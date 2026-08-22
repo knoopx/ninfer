@@ -3,7 +3,9 @@
 function(ninfer_internal_includes target)
   target_include_directories(${target} PRIVATE
     ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/src)
+    ${PROJECT_SOURCE_DIR}/src
+    ${NLOHMANN_JSON_INCLUDE_DIR}
+    ${UTF8PROC_INCLUDE_DIRS})
 endfunction()
 
 function(ninfer_cuda_archive target)
