@@ -24,8 +24,8 @@ void ProgramImpl::initialize_captures(std::uint32_t lane, std::uint32_t from,
 void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
     auto& request    = requests[lane];
     const auto& plan = *request.base;
-    auto& staged     = request.prefill.emplace();
-    staged.prompt    = *plan.prompt;
+    auto& staged =
+        request.prefill.emplace(RequestControl::Prefill{.prompt = *plan.prompt});
     staged.base = staged.cursor = base;
     staged.prompt_tokens        = plan.summary.prompt_tokens;
     staged.prepare_mtp          = speculative_backend == SpeculativeBackend::Mtp;

@@ -9,7 +9,7 @@ target_link_libraries(ninfer PRIVATE
 
 add_executable(ninfer-serve serve/main.cpp)
 ninfer_internal_includes(ninfer-serve)
-target_link_libraries(ninfer-serve PRIVATE ninfer_serve ninfer_product_logging)
+target_link_libraries(ninfer-serve PRIVATE ninfer_serve ninfer_product_logging PkgConfig::HTTPLIB)
 
 add_executable(ninfer-perplexity
   perplexity/main.cpp

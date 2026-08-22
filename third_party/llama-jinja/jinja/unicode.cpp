@@ -1,7 +1,7 @@
 #include "unicode.h"
 #include "unicode_data.h"
 #include "text/unicode.h"
-#include <utf8proc/utf8proc.h>
+#include <utf8proc.h>
 #include <algorithm>
 #include <iterator>
 #include <limits>

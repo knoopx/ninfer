@@ -1,4 +1,111 @@
-# NInfer
+# NInfer (personal fork)
+
+This repository is a personal fork of
+[upstream NInfer](https://github.com/Neroued/ninfer) with end-user serving additions. The
+repository is experimental: changes are subject to being wiped without notice based on the
+maintainer's own usage observations. The sections below the fork section describe the shared
+upstream product.
+
+## What this fork adds
+
+### Multi-model router
+
+The server runs an in-process multi-model router. It adapts llama-swap's router to own an
+in-process Engine lifecycle instead of a child-process one. The router starts no-resident:
+no model loads at startup and no warm-up runs. The first request for a model loads it on
+demand. A request for a different model swaps the resident: it destroys the loaded Engine
+to free VRAM, builds the target Engine, and gates on readiness under a health-check
+timeout. A 1-second TTL ticker unloads an idle model once it has been idle past its
+effective TTL and holds no in-flight request; an in-flight request pins the model. A
+serve-config JSON (`--config`, required) names the model list and each model's engine
+presets. Load, swap, and unload transitions publish live `model_status` events on a
+router-hooked SSE feed (`GET /models/sse`). The swap lifecycle also exposes the llama.cpp
+compatibility routes `POST /models/load` and `POST /models/unload`. The router does not
+cap request concurrency; the engine layer owns bounded FIFO ingress. See [HTTP
+serving](docs/serving.md).
+
+### Decision scoring (JEV-alike)
+
+`POST /v1/decisions` (alias `POST /v1/systemone`) scores a set of typed questions over a
+shared state without generating tokens, so `output_tokens` is always 0. The context is
+either a `state` string or a `messages` chat history (with optional image parts). The
+questions are a map from id to `{type, instructions, criteria}`. Three types run:
+
+- `noul` — a true/false question; the answer is the P(true) probability.
+- `choice` — a named option set of 1-255 entries; the answer is the winning key,
+  per-option probabilities, and a normalized Gini confidence.
+- `score` — an ordered level array of 2-50 levels; the answer is the expected level index,
+  a legend, per-level probabilities, and confidence.
+
+Each question forks the shared state into its own round of prefill, readout, projection,
+and softmax. A large question set runs as successive rounds, not as a rejection. Decision
+jobs count against the server's concurrency budget, reserve their own execution rows so
+chat traffic cannot starve them, and release their slot on every completion path. The
+[Decision scoring guide](docs/decisions.md) documents the contract, the execution path,
+and the JevBench benchmark (84.4% on 231 public tasks).
+
+https://github.com/user-attachments/assets/aa6b5a2b-a1dd-495c-b6c5-b75b8421ae16
+
+https://github.com/user-attachments/assets/37e6c547-7192-4e2c-b831-2778e216e9dc
+
+### Web UI and llama.cpp compatibility
+
+`--webui` serves a bundled [llama-ui](https://github.com/ggml-org/llama-ui) (llama.cpp /
+llama-swap) interface at `/`. The server implements the llama-ui management surface as
+real, working functionality backed by serving-owned state in `src/serve/`:
+
+- model load and unload through the router (`POST /models/load`, `POST /models/unload`);
+- a router-hooked model-status feed (`GET /models/sse`) that fans out live `model_status`
+  events with 5-second keepalives;
+- live concurrency slot state (`GET /slots`), one object per configured slot;
+- a server-side conversation stream registry keyed by the `X-Conversation-Id` header, with
+  replay from a byte offset and a live tail (`POST /v1/streams/lookup`, `GET /v1/stream/{id}`,
+  `DELETE /v1/stream/{id}`);
+- a server-side tool registry (`GET /tools`, `POST /tools`) that starts empty because NInfer
+  is a client-side function-calling engine; and
+- owner-addressable cancellation of one in-flight generation
+  (`POST /v1/chat/completions/control`), which signals the matching stream's cancel token
+  without touching any other request.
+
+These routes are a compatibility surface for the webui, not part of the OpenAI or Anthropic
+protocol contract. See [HTTP serving](docs/serving.md).
+
+<img width="1883" height="2114" alt="image" src="https://github.com/user-attachments/assets/90ada720-6658-45c3-a369-a7b83e916683" />
+
+### Copilot and Claude Code tool calls
+
+Serve accepts Copilot custom tools and continues a trailing assistant prefill: a final
+text-only assistant message continues its own text instead of opening a new turn. It
+parses Claude Code XML tool calls with tolerant truncation recovery — a call whose closing
+tags are cut off at the region end still yields a structured result, and the parse
+diagnostics report the discarded tail, bounded to a short markup snippet for transparency.
+It treats `strict:true` and `required`/named tool choices as advisory: the engine cannot
+force a call, so the request proceeds without that guarantee. Tool names run up to 256
+bytes, past the 64-byte bound OpenAI documents, so VS Code Copilot's MCP-wrapped names
+(`activate_fallback_mcp_<server>_<tool>`) parse cleanly. Engine model metadata enters the
+llama.cpp `/models` payload. See [HTTP serving](docs/serving.md).
+
+### Nix packaging
+
+The [flake](flake.nix) builds and packages the `ninfer` and `ninfer-serve` binaries on
+CUDA 13.2 and ships a devShell. It pulls httplib, nlohmann_json, spdlog (static), and
+utf8proc from nixpkgs instead of vendoring them. It bundles the prebuilt llama-ui Web UI,
+pinned to a specific build rather than a rolling `latest` pointer, so `--webui` serves it
+from `<exe-dir>/../share/ninfer/webui` with no runtime download. The build clears the CMake
+`CMAKE_CXX_SCANDEP_SOURCE` variable so the Ninja generator drops the clang-scan-deps `.ddi`
+rule that fails inside the Nix sandbox.
+
+### Engine and performance
+
+The fork also changes engine internals for single-GPU throughput. The additions:
+
+- Short Temporal requests scheduled against a donor work budget, with a Program proof
+  required for Persistent backfill.
+- A 4/8-warp MMA fast path for INT8 prompt attention, with prefill chunks rounded to
+  prompt waves.
+- Measured CUDA Graph memory in the engine's memory summary.
+
+---
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
