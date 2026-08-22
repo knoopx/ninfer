@@ -183,14 +183,35 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 
 ## Local operations
 
-Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
-causes failures or interferes with the task, and briefly explain why.
+Build inside the Nix dev-shell, which is the single authority for the toolchain environment.
+Enter it with `nix develop path:.` (use `path:.` so untracked files are included; never quote the
+command), or run a one-shot with `nix develop path:. -c <command>` where `<command>` is passed as
+trailing arguments with no quotes. The
+dev-shell (defined in `flake.nix`) puts the CUDA host include/lib paths (cudart, crt, nvtx, cccl)
+and the ffmpeg/curl dependencies on the compiler search paths (`CPLUS_INCLUDE_PATH`,
+`C_INCLUDE_PATH`, `LIBRARY_PATH`, `LD_LIBRARY_PATH`) and puts `cmake`, `ninja`, and `nvcc` on
+`PATH`. Do not hand-construct `CPATH`/`LIBRARY_PATH` from `/nix/store` paths — the dev-shell
+already provides them; a plain shell that lacks them cannot compile the CUDA host sources.
 
-Use the selected Python 3.11 interpreter explicitly. On this machine it is
-`/home/neroued/miniconda3/envs/py311/bin/python`; the default shell's `python3` may be a different
-version. Use `python3` only after selecting the maintainer environment or checking its version.
-Normal resources are `build/`, `out/qwen3_6_27b.ninfer`, its `.conversion.json` report, and
-`profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; the local toolchain is CUDA 13.1.
+Builds are user-owned: the agent never starts a build (configure, compile, or link) unless the
+user explicitly requests it in the current conversation; a build that is not requested is a
+violation, and build output is reported by the user, not produced by the agent. When a build
+IS requested, it runs in `/tmp` — the build directory is `/tmp/ninfer-build` (never inside the
+repo) — with `nix develop path:. -c cmake --build /tmp/ninfer-build -j` (no quotes; the first
+build configures with `nix develop path:. -c cmake -S CMAKE_BUILD_TYPE=Release -B /tmp/ninfer-build .`),
+add `--target ninfer-serve -j` for the server, or `--clean-first` for a full from-scratch
+compile+link. Adjust parallelism when actual resource pressure causes failures or interferes
+with the task, and briefly explain why.
+
+Use `uv` for Python 3.11 — `uv python install 3.11`, run scripts with `uv run --python 3.11 <script>`,
+or create a venv with `uv venv --python 3.11`. The default shell's `python3` may be a different
+version.
+Normal resources are `/tmp/ninfer-build` and `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; the
+local toolchain is CUDA 13.2 (the
+flake's `pkgs.cudaPackages_13`). Deployed `.ninfer` models live in
+`~/.local/share/ninfer/models/`, in one subdir per HF owner (e.g.
+`ornith-ai/Ornith-1.5-35B-A3B-MTP-w8g32-q4g64-q5g64-q6g64-bf16.v3.ninfer`);
+that directory is the serve route's model root, so select models by explicit path under it.
 Select model artifacts by explicit path, never glob order, modification time, or unqualified
 “latest”. Source checkpoints and large artifacts are prerequisites; download or regenerate them
 only when that work is in scope. Install or upgrade dependencies only when the task needs it.
