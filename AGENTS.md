@@ -303,23 +303,43 @@ run and why.
 
 ## Local environment
 
-Use unrestricted build-tool parallelism for repository compilation. Invoke CMake builds as
-`cmake --build <build-dir> -j`; do not supply a numeric job limit such as `-j2` or `-j32`.
+The build is driven by the repository nix flake (`flake.nix`): the CUDA toolchain, compiler,
+headers, and libraries come from the flake dev shell, so CMake configure and build run inside
+`nix develop`. A bare `cmake` invocation outside the shell cannot see the CUDA headers.
+Use unrestricted build-tool parallelism: pass `-j` with no numeric job limit (never `-j2`
+or `-j32`).
+
+```bash
+nix develop --command cmake -B build                # configure (once)
+nix develop --command cmake --build build -j        # build
+```
+
+The flake pins `CMAKE_CUDA_ARCHITECTURES=120a` (enforced to `sm_120a` only) and ships a
+packaged build (`nix build .#ninfer`, clang-based) plus the `ninfer` / `ninfer-serve` apps.
+Tests are built in a separate tree with `-DBUILD_TESTING=ON` and run with
+`nix develop --command ctest --test-dir build-tests -R <regex>`.
 
 These are conventional project resources, not a checklist of resources every task must use:
 
 | Purpose | Path |
 |---|---|
 | repository | current checkout |
-| Python 3.11 | `python3` in the selected maintainer environment |
+| flake / dev shell | `flake.nix` (`nix develop`) |
+| Python 3.14 | `python3` (system 3.14.x) |
 | BF16 source checkpoint | explicit local checkpoint directory |
-| product artifact | `out/qwen3_6_27b.ninfer` |
+| product artifact | `out/qwen3_6_27b.ninfer` (conversion output); registered model artifacts live in `~/.local/share/ninfer/models/` |
 | conversion report | `out/qwen3_6_27b.ninfer.conversion.json` |
 | normal build | `build/` |
+| test build | `build-tests/` (`-DBUILD_TESTING=ON`) |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
-| hardware/toolchain | RTX 5090, `sm_120a`, CUDA 13.1 |
+| hardware/toolchain | RTX 5090, `sm_120a`, CUDA 13 (`pkgs.cudaPackages_13`; nvcc 13.2.78) |
 
-Use the selected Python 3.11 interpreter explicitly. Do not install or upgrade dependencies unless
+Registered model artifacts live in `~/.local/share/ninfer/models/`, in per-user subdirectories.
+The 27B target is the nvfp4-weights artifact run with an INT8 KV cache (the "int8" refers to the
+KV cache dtype, not the weight format; there is no int8-weight artifact):
+`~/.local/share/ninfer/models/ostfralla/Qwen3.8-27B-NInfer-nvfp4-w8g32-q4g64-q5g64-q6g64-bf16.ninfer`.
+
+Use the system Python 3.14 interpreter explicitly. Do not install or upgrade dependencies unless
 the task requires it. Never select an artifact by glob, modification time, or an unqualified
 “latest” name. Large artifacts, source checkpoints, and profiler outputs are local prerequisites;
 do not download or regenerate them unless that work is in scope.
@@ -327,8 +347,27 @@ do not download or regenerate them unless that work is in scope.
 ```bash
 PYTHON=python3
 MODEL=/path/to/Qwen3.6-27B
-NINFER_WEIGHTS=out/qwen3_6_27b.ninfer
+NINFER_WEIGHTS=~/.local/share/ninfer/models/ostfralla/Qwen3.8-27B-NInfer-nvfp4-w8g32-q4g64-q5g64-q6g64-bf16.ninfer
 ```
+
+## Benchmark ownership, model scope, and reference numbers
+
+Benchmarks are run by the user personally, never by the agent. The agent's deliverable for a
+benchmark request is a user-run script (bash or python) plus static checks only: `bash -n` or
+`py_compile`, and a dry-run mode that prints the commands without executing them. The script must
+never select an artifact by glob, modification time, or an unqualified "latest" name.
+
+MTP draft-depth and benchmark work is scoped to the 27B target (nvfp4 weights, INT8 KV cache) only.
+There is no rk8v4 target in this repository and none may be referenced or invented. No 35b-a3b or
+other-target work unless the user explicitly requests it.
+
+There are no baselines. Any comparison, for example fixed draft depth 4 versus the adaptive
+selector, is measured within the script's own run, printing both numbers side by side with a
+percent difference. Neither the script nor the agent may fabricate, harvest, or cite
+previously-measured reference throughput numbers.
+
+The word "baseline" refers exclusively to previously measured reference numbers. Pre-edit or
+pre-change state is named "pre-state" (pre-state snapshot, pre-state hash) — never "baseline".
 
 ## Commits
 
