@@ -1,4 +1,5 @@
 # Build
+result
 build/
 build-*/
 cmake-build-*/
