@@ -610,6 +610,42 @@ schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint
     };
 }
 
+// Computes the effective per-sequence MTP K from the rolling acceptance history. K starts at
+// K_high (the configured draft_window). When the mean acceptance over the last
+// kMtpAdaptiveWindow rounds drops below kMtpAdaptiveAcceptDrop, K is reduced to K_low.
+// When acceptance recovers above kMtpAdaptiveAcceptRestore, K is restored to K_high.
+std::uint32_t mtp_effective_k(SequenceState& sequence, std::uint32_t k_high) {
+    const std::uint32_t k_low = std::max<std::uint32_t>(1, k_high / 2);
+    if (sequence.mtp_acceptance_count < SequenceState::kMtpAdaptiveWindow) { return k_high; }
+    std::uint32_t total_accepted = 0, total_extent = 0;
+    for (std::uint32_t i = 0; i < SequenceState::kMtpAdaptiveWindow; ++i) {
+        const auto& [acc, ext] = sequence.mtp_acceptance_history[i];
+        total_accepted += acc;
+        total_extent   += ext;
+    }
+    if (total_extent == 0) { return k_high; }
+    const double rate = static_cast<double>(total_accepted) / static_cast<double>(total_extent);
+    if (!sequence.mtp_k_reduced && rate < SequenceState::kMtpAdaptiveAcceptDrop) {
+        sequence.mtp_k_reduced = true;
+        return k_low;
+    }
+    if (sequence.mtp_k_reduced && rate > SequenceState::kMtpAdaptiveAcceptRestore) {
+        sequence.mtp_k_reduced = false;
+        return k_high;
+    }
+    return sequence.mtp_k_reduced ? k_low : k_high;
+}
+
+// Records this round's (accepted, extent) pair into the per-sequence circular buffer.
+void mtp_record_acceptance(SequenceState& sequence, std::uint32_t accepted, std::uint32_t extent) {
+    if (extent == 0) { return; }
+    sequence.mtp_acceptance_history[sequence.mtp_acceptance_pos] = {accepted, extent};
+    sequence.mtp_acceptance_pos = (sequence.mtp_acceptance_pos + 1) % SequenceState::kMtpAdaptiveWindow;
+    if (sequence.mtp_acceptance_count < SequenceState::kMtpAdaptiveWindow) {
+        sequence.mtp_acceptance_count++;
+    }
+}
+
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
                                          std::uint32_t frontier, const char* label) {
     const auto it = std::find_if(
@@ -11887,8 +11923,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
+            const std::uint32_t lane_k  = mtp_effective_k(sequence, draft_window);
             const std::uint32_t extent =
-                std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
+                std::min({sequence.mtp_draft_count, lane_k, max_by_budget,
                           capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
@@ -11973,6 +12010,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     request.speculative_stats.accepted_per_position[static_cast<std::size_t>(i)] +=
                         1;
                 }
+                mtp_record_acceptance(sequence, static_cast<std::uint32_t>(accepted_i), pcur);
             }
             request.pending = PendingCandidate{
                 .kind          = PendingKind::Speculative,

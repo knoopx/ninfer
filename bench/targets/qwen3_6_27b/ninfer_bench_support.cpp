@@ -294,7 +294,7 @@ std::string usage_text(std::string_view program) {
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
         << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4>  KV cache storage (default: bf16)\n"
-        << "  --mtp-draft-tokens <0..5>   speculative draft window (default: 0)\n"
+        << "  --mtp-draft-tokens <0..8>   speculative draft window (default: 0)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires MTP\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             use eager decode\n"
@@ -350,7 +350,7 @@ BenchOptions parse_args(int argc, char** argv) {
             options.mtp_draft_tokens =
                 parse_u32(value("--mtp-draft-tokens"), "mtp-draft-tokens", true);
             if (options.mtp_draft_tokens > kMaxMtpDraftTokens) {
-                throw std::invalid_argument("--mtp-draft-tokens must be in [0,5]");
+                throw std::invalid_argument("--mtp-draft-tokens must be in [0,8]");
             }
         } else if (arg == "--lm-head-draft") {
             options.proposal_head = ProposalHead::Optimized;
@@ -415,7 +415,7 @@ std::uint32_t resolve_max_context(const std::vector<BenchTest>& tests,
                                   std::optional<std::uint32_t> override_max_context,
                                   std::uint32_t mtp_draft_tokens, bool use_cuda_graph) {
     if (mtp_draft_tokens > kMaxMtpDraftTokens) {
-        throw std::invalid_argument("mtp draft window must be in [0,5]");
+        throw std::invalid_argument("mtp draft window must be in [0,8]");
     }
     std::uint32_t required = 0;
     std::string driver;
@@ -482,7 +482,7 @@ std::string decode_path_name(bool use_cuda_graph, std::uint32_t mtp_draft_tokens
 
 std::uint32_t decode_graph_prime_output_tokens(std::uint32_t mtp_draft_tokens) {
     if (mtp_draft_tokens > kMaxMtpDraftTokens) {
-        throw std::invalid_argument("mtp draft window must be in [0,5]");
+        throw std::invalid_argument("mtp draft window must be in [0,8]");
     }
     return mtp_draft_tokens == 0 ? 3 : 2 * (mtp_draft_tokens + 1) + 1;
 }

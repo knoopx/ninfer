@@ -422,6 +422,18 @@ struct SequenceState {
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
+    // Adaptive MTP K: per-sequence rolling acceptance tracking. The circular buffer holds the
+    // (accepted_count, draft_extent) pair for the last 4 MTP decode rounds. When the mean
+    // acceptance over the window drops below kMtpAdaptiveAcceptDrop, K is reduced to K_low;
+    // when it recovers above kMtpAdaptiveAcceptRestore, K returns to K_high.
+    static constexpr std::uint32_t kMtpAdaptiveWindow    = 4;
+    static constexpr double kMtpAdaptiveAcceptDrop      = 0.6;
+    static constexpr double kMtpAdaptiveAcceptRestore   = 0.8;
+    std::array<std::pair<std::uint32_t, std::uint32_t>, kMtpAdaptiveWindow>
+        mtp_acceptance_history{};
+    std::uint32_t mtp_acceptance_pos = 0;
+    std::uint32_t mtp_acceptance_count = 0;
+    bool mtp_k_reduced = false;
     bool tail_hidden_valid        = false;
     bool endpoint_valid           = false;
     RewriteCheckpoint rewrite_checkpoint;

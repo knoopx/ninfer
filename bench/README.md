@@ -49,7 +49,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>]
-          [--mtp-draft-tokens <0..5>] [--lm-head-draft]
+          [--mtp-draft-tokens <0..8>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
 ```
@@ -345,7 +345,7 @@ cmake --build build --parallel --target ninfer_gdn_input_proj_bench
 row-scaled FP8, and W8 `gdn_input_proj_conv_snapshot` / `gdn_input_proj_conv_record` forms for exact
 `B=1..8`. The timed body is exactly one complete public Op call; the benchmark does not include
 private launchers, candidate selection, duplicated compositions, or route labels. Its default
-`T=1..6` sweep is the production MTP verification interval; Record begins at `T=2`.
+`T=1..9` sweep is the production MTP verification interval; Record begins at `T=2`.
 `--form snapshot|record|both` selects the semantic form. NVFP4 accepts public `a16`/`a4`, while FP8
 accepts `a16`/`a8`; the reported profile names caller policy, not a private resolved route.
 
@@ -769,13 +769,13 @@ cmake --build build --parallel --target ninfer_argmax_bench ninfer_sampling_sele
 ```
 
 The G2/G3 benchmark uses physical rows 248320, valid token domain 248077, optional occurrence
-counts, batched sampling at `B=1,2,4,8`, and every MTP window `K=1..5`. With no arguments it runs
+counts, batched sampling at `B=1,2,4,8`, and every MTP window `K=1..8`. With no arguments it runs
 the full greedy/stochastic matrix; individual routes are suitable for Nsight Compute capture:
 
 ```bash
 ./build/bench/ninfer_sampling_select_bench --matrix
 ./build/bench/ninfer_sampling_select_bench --sample --batch 8 --mode stochastic --top-k 20
-./build/bench/ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5 --top-k 20
+./build/bench/ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 8 --top-k 20
 ```
 
 ## 35B dFlash causal Attention qualification

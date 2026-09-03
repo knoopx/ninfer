@@ -53,8 +53,10 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
     constexpr const char* op = "mtp_prepare_next_round";
     const std::int32_t T     = verify_ids.ne[0];
     const std::int32_t batch = verify_ids.ne[1];
-    if (T < 2 || T > 6) {
-        throw std::invalid_argument("mtp_prepare_next_round: T must be in [2,6]");
+    // T = verify width = drafts + 1. The family schedules at most 8 MTP drafts,
+    // so the supported verify width is at most 9.
+    if (T < 2 || T > 9) {
+        throw std::invalid_argument("mtp_prepare_next_round: T must be in [2,9]");
     }
     if (batch < 1) { throw std::invalid_argument("mtp_prepare_next_round: B must be positive"); }
     if (max_context <= 0) {
