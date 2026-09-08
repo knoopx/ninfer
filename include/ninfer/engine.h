@@ -58,6 +58,12 @@ private:
 
 class Engine {
 public:
+    // Pimpl. The nested class NAME is public (its body stays opaque in this header) so a
+    // GenerationHandle's Impl can hold a typed std::shared_ptr<Engine::Impl> keep-alive
+    // back-reference: each live handle pins the Engine's VRAM and its destructor releases
+    // that pin (active_handle_pins / wait_handle_pins_zero).
+    class Impl;
+
     explicit Engine(EngineOptions options);
     ~Engine();
 
@@ -103,15 +109,28 @@ public:
 
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
+    [[nodiscard]] ModelMetadata model_metadata() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] bool is_available() const;
 
+    // Live VRAM pin count: the number of GenerationHandles currently pinning this Engine's
+    // VRAM (weights, KV cache, CUDA graphs). Each handle returned by submit() pins the Engine
+    // until it is destroyed; ~Engine() alone does not free VRAM (it drops one ref, and every
+    // live handle holds another). The serve router's swap drain gates on this count before
+    // destroying an evicted resident: the router's Grant in-flight counter can reach 0 while a
+    // retained/streaming GenerationHandle still pins the VRAM (concurrent residency -> OOM).
+    [[nodiscard]] std::size_t active_handle_pins() const;
+    // Bounded wake on the live-handle pin count reaching zero: blocks until no GenerationHandle
+    // pins the Engine's VRAM (active_handle_pins() == 0) or `deadline` passes; returns true when
+    // zero live pins are observed (a no-engine Engine has no pins, so it returns true immediately).
+    // Lets the serve router's swap drain gate on the real pin without busy-polling.
+    [[nodiscard]] bool wait_handle_pins_zero(std::chrono::steady_clock::time_point deadline) const;
+
     void reset_memory_peaks() noexcept;
 
 private:
-    class Impl;
     std::shared_ptr<Impl> impl_;
 };
 

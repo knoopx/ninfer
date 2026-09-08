@@ -14,6 +14,37 @@
       };
       cuda = pkgs.cudaPackages_13_2;
 
+      # Prebuilt llama.cpp webui (ggml-org/llama-ui), pinned to a specific build
+      # rather than the rolling "latest" pointer for reproducibility. A single
+      # prebuilt dist.tar.gz is published per build; its entries are ./-prefixed,
+      # so extracting it directly yields the servable tree (index.html at root).
+      llamaWebui = pkgs.stdenvNoCC.mkDerivation rec {
+        pname = "llama-ui-webui";
+        version = "b10021";
+
+        src = pkgs.fetchurl {
+          url = "https://huggingface.co/buckets/ggml-org/llama-ui/resolve/${version}/dist.tar.gz";
+          # Matches the upstream-published dist.tar.gz.sha256 sidecar.
+          sha256 = "7726ec9d4b7fe63536f70dcd14813a4054819317ba4df78539ea2bfc5aa7db2a";
+        };
+
+        # The prebuilt archive is the whole deliverable: extract it straight into
+        # $out and skip the (vacuous) build/install phases.
+        dontConfigure = true;
+        dontBuild = true;
+        dontCheck = true;
+        unpackPhase = ''
+          mkdir -p "$out/share/ninfer/webui"
+          tar xzf "$src" -C "$out/share/ninfer/webui"
+        '';
+        buildPhase = ":";
+        installPhase = ":";
+
+        meta = with pkgs.lib; {
+          description = "Prebuilt llama.cpp webui (ggml-org/llama-ui), pinned build ${version}";
+        };
+      };
+
       # CMake 4.x + Ninja: the Clang CXX compiler module (Clang-CXX.cmake) sets
       # CMAKE_CXX_SCANDEP_SOURCE *unconditionally* for Clang >= 16 with the GNU
       # frontend, so the Ninja generator emits a clang-scan-deps `.ddi` (Dynamic
@@ -45,6 +76,44 @@
       # makes it win over the 15.3.0 -L search order.
       libstdcxx = pkgs.gccNGPackages_16.libstdcxx;
 
+      # CMake flags shared by the nix build derivation and the dev shell, so a
+      # plain `cmake` inside `nix develop` configures and builds with no manual
+      # -D flags. Referencing llamaWebui / scandepsDisable / libstdcxx
+      # here makes the dev shell fetch and build every one of them.
+      ninferCmakeFlags = [
+        "-DCMAKE_CUDA_ARCHITECTURES=120a"
+        # The flake points NINFER_WEBUI_SRC at the fetched llama-ui webui tree;
+        # CMake also bundles the tree into the build dir (build/share/ninfer/webui)
+        # for dev builds.
+        "-DNINFER_WEBUI_SRC=${llamaWebui}/share/ninfer/webui"
+        # Opt out of the Ninja clang-scan-deps `.ddi` rule (see the comment on
+        # the scandepsDisable store path): with CMAKE_CXX_SCANDEP_SOURCE unset
+        # the Ninja generator falls back to compiler-based dependency
+        # generation, which works in the Nix sandbox.
+        "-DCMAKE_PROJECT_INCLUDE=${scandepsDisable}"
+        # Explicit C++ standard library: CMake leaves CMAKE_CXX_STANDARD_LIBRARIES
+        # empty for Clang (driver auto-link), and the wrapper's empty
+        # libcxx-ldflags means nothing else adds libstdc++ — so the 16.2.0
+        # runtime is linked by absolute path (beats the 15.3.0 -L order).
+        "-DCMAKE_CXX_STANDARD_LIBRARIES=${libstdcxx}/lib/libstdc++.so"
+        # Embed the 16.2.0 libstdc++ as DT_RPATH (old dtags => searched before
+        # LD_LIBRARY_PATH): the runtime environment resolves libstdc++.so.6 to
+        # the stdenv's 15.3.0 library, which lacks the GLIBCXX_3.4.35 nodes
+        # these binaries require.
+        "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags,-rpath,${libstdcxx}/lib"
+      ];
+
+      # Dev-shell cmake that prepends the shared flags, so a plain `cmake` in
+      # `nix develop` configures with every flag the derivation uses. mkShell does
+      # not auto-wrap the shell's cmake from a cmakeFlags attribute, so we ship a
+      # makeWrapper'd cmake on the dev shell's PATH instead.
+      # A `cmake` wrapper script that execs the real cmake with the shared flags
+      # prepended, so the dev shell's PATH cmake needs no manual -D flags. (Not the
+      # makeWrapper function — `pkgs.makeWrapper` is the tool package here.)
+      cmakeDev = pkgs.writeShellScriptBin "cmake" ''
+        exec ${pkgs.cmake}/bin/cmake ${pkgs.lib.concatStringsSep " " ninferCmakeFlags} "$@"
+      '';
+
       ninfer = pkgs.clangStdenv.mkDerivation rec {
         pname = "ninfer";
         version = "0.1.0";
@@ -71,26 +140,12 @@
           pkgs.nlohmann_json
           (pkgs.spdlog.override { staticBuild = true; })
           pkgs.utf8proc
+          llamaWebui
         ];
 
-        cmakeFlags = [
-          "-DCMAKE_CUDA_ARCHITECTURES=120a"
-          # Opt out of the Ninja clang-scan-deps `.ddi` rule (see the comment on
-          # the scandepsDisable store path): with CMAKE_CXX_SCANDEP_SOURCE unset
-          # the Ninja generator falls back to compiler-based dependency
-          # generation, which works in the Nix sandbox.
-          "-DCMAKE_PROJECT_INCLUDE=${scandepsDisable}"
-          # Explicit C++ standard library: CMake leaves CMAKE_CXX_STANDARD_LIBRARIES
-          # empty for Clang (driver auto-link), and the wrapper's empty
-          # libcxx-ldflags means nothing else adds libstdc++ — so the 16.2.0
-          # runtime is linked by absolute path (beats the 15.3.0 -L order).
-          "-DCMAKE_CXX_STANDARD_LIBRARIES=${libstdcxx}/lib/libstdc++.so"
-          # Embed the 16.2.0 libstdc++ as DT_RPATH (old dtags => searched before
-          # LD_LIBRARY_PATH): the runtime environment resolves libstdc++.so.6 to
-          # the stdenv's 15.3.0 library, which lacks the GLIBCXX_3.4.35 nodes
-          # these binaries require.
-          "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags,-rpath,${libstdcxx}/lib"
-        ];
+        # Shared with the dev shell (see ninferCmakeFlags) so `nix develop` +
+        # plain `cmake` works without manual -D flags.
+        cmakeFlags = ninferCmakeFlags;
 
         enableParallelBuilding = true;
         doCheck = false;
@@ -99,6 +154,10 @@
           runHook preInstall
           install -Dm0755 apps/ninfer "$out/bin/ninfer"
           install -Dm0755 apps/ninfer-serve "$out/bin/ninfer-serve"
+          # Bundle the prebuilt webui so --webui can serve it from
+          # <exe-dir>/../share/ninfer/webui with no runtime download.
+          install -d "$out/share/ninfer/webui"
+          cp -a "${llamaWebui}/share/ninfer/webui/." "$out/share/ninfer/webui/"
           runHook postInstall
         '';
 
@@ -113,6 +172,7 @@
       packages.${system} = {
         default = ninfer;
         ninfer = ninfer;
+        llamaWebui = llamaWebui;
       };
 
       apps.${system} = {
@@ -128,7 +188,7 @@
 
       devShells.${system}.default = pkgs.mkShell {
         buildInputs = [
-          pkgs.cmake
+          cmakeDev
           pkgs.ninja
           pkgs.pkg-config
           pkgs.clang-tools
@@ -145,6 +205,8 @@
           pkgs.nlohmann_json
           (pkgs.spdlog.override { staticBuild = true; })
           pkgs.utf8proc
+          # Prebuilt llama.cpp webui tree bundled into the build (NINFER_WEBUI_SRC).
+          llamaWebui
         ];
       };
     };

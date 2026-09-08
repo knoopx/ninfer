@@ -1,10 +1,15 @@
 add_library(ninfer_serve STATIC
   http_transport.cpp
+  model_sse_hub.cpp
+  stream_registry.cpp
+  tool_registry.cpp
   request_validation.cpp
   openai_chat_request.cpp
   openai_chat_response.cpp
   openai_chat_http.cpp
   openai_common.cpp
+  model_config.cpp
+  model_router.cpp
   openai_responses_request.cpp
   openai_responses_state.cpp
   openai_responses_response.cpp
