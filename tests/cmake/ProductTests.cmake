@@ -42,7 +42,8 @@ ninfer_add_test(ninfer_anthropic_schema_test
 
 ninfer_add_test(ninfer_serve_options_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_options.cpp"
-  LIBRARIES ninfer_serve)
+  LIBRARIES ninfer_serve
+  NEEDS_SOURCE_DIR)
 
 ninfer_add_test(ninfer_request_log_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_request_log.cpp"
@@ -54,4 +55,29 @@ ninfer_add_test(ninfer_http_error_handler_test
 
 ninfer_add_test(ninfer_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
+  LIBRARIES ninfer_serve)
+
+ninfer_add_test(ninfer_model_config_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_model_config.cpp"
+  LIBRARIES ninfer_serve
+  NEEDS_SOURCE_DIR)
+
+ninfer_add_test(ninfer_model_router_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_model_router.cpp"
+  LIBRARIES ninfer_serve)
+
+ninfer_add_test(ninfer_stream_registry_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_stream_registry.cpp"
+  LIBRARIES ninfer_serve)
+
+ninfer_add_test(ninfer_tool_registry_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tool_registry.cpp"
+  LIBRARIES ninfer_serve)
+
+ninfer_add_test(ninfer_model_sse_hub_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_model_sse_hub.cpp"
+  LIBRARIES ninfer_serve)
+
+ninfer_add_test(ninfer_serve_slots_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_slots.cpp"
   LIBRARIES ninfer_serve)

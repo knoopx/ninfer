@@ -897,7 +897,7 @@ public:
         require(pending_plan_.has_value(), "fake materialization plan disappeared");
         const FakeResourcePlan& plan = *pending_plan_;
         FakeMaterializationResult result;
-        result.status = (abort_progress || cancellation.requested())
+        result.status = (abort_progress || fault_source_consumption || cancellation.requested())
                             ? ContextTransactionStatus::Aborted
                             : ContextTransactionStatus::Published;
         for (std::size_t index = 0; index < plan.private_actions.size(); ++index) {
@@ -1144,6 +1144,10 @@ public:
     bool require_evictions                               = false;
     bool abort_start                                     = false;
     bool abort_progress                                  = false;
+    // Fault injection for prepare_consumed_source: when set, the materialization path aborts
+    // (retaining the private source) even without abort_progress, mirroring a thrown source-KV
+    // consumption check in the real Program. The caller clears it to prove the engine recovers.
+    bool fault_source_consumption                         = false;
     bool malform_last_private_victim                     = false;
     bool malform_last_capture_private_victim             = false;
     bool malform_private_checkpoint_identity             = false;
@@ -2458,6 +2462,51 @@ void test_materialization_abort_preserves_source() {
             "abort restored the wrong source capability");
 }
 
+void test_source_consumption_failure_aborts_only_the_session() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest seed = start_active(manager, program, 5, make_base(5), 1);
+    (void)finish_active(manager, program, seed);
+
+    auto inspection = manager.inspect(program, FakePreparedPrompt{5}, make_base(5), 2);
+    require(inspection.choice && inspection.choice->summary().reusable_prompt_tokens == 16,
+            "source-consumption failure test did not select its private source");
+
+    program.fault_source_consumption = true;
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{5}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "failing materialization was not reserved");
+    auto progress = manager.progress_context_transaction(program, {});
+    auto outcome  = std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+    require(outcome.status == ContextTransactionStatus::Aborted && !outcome.activation,
+            "source-consumption failure did not abort before publication");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "source-consumption failure did not restore its source visibility");
+    require(manager.lane_state(LaneId{0}) == ninfer::runtime::LogicalLaneState::Free,
+            "source-consumption failure did not release its logical lane");
+
+    // The engine must keep serving after a per-session source-consumption failure: the same
+    // prefix re-inspects and publishes on retry, proving the abort was session-local and the
+    // server (manager) survives to complete the next session on that lane.
+    program.fault_source_consumption = false;
+    auto retry = manager.inspect(program, FakePreparedPrompt{5}, make_base(5), 3);
+    require(retry.choice && retry.choice->summary().reusable_prompt_tokens == 16,
+            "restored source was not reusable after the abort");
+    require(manager.reserve_materialization(program, std::move(*retry.choice),
+                                            FakePreparedPrompt{5}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "retried materialization was not reserved");
+    auto retried   = manager.progress_context_transaction(program, {});
+    auto published = std::get<FakeManager::MaterializationOutcome>(std::move(retried));
+    require(published.status == ContextTransactionStatus::Published && published.activation,
+            "manager did not continue serving after the aborted session");
+    auto activation = std::move(*published.activation);
+    manager.adopt(program, std::move(activation));
+    require(manager.lane_state(LaneId{0}) == ninfer::runtime::LogicalLaneState::Active,
+            "successful retry did not re-acquire its logical lane");
+}
+
 void test_committed_victim_survives_transaction_abort() {
     FakeManager manager = make_manager(1, 2);
     FakeProgram program;
@@ -3479,6 +3528,8 @@ int main() {
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
+    run_test("source consumption failure aborts only the session",
+             test_source_consumption_failure_aborts_only_the_session);
     run_test("committed victim survives abort", test_committed_victim_survives_transaction_abort);
     run_test("uncommitted pressure acknowledgement",
              test_uncommitted_pressure_acknowledgement_is_not_degradation);
