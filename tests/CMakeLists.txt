@@ -197,6 +197,16 @@ ninfer_add_test(ninfer_tool_call_parser_test
   LIBRARIES ninfer_engine)
 ninfer_add_test(ninfer_serve_options_test
   SOURCES test_serve_options.cpp
+  LIBRARIES ninfer_serve
+  NEEDS_SOURCE_DIR)
+ninfer_add_test(ninfer_model_config_test
+  SOURCES test_model_config.cpp
+  LIBRARIES ninfer_serve
+  NEEDS_SOURCE_DIR)
+# In-process multi-model router (Option-B Engine lifecycle). Host-side: a fake backend is injected
+# via the BackendFactory, so no Engine/GPU is needed and the test links only ninfer_serve.
+ninfer_add_test(ninfer_model_router_test
+  SOURCES test_model_router.cpp
   LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
@@ -214,6 +224,37 @@ ninfer_add_test(ninfer_http_transport_test
   LIBRARIES ninfer_serve)
 target_include_directories(ninfer_http_transport_test PRIVATE
   ${HTTPLIB_INCLUDE_DIRS})
+# Serving-owned stream registry (llama-parity design §1, step 1): the first real server-side
+# mutable state. Host-side: a pure serving-state object (no Engine/GPU/network), so it links only
+# ninfer_serve and verifies the lifecycle, byte-offset replay, live tail, cancel token, and reaper.
+ninfer_add_test(ninfer_stream_registry_test
+  SOURCES test_stream_registry.cpp
+  LIBRARIES ninfer_serve)
+# Serving-owned tool registry (llama-parity design §4, step 7): a real, mutable, in-memory
+# registry (empty at startup -- NInfer ships no built-in server tools). Host-side: a pure
+# serving-state object (no Engine/GPU/network); verifies the empty baseline (list -> []),
+# upsert (GET reflects a registered tool), and the execution dispatch (an unhandled tool ->
+# {error}; a registered handler -> {plain_text_response}).
+ninfer_add_test(ninfer_tool_registry_test
+  SOURCES test_tool_registry.cpp
+  LIBRARIES ninfer_serve)
+# Serving-owned /models/sse pub/sub (llama-parity design §5, step 9): the ModelSseHub is the
+# fan-out target of the ModelRouter's status hook. Host-side (a pure serving-state object + a
+# fake-backend router, no Engine/GPU): verifies subscribe/fan-out, the current-status-on-connect
+# record, the slow-client drop (bounded queue), clean unsubscribe, and that the router's status
+# hook fires at a real (fake-backend) load/unload transition.
+ninfer_add_test(ninfer_model_sse_hub_test
+  SOURCES test_model_sse_hub.cpp
+  LIBRARIES ninfer_serve)
+# GET /slots live slot state (llama-parity design §3, step 8): the slot-shaping is a pure function
+# (make_slots_list) driven by scalar inputs the handler gathers from the live ModelRouter + the
+# resident backend's runtime_stats (in_flight/loaded_id/is_swapping + prefilling). Host-side (no
+# Engine/GPU): verifies the no-resident baseline (all slots idle), the injected in-flight count
+# (a processing slot reports is_processing=true), the concurrency clamp, the ?model= filter
+# (resident vs non-resident), and the is-swapping "loading" marker.
+ninfer_add_test(ninfer_serve_slots_test
+  SOURCES test_serve_slots.cpp
+  LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp
           ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_6_27b/ninfer_bench_support.cpp

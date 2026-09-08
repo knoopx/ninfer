@@ -17,11 +17,56 @@ namespace ninfer::serve {
 void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Response& res) {
     const std::string request_id = new_anthropic_request_id();
     res.set_header("request-id", request_id);
+    AnthropicCountTokensRequest request;
     try {
-        const AnthropicCountTokensRequest request =
-            parse_anthropic_count_tokens_request(parse_json_body(req));
-        const int input_tokens = service_->count_prompt_tokens(
-            request.generation, [&req] { return client_disconnected(req); });
+        request = parse_anthropic_count_tokens_request(parse_json_body(req));
+    } catch (const ApiException& exception) {
+        write_anthropic_error(res, exception.error(), request_id);
+        return;
+    } catch (const std::exception& exception) {
+        operational_log_.http_failure(
+            "anthropic_count_tokens",
+            make_internal_request_failure(RequestFailurePhase::Http, exception.what()), request_id);
+        ApiError error;
+        error.status  = 500;
+        error.message = exception.what();
+        write_anthropic_error(res, error, request_id);
+        return;
+    }
+    // Route (supersedes model validation): unknown model -> 404 model-not-found; a concurrency /
+    // queue breach -> 429. The Grant keeps the backend alive for the (short) count call.
+    ModelRouter::Grant grant;
+    try {
+        grant = router_->route(request.model);
+    } catch (const std::out_of_range& exception) {
+        ApiError error;
+        error.status  = 404;
+        error.code    = "model_not_found";
+        error.message = exception.what();
+        write_anthropic_error(res, error, request_id);
+        return;
+    } catch (const std::overflow_error& exception) {
+        ApiError error;
+        error.status  = 429;
+        error.code    = "rate_limit_exceeded";
+        error.message = exception.what();
+        write_anthropic_error(res, error, request_id);
+        return;
+    } catch (const std::exception& exception) {
+        // A rethrown factory/Engine exception from route() (a failed load, or a readiness-timeout /
+        // shutdown-during-install "model is not ready").
+        ApiError error;
+        error.status  = 503;
+        error.code    = "model_not_ready";
+        error.message = exception.what();
+        write_anthropic_error(res, error, request_id);
+        return;
+    }
+    auto* backend = grant.backend.get();
+    try {
+        const int input_tokens =
+            backend->count_prompt_tokens(request.generation,
+                                         [&req] { return client_disconnected(req); });
         res.set_content(make_anthropic_count_tokens_response(input_tokens), "application/json");
     } catch (const ApiException& exception) {
         write_anthropic_error(res, exception.error(), request_id);
@@ -63,12 +108,55 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
+
+    // Route through the in-process router: unknown model -> 404 model-not-found; a concurrency /
+    // queue breach -> 429. The Grant keeps the granted backend alive for the whole request; the
+    // streaming path moves it into the stream.
+    ModelRouter::Grant grant;
+    try {
+        grant = router_->route(request.model);
+    } catch (const std::out_of_range& exception) {
+        ApiError error;
+        error.status  = 404;
+        error.code    = "model_not_found";
+        error.message = exception.what();
+        record_request_rejected(make_request_rejection_log_context(
+            req_id, "anthropic_messages", request.generation, metadata,
+            normalize_anthropic_error(error)));
+        write_anthropic_error(res, error, request_id);
+        return;
+    } catch (const std::overflow_error& exception) {
+        ApiError error;
+        error.status  = 429;
+        error.code    = "rate_limit_exceeded";
+        error.message = exception.what();
+        record_request_rejected(make_request_rejection_log_context(
+            req_id, "anthropic_messages", request.generation, metadata,
+            normalize_anthropic_error(error)));
+        write_anthropic_error(res, error, request_id);
+        return;
+    } catch (const std::exception& exception) {
+        // A rethrown factory/Engine exception from route() (a failed load, or a readiness-timeout /
+        // shutdown-during-install "model is not ready").
+        ApiError error;
+        error.status  = 503;
+        error.code    = "model_not_ready";
+        error.message = exception.what();
+        record_request_rejected(make_request_rejection_log_context(
+            req_id, "anthropic_messages", request.generation, metadata,
+            normalize_anthropic_error(error)));
+        write_anthropic_error(res, error, request_id);
+        return;
+    }
+    auto* backend = grant.backend.get();
+
     PreparedRequest prepared;
     try {
-        prepared = service_->prepare(request.generation,
-                                     request.stream ? GenerationConsumerMode::Streaming
-                                                    : GenerationConsumerMode::Aggregate,
-                                     {}, [&req] { return client_disconnected(req); });
+        prepared = backend->prepare(request.generation,
+                                    request.stream ? GenerationConsumerMode::Streaming
+                                                   : GenerationConsumerMode::Aggregate,
+                                    {}, [&req] { return client_disconnected(req); },
+                                    ninfer::ContextCacheHints{});
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(
@@ -96,7 +184,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     if (!request.stream) {
         GenerationOutcome outcome;
         try {
-            outcome = service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
+            outcome = backend->run(prepared, nullptr, [&req] { return client_disconnected(req); });
         } catch (const ApiException& exception) {
             const ApiError error = normalize_anthropic_error(exception.error());
             lifecycle->failure(make_generation_request_failure(error));
@@ -136,9 +224,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens);
 
         prepare_sse_response(res);
+        // Move the Grant into the stream so the granted backend (Engine) outlives the streaming
+        // generation (see the OpenAI handlers for the copyability-wrapper rationale).
+        auto grant_keep = std::make_shared<ModelRouter::Grant>(std::move(grant));
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, stream, encoder, lifecycle](std::size_t, httplib::DataSink& sink) -> bool {
+            [this, stream, encoder, lifecycle, grant_keep](
+                std::size_t, httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
                     return true;
@@ -177,7 +269,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     };
                     output.is_cancelled = [&] { return transport.poll(); };
 
-                    outcome = service_->run(stream->prepared, &output);
+                    outcome = grant_keep->backend->run(stream->prepared, &output, {});
                 } catch (const ClientDisconnected&) {
                     lifecycle->failure(
                         make_client_disconnected_failure(RequestFailurePhase::Transport));

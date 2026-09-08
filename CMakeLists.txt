@@ -81,6 +81,24 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
   find_package(spdlog CONFIG REQUIRED)
 endif()
 
+# --- Prebuilt webui bundling --------------------------------------------------
+# The webui is a required, always-bundled part of the build. NINFER_WEBUI_SRC must always
+# point at a built llama.cpp webui tree; the flake always sets it to the fetched ggml-org/
+# llama-ui tree. It is NOT optional: a build that provides no NINFER_WEBUI_SRC (no flake,
+# no -DNINFER_WEBUI_SRC) is a hard error. The tree is copied into the build tree at
+# ${CMAKE_BINARY_DIR}/share/ninfer/webui (landing path <exe-dir>/../share/ninfer/webui).
+set(NINFER_WEBUI_SRC "" CACHE PATH
+  "Built llama.cpp webui tree to bundle (required; always set by the flake)")
+if(NOT NINFER_WEBUI_SRC)
+  message(FATAL_ERROR
+    "NINFER_WEBUI_SRC is required and always set by the flake (the fetched llama-ui webui "
+    "tree). Provide a valid webui tree via -DNINFER_WEBUI_SRC=<dir> containing index.html.")
+endif()
+if(NOT EXISTS "${NINFER_WEBUI_SRC}/index.html")
+  message(FATAL_ERROR
+    "NINFER_WEBUI_SRC='${NINFER_WEBUI_SRC}' does not contain index.html; it must be a built llama.cpp webui tree.")
+endif()
+
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)

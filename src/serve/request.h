@@ -178,7 +178,10 @@ struct GenerationRequest {
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
     bool stop_strings_apply_to_reasoning = false;
-    int max_tokens                       = 0; // resolved budget; zero means immediate output limit
+    int max_tokens                       = 0; // resolved output budget; the chat path pins a
+                                              // positive value (a non-positive client request
+                                              // resolves to the server default), zero remains the
+                                              // no-generation signal for direct callers
     std::optional<bool> enable_thinking;      // unset => use the server default
     std::optional<std::uint32_t> thinking_budget;
     std::optional<RequestedReasoningEffort> reasoning_effort;

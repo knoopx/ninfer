@@ -44,7 +44,9 @@ std::optional<std::uint64_t> get_seed(const Json& object) {
     const Json& value = object.at("seed");
     if (!value.is_number_integer()) { bad_request("seed must be an integer", "seed"); }
     if (value.is_number_unsigned()) { return value.get<std::uint64_t>(); }
-    return static_cast<std::uint64_t>(value.get<std::int64_t>());
+    const std::int64_t signed_value = value.get<std::int64_t>();
+    if (signed_value < 0) { bad_request("seed must be nonnegative", "seed"); }
+    return static_cast<std::uint64_t>(signed_value);
 }
 
 ChatRole parse_message_role(const std::string& role) {
@@ -492,6 +494,10 @@ ChatTurn parse_tool_message(const Json& item, std::size_t index, bool legacy_fun
         !item.at("tool_call_id").is_string()) {
         bad_request("tool_call_id must be a string", "messages");
     }
+    if (item.contains("tool_call_id") && !item.at("tool_call_id").is_null() &&
+        item.at("tool_call_id").is_string() && item.at("tool_call_id").get<std::string>().empty()) {
+        bad_request("tool_call_id must not be empty", "messages");
+    }
     if (!item.contains("content") || item.at("content").is_null()) {
         bad_request("tool messages must contain content", "messages");
     }
@@ -868,34 +874,42 @@ void parse_response_observations(const Json& body, OpenAIChatRequest& output) {
 
 void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAIChatRequest& output) {
     std::optional<int> limit = optional_int(body, "max_completion_tokens");
-    const char* param        = "max_completion_tokens";
-    if (!limit) {
-        limit = optional_int(body, "max_tokens");
-        param = "max_tokens";
-    }
-    if (limit) {
-        if (*limit < 0) { bad_request(std::string(param) + " must be nonnegative", param); }
+    if (!limit) { limit = optional_int(body, "max_tokens"); }
+    if (limit && *limit > 0) {
         output.generation.max_tokens  = *limit;
         output.output_tokens_explicit = true;
     } else {
+        // No explicit limit, or a non-positive one (the llama.cpp webui sends -1 for "unlimited"): a
+        // non-positive explicit budget resolves to the server default, which the Engine clamps to
+        // its effective context capacity (no negative or zero budget reaches the request).
         output.generation.max_tokens = limits.default_max_tokens;
     }
 }
 
 } // namespace
 
-OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
+OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits,
+                                                 const std::string& default_model_id) {
     require_object(body, "request body must be a JSON object");
     validate_standard_output_controls(body);
     validate_constrained_decoding_extensions(body);
     validate_compatibility_hints(body);
 
     OpenAIChatRequest output;
-    if (!body.contains("model") || !body.at("model").is_string() ||
-        body.at("model").get<std::string>().empty()) {
+    // An explicit `model` field wins; otherwise fall back to the loaded artifact's public id
+    // (single-model clients such as the llama.cpp webui omit the field). An empty default with no
+    // model in the request is a malformed payload.
+    if (body.contains("model") && !body.at("model").is_null() && !body.at("model").is_string()) {
+        bad_request("model must be a string", "model");
+    }
+    if (body.contains("model") && body.at("model").is_string() &&
+        !body.at("model").get<std::string>().empty()) {
+        output.model = body.at("model").get<std::string>();
+    } else if (!default_model_id.empty()) {
+        output.model = default_model_id;
+    } else {
         bad_request("missing required field: model", "model");
     }
-    output.model = body.at("model").get<std::string>();
 
     const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 

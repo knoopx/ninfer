@@ -1,53 +1,75 @@
 # HTTP serving
 
-`build/apps/ninfer-serve` loads one registered artifact and exposes OpenAI- and
-Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
+`build/apps/ninfer-serve` exposes OpenAI- and Anthropic-compatible HTTP endpoints over the
+in-process multi-model router. The model list and every per-model engine preset come from a
+serve-config JSON file (`--config`, required); the process starts **no-resident** and loads a
+model on demand when the first request for it arrives, swapping the single GPU-resident model as
+needed. CLI flags cover only the global server, memory, and ingress options.
 
 ## Start the server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+cat > serve-config.json <<'EOF'
+{
+  "models": {
+    "qwen3.8-27b/nvfp4": {
+      "artifact": "models/qwen3_8_27b_nvfp4.ninfer",
+      "maxContext": 240000,
+      "kvCapacity": 240000,
+      "kvDtype": "fp8",
+      "spec": "mtp",
+      "draftTokens": 3,
+      "lmHeadDraft": true,
+      "vision": true
+    }
+  },
+  "healthCheckTimeout": 300,
+  "globalTTL": 300
+}
+EOF
+
+./build/apps/ninfer-serve \
+  --config serve-config.json \
   --host 127.0.0.1 \
   --port 8080 \
-  --max-context 240000 \
-  --kv-capacity 240000 \
   --max-concurrency 2 \
-  --kv-dtype fp8 \
   --device-state-slots 2 \
   --host-state-slots 8 \
   --host-kv-mib 8192 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft \
   --preserve-thinking
 ```
 
-The command uses Qwen3.8-27B NVFP4. Each request has a 240,000-token logical ceiling. A shared
-240,000-token Main Text KV pool serves admitted requests; either request may use the full capacity
-when running alone, and two requests run concurrently when their complete reservations fit.
+The config uses Qwen3.8-27B NVFP4. Its `maxContext` gives each request a 240,000-token logical
+ceiling; `kvCapacity` fixes a shared 240,000-token Main Text KV pool that serves admitted
+requests, so either request may use the full capacity when running alone, and two requests run
+concurrently when their complete reservations fit.
 
-With `C=2` and two extra Device checkpoint slots, the process owns two active StateImage guarantees
-plus a global pool of two Device-resident checkpoints. Eight pinned Host State slots and 8 GiB of
-pinned Host KV retain inactive continuations under Device pressure. Active request capacity is two.
+With `--max-concurrency 2` and two extra Device checkpoint slots, the process owns two active
+StateImage guarantees plus a global pool of two Device-resident checkpoints. Eight pinned Host
+State slots and 8 GiB of pinned Host KV retain inactive continuations under Device pressure.
+Active request capacity is two.
 
-Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
-selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
-artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`, with
-`--lm-head-draft` optional. DFlash2 accepts draft counts 1..15 and supports the same sampling,
+Other artifacts use the same shape with their own `models` entry (and their own engine presets).
+For 35B-A3B DFlash, set the model's speculative fields to `"spec": "dflash"`,
+`"draftTokens": 7`, `"lmHeadDraft": true` in its config entry. Qwen3.8-27B artifacts with
+DFlash2 companion weights also support `"spec": "dflash2"` with `"draftTokens": 7`, leaving
+`lmHeadDraft` optional. DFlash2 accepts draft counts 1..15 and supports the same sampling,
 concurrency, prefix reuse, and image/video request surfaces. It may remain combined with
-`--vision`.
+`"vision": true`.
 
 When `--model-id` is omitted, the server advertises and accepts the loaded container's exact
 `identity.model_id`. An explicit `--model-id` remains a public HTTP alias override and does not
 select or alter the artifact.
 
 Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
-allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
-`--vision` when the server must accept image or video input. Speculative residency is likewise
-frozen by `--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
-`--lm-head-draft` additionally loads the optimized proposal head. DFlash on 35B-A3B and DFlash2 on Qwen3.8-27B can be combined
-with `--vision`; each accelerates generated-text decode after multimodal prefill, while Vision encode
-and prefill remain outside speculative acceleration. A later request cannot enable a capability
-omitted at startup.
+allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Set
+the model's `"vision": true` in the serve config when the model must accept image or video input.
+Speculative residency is likewise frozen by the model's `spec` (`mtp|dflash|dflash2`) and
+`draftTokens` fields; omitting `spec` loads no speculative backend. `lmHeadDraft` additionally
+loads the optimized proposal head. DFlash on 35B-A3B and DFlash2 on Qwen3.8-27B can be combined
+with `"vision": true`; each accelerates generated-text decode after multimodal prefill, while
+Vision encode and prefill remain outside speculative acceleration. A later request cannot enable
+a capability omitted at load.
 
 ## Endpoints
 
@@ -64,10 +86,21 @@ omitted at startup.
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `POST /models/load` | llama.cpp compatibility: load/swap the resident model |
+| `POST /models/unload` | llama.cpp compatibility: force the no-resident state |
+| `GET /models/sse` | llama.cpp compatibility: live model-status SSE feed |
+| `GET /slots` | llama.cpp compatibility: live concurrency slot state |
+| `GET /tools` | llama.cpp compatibility: list registered server-side tools |
+| `POST /tools` | llama.cpp compatibility: execute a server-side tool |
+| `POST /v1/streams/lookup` | llama.cpp compatibility: list active conversation streams |
+| `GET /v1/stream/{id}` | llama.cpp compatibility: replay + live-tail a registered stream |
+| `DELETE /v1/stream/{id}` | llama.cpp compatibility: cancel + remove a registered stream |
+| `POST /v1/chat/completions/control` | llama.cpp compatibility: cancel an in-flight generation |
 
-`GET /health` returns HTTP 200 with `{"status":"ok"}` while the Engine can accept work. After an
-Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}`. Temporary queue
-saturation does not make the Engine unavailable. The endpoint remains unauthenticated.
+`GET /health` is a pure liveness probe: while the server process is up it always returns HTTP 200
+with `{"status":"ok"}`, independent of model load state (a startup /health with nothing loaded is
+still 200). Per-model readiness is surfaced via the `GET /v1/models` `status` field
+(`loaded`/`unloaded`), not via /health. The endpoint remains unauthenticated.
 
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
@@ -103,9 +136,10 @@ The endpoint supports:
   separators, and empty wire content remains an empty turn;
 - User `image_url` parts, tool-result `image_url` parts used by compatible clients, and the User
   `video_url` extension using HTTP(S) or data URIs; image detail is omitted or `auto`;
-- nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
-  processing without generation;
-- `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
+- nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; a non-positive or
+  omitted output budget resolves to the server `defaultMaxTokens` (clamped to the engine's context
+  capacity);
+- `temperature`, `top_p`, presence/frequency penalties, and nonnegative integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
 - `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
@@ -114,7 +148,8 @@ The endpoint supports:
 - llama.cpp-compatible terminal `timings`, plus opt-in `timings_per_token` and
   streaming `return_progress` observations;
 - non-strict function tools with `tool_choice` `auto`, `none`, or `allowed_tools` in `auto` mode,
-  parallel calls enabled, assistant tool-call history, tool-result messages, and legacy
+  parallel calls enabled, assistant tool-call history, tool-result messages whose `tool_call_id`
+  is a non-empty string (an empty value is rejected with HTTP 400), and legacy
   function-call history;
 - the top-level `reasoning_effort` field;
 - `enable_thinking` and `preserve_thinking`, either at top level or in
@@ -155,14 +190,17 @@ and availability failures retain their dedicated codes. Internal invariant failu
 relabeled as client input errors.
 
 The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
-the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
+the explicit `--model-id` override. A non-string `model` value is rejected with HTTP 400 code
+`invalid_request_error` (param `model`); an empty string or `null` model is not rejected and
+resolves to the default. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
 
 Across Chat Completions, Responses, and Anthropic Messages, a direct top-level tool-parameter
 `type`, or an `anyOf`/`oneOf` composed entirely of explicit primitive types, guides conversion of
 Qwen's untyped parameter text. It does not decide whether structurally complete markup is a tool
-call. String-admitting values remain strings, including the empty string. An empty block for a
-declared non-string parameter is omitted. Admitted JSON values retain their JSON type;
+call. String-admitting values remain strings, including the empty string; the only
+exception is a tool-result message's `tool_call_id`, which must be non-empty. An empty block
+for a declared non-string parameter is omitted. Admitted JSON values retain their JSON type;
 case-insensitive boolean text is normalized to `true` or `false`. A nonempty schema mismatch remains
 a structured call: valid JSON retains its represented type and other text becomes a JSON string so
 the tool consumer can report the validation error and continue the agent loop. Schemas without a
@@ -295,7 +333,7 @@ denominator is nonzero.
 
 ### Multimodal request
 
-Start the server with `--vision` before sending media:
+Start the model with its `"vision": true` serve-config field before sending media:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -316,10 +354,11 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
-media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
-has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision limit is therefore
-`min(--max-context, 32768)`. There is no fixed image/video item-count limit: item count is admitted
-through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
+media-token expansion, the result must fit the model's context ceiling (`maxContext` in the serve
+config). The current Vision runtime also has a 32,768 merged-token envelope (131,072 raw patches);
+the effective Vision limit is therefore `min(maxContext, 32768)`. There is no fixed image/video
+item-count limit: item count is admitted through aggregate source-byte, decoded-pixel, raw-patch,
+Vision-token, and live-memory budgets.
 
 Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
 pool. Prepared payloads are keyed by SHA-256 of the acquired bytes plus modality, so repeated media
@@ -330,8 +369,8 @@ not invalidate a request reference, and live bytes are returned only when the fi
 released. A request-level preparation gate derived from the live limit prevents concurrent partial
 builds from deadlocking the memory account.
 
-An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded`, including
-the prepared token count and configured context ceiling. A media preprocessing resource rejection
+An expanded prompt beyond the model's context ceiling (`maxContext`) returns HTTP 400
+`context_length_exceeded`, including the prepared token count and configured context ceiling. A media preprocessing resource rejection
 returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
 body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
 resource errors.
@@ -406,7 +445,7 @@ wire response contains typed `output` Items.
 | `input` | string or typed Item array; it may be omitted or empty only when `previous_response_id` already supplies a user query |
 | `instructions` | optional string, inserted before the reconstructed conversation for this request only |
 | `previous_response_id` | optional ID of a retained local Response |
-| `max_output_tokens` | non-negative integer; omission executes with `--default-max-tokens` but remains `null` in the Response object |
+| `max_output_tokens` | non-negative integer; omission executes with the model's `defaultMaxTokens` serve-config field (default `8192`) but remains `null` in the Response object |
 | `stream` | boolean; `true` selects Responses SSE rather than a JSON body |
 | `store` | boolean, default `true`; controls local retrieval and continuation state |
 | `temperature` | finite number in `[0,2]` |
@@ -442,8 +481,8 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `input_text` | message content part containing string `text` |
 | `output_text` | assistant-message replay part containing string `text` |
 | `refusal` | assistant-message replay part; its text enters assistant history |
-| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
-| `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
+| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires the model's `vision` serve-config field |
+| `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires the model's `vision` serve-config field |
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
 | `function_call_output` | completed result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
@@ -670,7 +709,8 @@ positional: a string-form System value, a later array block, or an inline System
 same text remains ordinary prompt content. A `cache_control` marker attached to the consumed block
 is consumed with it rather than moved to adjacent content.
 
-`max_tokens` is optional for local clients and otherwise uses `--default-max-tokens`; a positive
+`max_tokens` is optional for local clients and otherwise uses the model's `defaultMaxTokens`
+serve-config field (default `8192`); a positive
 value is the complete output budget. `max_tokens:0` is rejected because NInfer does not expose a
 completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, and
 `stop_sequences` enter Engine execution. A matched custom stop is returned as
@@ -737,6 +777,128 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
   }'
 ```
 
+## llama.cpp / llama-ui compatibility
+
+The bundled webui (`ggml-org/llama-ui`, a llama.cpp/llama-swap client) is served at `/` with
+`--webui` and is most useful in ROUTER mode (multi-model via `--config`). It drives the
+server-management routes below, which NInfer implements as **real, working functionality** backed
+by serving-owned state: a server-side stream registry, a tool registry, live slot introspection,
+a router-hooked model-status feed, and an owner-addressable cancellation token. These routes are a
+**compatibility surface for that webui**, not part of the OpenAI or Anthropic protocol contract
+documented above. NInfer ships no built-in server-side tools, and the live-generation behaviors
+(a busy slot, a mid-stream cancel, a real load/unload transition) need a resident model on a real
+GPU; without one, each route still answers with its real, structured response (an empty list, an
+idle slot, `success: false`, or a well-formed error) rather than fabricating state. They are
+key-gated by `--api-key` like the other API paths.
+
+| Method and path | Behavior |
+|---|---|
+| `POST /models/load` | load/swap the resident model (ModelRouter) |
+| `POST /models/unload` | force the no-resident state (ModelRouter) |
+| `GET /models/sse` | router-hooked model-status SSE feed (live `model_status` events + keepalive) |
+| `GET /slots` | live concurrency slot state (`is_processing`, `?model=`) |
+| `GET /tools` | list registered server-side tools |
+| `POST /tools` | execute a registered server-side tool |
+| `POST /v1/streams/lookup` | list active (non-done) conversation streams |
+| `GET /v1/stream/{id}` | replay + live-tail a registered stream (`?from=` byte offset) |
+| `DELETE /v1/stream/{id}` | cancel + remove a registered stream |
+| `POST /v1/chat/completions/control` | cancel an in-flight generation (`{"success":…}`) |
+
+### Model load and unload
+
+- `POST /models/load` — body `{"model": <id>}`. Runs the in-process router's on-demand load/swap:
+  it evicts the current resident and loads the target. This is the single-GPU, one-resident,
+  sequential-swap model — no concurrent residency and no preemption of in-flight requests.
+  `extra_args` and other body fields are ignored (model config is fixed at registration).
+  `200 {"model":<id>,"status":"loaded"}`; `400 model_required` when `model` is missing;
+  `404 model_not_found` for an unknown id; `429 rate_limit_exceeded` when the
+  concurrency/queue limit is reached.
+- `POST /models/unload` — body `{"model": <id>}`. Forces the no-resident state: the single
+  resident is unloaded, and a named model that is not the loaded one still returns `200`.
+  `200 {"model":<id>,"status":"unloaded"}`; `404 model_not_found` for an unknown or missing
+  `model`.
+
+### Model-status feed
+
+- `GET /models/sse` — `Content-Type: text/event-stream`. The feed is **router-hooked pub/sub**:
+  on every real `ModelRouter` transition (load, swap-ready, explicit unload, or TTL eviction) the
+  router emits a status event, and the hub fans it out to all connected clients as a live
+  `model_status` record. Idle subscribers also receive periodic `: keep-alive` comments on a 5 s
+  cadence. Delivery is non-blocking, and a client that cannot drain its queue is dropped so one
+  slow reader never stalls the router's event path. Record shape:
+
+  ```json
+  {"event":"model_status","model":"<id>","data":{"status":"<status>","exit_code":0}}
+  ```
+
+  `data.status` is `unloaded`, `loading`, or `loaded` (the router's live state); `data.progress`
+  is present only while `status` is `loading`. With no resident model the feed opens with an
+  `unloaded` record and then holds the connection with keepalives.
+
+### Live slot state
+
+- `GET /slots` — `200` with a JSON array of **`max_concurrency` slot objects**, one per
+  configured concurrency slot; `?model=<name>` filters to that model's slots. Each slot:
+
+  ```json
+  {"id":0,"model":"<id>","is_processing":true,"state":"decode"}
+  ```
+
+  `is_processing` is `true` for a slot holding an in-flight generation and `false` otherwise,
+  computed from the router's live in-flight count, the resident model, and the backend's
+  `runtime_stats()`. `state` is an informational `idle` / `prefill` / `decode` / `loading`
+  label. With no resident model the array reports `max_concurrency` idle slots
+  (`is_processing:false`, `state:"idle"`, empty `model`) — the correct live state, not an empty
+  list.
+
+### Server-side tool registry
+
+- `GET /tools` — `200` with a JSON array of the registered tools, each `{"name":<name>,
+  "definition":<json schema>,"enabled":true}`. NInfer ships **no built-in server-side tools**
+  (it is a client-side function-calling engine), so the registry starts empty and this returns
+  `200 []`.
+- `POST /tools` — body `{"tool":<name>,"params":<object>}`. **Executes** the named tool through
+  the server-side dispatcher and returns `200` with `{"plain_text_response":<result>}` on
+  success or a structured `{"error":"<message>"}` on failure. For a tool that is not registered
+  the dispatcher answers `{"error":"tool '<name>' is not available on this server"}`. The
+  dispatch machinery is real; only the default tool set is empty.
+
+### Conversation-stream registry
+
+NInfer keeps a **server-side `StreamRegistry`** — its first durable server-side state — keyed by
+the stream id the webui sends in the `X-Conversation-Id` header (`conversationId::model`). Each
+in-flight *streaming* chat completion registers an entry whose raw SSE bytes are buffered, so a
+stream can be re-attached by byte offset and tailed live from another request.
+
+- `POST /v1/streams/lookup` — body `{"conversation_ids":[<id>, …]}`. `200` with a JSON array of
+  the **active (non-done)** matching streams, each `{"conversation_id":<id>,"is_done":false,
+  "started_at":<epoch s>}`; `200 []` when none of the ids are active.
+- `GET /v1/stream/{id}` — `Content-Type: text/event-stream`. Replays the buffered SSE from the
+  byte offset in `?from=` (default `0`), then **live-tails** new frames until the stream is done
+  and closes. An unknown `{id}` returns `404` with `{"error":{"code":"stream_not_found"}}`.
+- `DELETE /v1/stream/{id}` — removes the stream and, if its generation is in flight, cancels it.
+  `200` with `{"cancelled":true}` when the stream was found and removed, `{"cancelled":false}`
+  when the stream was unknown (never registered, or already reaped past its retention window); a
+  done-but-not-yet-reaped stream is still found and removed, so it reports `{"cancelled":true}`.
+
+### Reasoning control (cancellation)
+
+- `POST /v1/chat/completions/control` — body `{"id":<completion id or stream id>,"action":
+  "reasoning_end","model"?}`. Signals the matching in-flight generation to **stop now**, via the
+  per-stream cancel token that composes into the `CancellationView` channel the Engine already
+  polls between decode rounds. Returns `200` with `{"success":true}` when the id resolved and the
+  generation was signalled, or `{"success":false}` when the id is unknown. This is an
+  owner-initiated stop of one request's generation — **not** scheduler preemption: it touches no
+  other request, reorders no FIFO, and evicts no resident model.
+
+### Under the hood
+
+Two serving-owned additions back these routes: a `StreamRegistry` (durable, keyed state that
+outlives a single HTTP response) and a per-generation cancel token held by each registry entry and
+OR-composed into the existing `CancellationView`, whose decode-loop observation point is
+unchanged. Both live entirely in the serving layer (`src/serve/`); the Engine itself is not
+modified.
+
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
@@ -751,20 +913,20 @@ curl http://127.0.0.1:8080/v1/models \
 
 ## Server options
 
-The table lists executable defaults. The startup example selects a long-context FP8/MTP3 profile.
+The table lists executable CLI defaults. Per-model engine presets (context, KV, speculative,
+prefill, vision, output limit) live in the serve-config JSON (the field table follows the CLI
+options); the startup example selects a long-context FP8/MTP3 profile.
 
 | Option | Meaning | Default |
 |---|---|---:|
+| `--config FILE` | multi-model serve config: the model list plus per-model engine presets (required) | none |
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
-| `--max-context N` | logical context ceiling of each sequence | `8192` |
-| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
-| `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
+| `--max-concurrency N` | the single concurrency setting: maximum in-flight requests per model (the router's admission gate and the engine decode-batch count); valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
-| `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
@@ -776,13 +938,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
-| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
-| `--spec mtp\|dflash\|dflash2` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
-| `--lm-head-draft` | optimized proposal head | off |
-| `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
-| `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
@@ -802,6 +958,37 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--frequency-penalty F` | process-level frequency-penalty override | unset |
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
+
+Per-model engine presets are set per model entry in the serve-config JSON (`--config FILE`), not
+on the command line. A model entry without a field uses the shared default; a field present on
+one model never affects another. Top-level config fields:
+
+| Field | Meaning | Default |
+|---|---|---:|
+| `models` | object mapping each public model ID to its entry; at least one entry required | none |
+| `healthCheckTimeout` | seconds the router waits for a loaded model's readiness gate | `120` |
+| `globalTTL` | idle seconds before a loaded model is unloaded; a model's own `ttl` wins when `> 0`; `0` disables auto-unload | `0` |
+
+Per-model entry fields (all optional; an absent field uses the default):
+
+| Field | Meaning | Default |
+|---|---|---:|
+| `artifact` | path to the `.ninfer` artifact | required |
+| `identity` | the model ID the Engine reports; also the key's default | the entry key |
+| `aliases` | extra public IDs that resolve to this model | `[]` |
+| `ttl` | idle seconds before this model is unloaded; `0` falls back to `globalTTL` | `0` |
+| `maxContext` | logical context ceiling of each sequence of this model | `8192` |
+| `defaultMaxTokens` | output limit when a request omits `max_tokens`/`max_output_tokens` | `8192` |
+| `kvCapacity` | explicit shared Main Text KV token count, or `"auto"` to maximize it from remaining GPU memory; omitted follows `maxContext` | `maxContext` |
+| `kvDtype` | KV-cache storage: `bf16`/`int8`/`fp8`/`nvfp4`/`k8v4` | `bf16` |
+| `spec` | speculative backend `mtp`/`dflash`/`dflash2`; omitted loads no speculative backend | off |
+| `draftTokens` | MTP `1..5`; DFlash/DFlash2 `1..15` (used only with `spec`) | unset |
+| `lmHeadDraft` | optimized proposal head (used only with `spec`) | off |
+| `prefillChunk` | text-prefill chunk (positive multiple of 128) | `1024` |
+| `vision` | enable media input and load the model's Vision GPU allocations | off |
+
+The router logs the complete preset set of a model (identity, the normalized engine parameters,
+and which fields the config set) at each on-demand load or swap-in.
 
 Context-cost coefficients resolve once at startup from generic defaults, matching compiled values,
 and optional transfer or artifact-prefill entries from `--context-cost-presets FILE`. A malformed
@@ -950,10 +1137,10 @@ media request retains the same cancellation and timeout deadline. Model output i
 same finite request count and each request's effective output-token limit; output callbacks and
 network serialization run outside the GPU executor and do not delay formation of the next batch.
 
-`--max-context` is each sequence's logical ceiling. `--kv-capacity` fixes the shared Main Text KV
-pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
-and leaves 1 GiB of sizing headroom; omitting the option makes it follow `--max-context`. Capacity
-resolves once at startup.
+`maxContext` (the model's serve-config field) is each sequence's logical ceiling. `kvCapacity`
+fixes the shared Main Text KV pool used by active requests and retained prefixes. `auto`
+accounts for the complete enabled runtime and leaves 1 GiB of sizing headroom; omitting the field
+makes it follow `maxContext`. Capacity resolves once at the model's load.
 
 Admission reserves the full prompt-plus-effective-output page entitlement through request
 completion. A request remains queued until a legal resource plan can satisfy that entitlement.

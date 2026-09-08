@@ -1,5 +1,7 @@
 #include "serve/operational_log.h"
 
+#include "serve/model_router.h"
+
 #include "product/logging/pretty_format.h"
 #include "product/speculative_options.h"
 
@@ -10,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
@@ -446,11 +449,11 @@ void OperationalLog::http_failure(std::string_view endpoint, const RequestFailur
     write({.severity = failure_severity(failure.classification), .message = out.str()});
 }
 
-void OperationalLog::engine_capacity(const GenerationService& service) const {
-    const ninfer::MemorySummary memory            = service.memory_summary();
-    const ninfer::EngineOptions& engine           = service.engine_options();
+void OperationalLog::engine_capacity(const ModelBackend& backend) const {
+    const ninfer::MemorySummary memory            = backend.memory_summary();
+    const ninfer::EngineOptions& engine           = backend.engine_options();
     const ninfer::ContextCacheOptions& cache      = engine.context_cache;
-    const ninfer::ContextCostSummary context_cost = service.load_summary().context_cost;
+    const ninfer::ContextCostSummary context_cost = backend.load_summary().context_cost;
 
     logger_->info("capacity | KV {} tokens, {}, {} | pages {}/{} | runtime {} | free {}",
                   product::format_pretty_count(memory.kv_capacity), kv_cache_name(memory.kv_cache),
@@ -472,11 +475,14 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
         logger_->info("context cache | root only");
     }
 
-    if (service.options().enable_vision) {
-        const ninfer::MediaCacheSummary media = service.media_cache_summary();
+    if (engine.enable_vision) {
+        // Configured media capacity from engine_options() (the router backend interface does not
+        // expose the live MediaCacheSummary; these configured values are the capacity this line
+        // reports, consistent with the rest of engine_capacity).
         logger_->info("media | {} preprocess workers | cache {} | live {}",
-                      media.preprocess_threads, product::format_pretty_bytes(media.capacity_bytes),
-                      product::format_pretty_bytes(media.live_capacity_bytes));
+                      engine.media_preprocess_threads,
+                      product::format_pretty_bytes(engine.media_cache_bytes),
+                      product::format_pretty_bytes(engine.media_live_bytes));
     }
 
     logger_->debug("memory ledger | after weights {} | after startup {} | headroom {} | slack {} | "
@@ -492,6 +498,139 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                    product::format_pretty_text(context_cost.hardware_class),
                    product::format_pretty_text(context_cost.model_id),
                    product::format_pretty_text(context_cost.weights_id));
+}
+
+void OperationalLog::model_preset(const EngineModelBackend& backend, const ModelConfig& model,
+                                  const ServeOptions& base) const {
+    const ServeOptions& effective = backend.serve_options();
+    const ninfer::EngineOptions& engine = backend.engine_options();
+    const ninfer::SpeculativeOptions& spec = engine.speculative;
+
+    // Identity + admission: the router's admission gate is the single concurrency setting,
+    // the shared --max-concurrency (ServeOptions.max_concurrency).
+    const int concurrency = static_cast<int>(base.max_concurrency);
+
+    // Effective engine parameters (the once-normalized EngineOptions the Engine was constructed
+    // with; the serve config's per-model overrides are already applied to these values).
+    std::ostringstream spec_out;
+    if (spec.backend == ninfer::SpeculativeBackend::None) {
+        spec_out << "off";
+    } else {
+        spec_out << product::speculative_backend_name(spec.backend) << ' ' << spec.draft_tokens
+                 << " draft";
+        if (spec.proposal_head == ninfer::ProposalHead::Optimized) { spec_out << " lm-head-draft"; }
+    }
+    const std::string kv_capacity =
+        engine.kv_capacity.mode == ninfer::KvCapacityMode::Automatic
+            ? std::string{"auto"}
+            : product::format_pretty_count(engine.kv_capacity.explicit_tokens);
+
+    // Shared memory / ingress / serving values (pinned-memory capacities and the request queue
+    // bounds this model's Engine was constructed with; media lines only while vision is on).
+    std::ostringstream mem_out;
+    if (engine.context_cache.enabled) {
+        mem_out << product::format_pretty_bytes(engine.context_cache.host_kv_capacity_bytes)
+                << " host KV, "
+                << product::format_pretty_count(engine.context_cache.host_state_slots)
+                << " host states";
+        if (engine.context_cache.device_state_slots.has_value()) {
+            mem_out << ", " << product::format_pretty_count(*engine.context_cache.device_state_slots)
+                    << " device states";
+        }
+    } else {
+        mem_out << "root-only context cache";
+    }
+
+    // Thinking mode (the serving defaults a request inherits unless it opts out per request).
+    std::ostringstream think_out;
+    think_out << (effective.enable_thinking ? "thinking on" : "thinking off");
+    if (effective.preserve_thinking) { think_out << " preserve"; }
+    if (effective.default_thinking_budget.has_value()) {
+        think_out << " budget " << product::format_pretty_count(*effective.default_thinking_budget);
+    }
+
+    // Explicit sampling overrides (emitted only when the serving layer pins one; otherwise the
+    // registered model's sampling defaults govern).
+    std::ostringstream sample_out;
+    if (effective.greedy) { sample_out << "greedy"; }
+    if (effective.sampling_overrides.temperature.has_value()) {
+        sample_out << " temperature " << *effective.sampling_overrides.temperature;
+    }
+    if (effective.sampling_overrides.top_p.has_value()) {
+        sample_out << " top-p " << *effective.sampling_overrides.top_p;
+    }
+    if (effective.sampling_overrides.top_k.has_value()) {
+        sample_out << " top-k " << *effective.sampling_overrides.top_k;
+    }
+    if (effective.sampling_overrides.min_p.has_value()) {
+        sample_out << " min-p " << *effective.sampling_overrides.min_p;
+    }
+    if (effective.sampling_overrides.presence_penalty.has_value()) {
+        sample_out << " presence " << *effective.sampling_overrides.presence_penalty;
+    }
+    if (effective.sampling_overrides.frequency_penalty.has_value()) {
+        sample_out << " frequency " << *effective.sampling_overrides.frequency_penalty;
+    }
+    if (effective.sampling_overrides.seed.has_value()) {
+        sample_out << " seed " << *effective.sampling_overrides.seed;
+    }
+
+    // The per-model overrides the serve config actually set (absent => every engine parameter
+    // above came from the shared serving defaults, not this model's config entry).
+    std::vector<std::string_view> overrides;
+    if (model.overrides.max_context.has_value()) { overrides.push_back("maxContext"); }
+    if (model.overrides.default_max_tokens.has_value()) { overrides.push_back("defaultMaxTokens"); }
+    if (model.overrides.kv_capacity.has_value()) { overrides.push_back("kvCapacity"); }
+    if (model.overrides.kv_cache.has_value()) { overrides.push_back("kvDtype"); }
+    if (model.overrides.speculative.has_value()) { overrides.push_back("spec"); }
+    if (model.overrides.prefill_chunk.has_value()) { overrides.push_back("prefillChunk"); }
+    if (model.overrides.enable_vision.has_value()) { overrides.push_back("vision"); }
+    std::ostringstream ov_out;
+    for (std::size_t i = 0; i < overrides.size(); ++i) {
+        if (i != 0) { ov_out << ' '; }
+        ov_out << overrides[i];
+    }
+
+    // Combine all sections into a single log line.
+    std::ostringstream combined;
+    combined << "model preset | "
+             << product::format_pretty_text(model.id)
+             << " | artifact " << model.artifact
+             << " | concurrency " << std::to_string(concurrency)
+             << " | ttl " << (model.ttl > 0 ? std::to_string(model.ttl) + " s" : "off");
+
+    combined << " | context " << product::format_pretty_count(engine.max_context)
+             << " | kv " << kv_capacity << ' ' << kv_cache_name(engine.kv_cache)
+             << " | spec " << spec_out.str()
+             << " | prefill-chunk " << product::format_pretty_count(engine.prefill_chunk)
+             << " | vision " << (engine.enable_vision ? "on" : "off");
+
+    combined << " | " << mem_out.str()
+             << " | pending " << product::format_pretty_count(effective.max_pending_requests)
+             << " (" << product::format_pretty_count(effective.pending_timeout_ms) << " ms)"
+             << " | default-max-tokens "
+             << product::format_pretty_count(effective.default_max_tokens);
+
+    if (engine.enable_vision) {
+        combined << " | media cache "
+                 << product::format_pretty_bytes(engine.media_cache_bytes)
+                 << " | media live "
+                 << product::format_pretty_bytes(engine.media_live_bytes)
+                 << " | preprocess workers "
+                 << product::format_pretty_count(engine.media_preprocess_threads);
+    }
+
+    combined << " | " << think_out.str();
+
+    if (!sample_out.str().empty()) {
+        combined << " | sampling " << sample_out.str();
+    }
+
+    if (!ov_out.str().empty()) {
+        combined << " | overrides " << ov_out.str();
+    }
+
+    logger_->info("{}", combined.str());
 }
 
 void OperationalLog::warmup_started() const { logger_->debug("warming up"); }
@@ -520,7 +659,9 @@ void OperationalLog::listen_failure(std::string_view host, int port) const {
 void OperationalLog::server_ready(std::string_view host, int port, std::string_view model_id,
                                   bool auth_enabled) const {
     logger_->info("listening on http://{}:{} | model {} | auth {}",
-                  product::format_pretty_text(host), port, product::format_pretty_text(model_id),
+                  product::format_pretty_text(host), port,
+                  model_id.empty() ? std::string{"UNLOADED"}
+                                   : product::format_pretty_text(model_id),
                   auth_enabled ? "bearer" : "disabled");
 }
 

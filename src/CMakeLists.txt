@@ -371,11 +371,16 @@ if(NINFER_BUILD_SERVE)
   # HTTP protocol/product adapter. No serving header is part of the public API.
   add_library(ninfer_serve STATIC
     serve/http_transport.cpp
+    serve/model_sse_hub.cpp
+    serve/stream_registry.cpp
+    serve/tool_registry.cpp
     serve/request_validation.cpp
     serve/openai_chat_request.cpp
     serve/openai_chat_response.cpp
     serve/openai_chat_http.cpp
     serve/openai_common.cpp
+    serve/model_config.cpp
+    serve/model_router.cpp
     serve/openai_responses_request.cpp
     serve/openai_responses_state.cpp
     serve/openai_responses_response.cpp

@@ -245,7 +245,6 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
         request = parse_openai_responses_create_request(parse_json_body(req), limits);
-        validate_openai_model(request.prompt.model, public_model_id_);
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
                                                    request.store);
     } catch (const ApiException& exception) {
@@ -266,9 +265,57 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         .output_tokens_explicit            = request.requested_max_output_tokens.has_value(),
         .preserve_thinking_semantic_change = resolved.preserve_thinking_semantic_change,
     };
+
+    // Route through the in-process router (supersedes validate_openai_model): unknown model -> 404;
+    // a concurrency-limit / queue-full breach -> 429. The Grant keeps the granted backend alive
+    // for the whole request; the streaming path moves it into the stream.
+    ModelRouter::Grant grant;
+    try {
+        grant = router_->route(request.prompt.model);
+    } catch (const std::out_of_range& exception) {
+        ApiError error;
+        error.status  = 404;
+        error.type    = "invalid_request_error";
+        error.param   = "model";
+        error.code    = "model_not_found";
+        error.message = exception.what();
+        const ApiError logged = responses_error(error);
+        record_request_rejected(make_request_rejection_log_context(
+            req_id, "openai_responses", resolved.generation, metadata, logged));
+        write_openai_error(res, logged);
+        return;
+    } catch (const std::overflow_error& exception) {
+        ApiError error;
+        error.status  = 429;
+        error.type    = "invalid_request_error";
+        error.param   = "model";
+        error.code    = "rate_limit_exceeded";
+        error.message = exception.what();
+        const ApiError logged = responses_error(error);
+        record_request_rejected(make_request_rejection_log_context(
+            req_id, "openai_responses", resolved.generation, metadata, logged));
+        write_openai_error(res, logged);
+        return;
+    } catch (const std::exception& exception) {
+        // A rethrown factory/Engine exception from route() (a failed load, or a readiness-timeout /
+        // shutdown-during-install "model is not ready").
+        ApiError error;
+        error.status  = 503;
+        error.type    = "server_error";
+        error.param   = "model";
+        error.code    = "model_not_ready";
+        error.message = exception.what();
+        const ApiError logged = responses_error(error);
+        record_request_rejected(make_request_rejection_log_context(
+            req_id, "openai_responses", resolved.generation, metadata, logged));
+        write_openai_error(res, logged);
+        return;
+    }
+    auto* backend = grant.backend.get();
+
     PreparedRequest prepared;
     try {
-        prepared = service_->prepare(
+        prepared = backend->prepare(
             resolved.generation,
             request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
             {}, [&req] { return client_disconnected(req); }, std::move(resolved.cache_hints));
@@ -294,7 +341,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     if (!request.stream) {
         GenerationOutcome outcome;
         try {
-            outcome = service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
+            outcome = backend->run(prepared, nullptr, [&req] { return client_disconnected(req); });
         } catch (const ApiException& exception) {
             const ApiError error = responses_error(exception.error());
             lifecycle->failure(make_generation_request_failure(error));
@@ -371,9 +418,12 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             id, created, std::move(request), runtime_values(stream->prepared));
 
         prepare_sse_response(res);
+        // Move the Grant into the stream so the granted backend (Engine) outlives the streaming
+        // generation (see the OpenAI handlers for the copyability-wrapper rationale).
+        auto grant_keep = std::make_shared<ModelRouter::Grant>(std::move(grant));
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, stream, id, lifecycle](std::size_t, httplib::DataSink& sink) -> bool {
+            [this, stream, id, lifecycle, grant_keep](std::size_t, httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
                     return true;
@@ -420,7 +470,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     };
                     output.is_cancelled = [&] { return transport.poll(); };
 
-                    outcome = service_->run(stream->prepared, &output);
+                    outcome = grant_keep->backend->run(stream->prepared, &output, {});
                 } catch (const ClientDisconnected&) {
                     lifecycle->failure(
                         make_client_disconnected_failure(RequestFailurePhase::Transport));
@@ -514,11 +564,46 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
         limits.default_max_tokens = options_.default_max_tokens;
         OpenAIResponsesPromptRequest request =
             parse_openai_responses_input_tokens_request(parse_json_body(req), limits);
-        validate_openai_model(request.model, public_model_id_);
         OpenAIResponsesResolvedPrompt resolved =
             resolve_openai_responses_prompt(request, openai_responses_store_, std::nullopt, false);
-        const int tokens = service_->count_prompt_tokens(
-            resolved.generation, [&req] { return client_disconnected(req); });
+        // Route (supersedes validate_openai_model): unknown model -> 404; concurrency/queue -> 429.
+        ModelRouter::Grant grant;
+        try {
+            grant = router_->route(request.model);
+        } catch (const std::out_of_range& exception) {
+            ApiError error;
+            error.status  = 404;
+            error.type    = "invalid_request_error";
+            error.param   = "model";
+            error.code    = "model_not_found";
+            error.message = exception.what();
+            write_openai_error(res, responses_error(error));
+            return;
+        } catch (const std::overflow_error& exception) {
+            ApiError error;
+            error.status  = 429;
+            error.type    = "invalid_request_error";
+            error.param   = "model";
+            error.code    = "rate_limit_exceeded";
+            error.message = exception.what();
+            write_openai_error(res, responses_error(error));
+            return;
+        } catch (const std::exception& exception) {
+            // A rethrown factory/Engine exception from route() (a failed load, or a readiness-timeout
+            // / shutdown-during-install "model is not ready").
+            ApiError error;
+            error.status  = 503;
+            error.type    = "server_error";
+            error.param   = "model";
+            error.code    = "model_not_ready";
+            error.message = exception.what();
+            write_openai_error(res, responses_error(error));
+            return;
+        }
+        auto* backend = grant.backend.get();
+        const int tokens =
+            backend->count_prompt_tokens(resolved.generation,
+                                         [&req] { return client_disconnected(req); });
         res.set_content(make_openai_response_input_tokens_body(tokens), "application/json");
     } catch (const ApiException& exception) {
         write_openai_error(res, responses_error(exception.error()));

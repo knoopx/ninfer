@@ -73,7 +73,7 @@ bool valid_divisors(const WeightPlan& weight) {
 
 int verify_groupwise(const std::filesystem::path& path) {
     ninfer::artifact::Reader reader(path);
-    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen36GroupwiseInt) {
+    if (Package::resolve_weights(reader.identity(), reader) != WeightsProfile::Qwen36GroupwiseInt) {
         std::cerr << "groupwise identity resolved to the wrong profile\n";
         return 1;
     }
@@ -114,7 +114,7 @@ int verify_groupwise(const std::filesystem::path& path) {
 
 int verify_nvfp4(const std::filesystem::path& path) {
     ninfer::artifact::Reader reader(path);
-    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen36Nvfp4) {
+    if (Package::resolve_weights(reader.identity(), reader) != WeightsProfile::Qwen36Nvfp4) {
         std::cerr << "NVFP4 identity resolved to the wrong profile\n";
         return 1;
     }
@@ -257,9 +257,10 @@ int verify_dflash2_bundle(const std::filesystem::path& path, WeightsProfile prof
     return 0;
 }
 
-int verify_rejection() {
+int verify_rejection(const std::filesystem::path& path) {
+    const ninfer::artifact::Reader reader(path);
     try {
-        (void)Package::resolve_weights({"qwen3.6-27b", "unknown"});
+        (void)Package::resolve_weights({"qwen3.6-27b", "unknown"}, reader);
     } catch (const std::runtime_error& error) {
         const std::string message = error.what();
         if (message.find("qwen3.6-27b/unknown") != std::string::npos) { return 0; }
@@ -348,7 +349,7 @@ int main() {
         return 77;
     }
     if (const int result = verify_vision_workspace_planning(); result != 0) { return result; }
-    if (const int result = verify_rejection(); result != 0) { return result; }
+    if (const int result = verify_rejection(groupwise); result != 0) { return result; }
     if (const int result = verify_profile_mismatch_rejection(); result != 0) { return result; }
     if (const int result = verify_groupwise(groupwise); result != 0) { return result; }
     if (const int result = verify_nvfp4(nvfp4); result != 0) { return result; }

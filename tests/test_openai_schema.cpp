@@ -65,6 +65,34 @@ ninfer::RequestOptions options(const GenerationRequest& request) {
     return to_request_options(request, server, semantics(request), true);
 }
 
+// The llama.cpp webui runs one loaded artifact and does not send a `model` field; the dialect tests
+// parse against that default id.
+const char* webui_model() { return "qwen"; }
+
+OpenAIChatRequest parse_model(Json body) {
+    return parse_chat_completion_request(body, limits(), webui_model());
+}
+
+// A template capability set that supports the reasoning efforts the webui dialect reaches: the
+// chat template's reasoning-effort surface (low/medium/xhigh), not the client's `high` alias.
+ninfer::PromptCapabilities effort_capabilities() {
+    ninfer::PromptCapabilities capabilities;
+    capabilities.enable_thinking = true;
+    capabilities.reasoning_effort.low              = true;
+    capabilities.reasoning_effort.medium           = true;
+    capabilities.reasoning_effort.xhigh            = true;
+    capabilities.reasoning_effort.default_effort   = ninfer::ReasoningEffort::XHigh;
+    return capabilities;
+}
+
+ResolvedPromptSemantics effort_semantics(const GenerationRequest& request) {
+    return resolve_prompt_semantics(request, ServeOptions{}, effort_capabilities());
+}
+
+ninfer::PromptInput effort_prompt(const GenerationRequest& request) {
+    return to_prompt_input(request, effort_semantics(request), {});
+}
+
 Json parse_sse(const std::string& event) {
     constexpr std::string_view prefix = "data: ";
     if (!event.starts_with(prefix) || !event.ends_with("\n\n")) {
@@ -84,7 +112,7 @@ int test_request_envelope_and_sampling() {
     body["top_p"]                 = 0.8;
     body["presence_penalty"]      = 0.3;
     body["frequency_penalty"]     = -0.2;
-    body["seed"]                  = -1;
+    body["seed"]                  = 123;
     body["top_k"]                 = 17;
     body["min_p"]                 = 0.05;
     body["timings_per_token"]     = true;
@@ -97,8 +125,11 @@ int test_request_envelope_and_sampling() {
                       "llama.cpp response observations remain in the protocol envelope");
     failures += check(request.output_tokens_explicit && request.generation.max_tokens == 48,
                       "max_completion_tokens wins and explicitness stays in envelope");
-    failures += check(request.generation.sampling.seed == std::numeric_limits<std::uint64_t>::max(),
-                      "signed seed maps modulo 2^64");
+    Json negative_seed = base_request();
+    negative_seed["seed"] = -1;
+    const ApiError negative_seed_error = api_error([&] { (void)parse(negative_seed); });
+    failures += check(negative_seed_error.status == 400 && negative_seed_error.param == "seed",
+                      "a negative seed is rejected");
     failures +=
         check(request.generation.sampling.top_k == 17 && request.generation.sampling.min_p == 0.05,
               "compatible sampler extensions parsed");
@@ -108,9 +139,11 @@ int test_request_envelope_and_sampling() {
     failures +=
         check(translated.execution.sampling.min_p && *translated.execution.sampling.min_p == 0.05F,
               "min_p reaches Engine request options");
-    failures +=
-        check(translated.execution.sampling.seed == std::numeric_limits<std::uint64_t>::max(),
-              "signed seed reaches Engine request options");
+    Json min_seed = base_request();
+    min_seed["seed"] = std::numeric_limits<std::int64_t>::min();
+    const ApiError min_seed_error = api_error([&] { (void)parse(min_seed); });
+    failures += check(min_seed_error.status == 400 && min_seed_error.param == "seed",
+                      "the minimum signed seed is rejected");
 
     const OpenAIChatRequest defaults = parse(base_request());
     failures +=
@@ -183,8 +216,9 @@ int test_standard_field_policy() {
     Json zero_limit                     = base_request();
     zero_limit["max_completion_tokens"] = 0;
     const OpenAIChatRequest zero        = parse(zero_limit);
-    failures += check(zero.output_tokens_explicit && zero.generation.max_tokens == 0,
-                      "an explicit zero output limit reaches Engine's no-generation path");
+    failures += check(!zero.output_tokens_explicit &&
+                          zero.generation.max_tokens == limits().default_max_tokens,
+                      "a non-positive output limit resolves to the server default");
     return failures;
 }
 
@@ -491,6 +525,8 @@ int test_messages_and_media() {
                           legacy.messages[2].role == ninfer::ChatRole::Tool,
                       "legacy function-call history lowers to Engine tool history");
 
+    // An empty assistant-side tool_calls[].id is still accepted; a tool message's tool_call_id
+    // must be non-empty, so an empty tool_call_id is a 400 (a different field).
     body["messages"] = Json::array(
         {Json{{"role", "assistant"},
               {"content", nullptr},
@@ -498,9 +534,21 @@ int test_messages_and_media() {
                Json::array({Json{{"id", ""},
                                  {"type", "function"},
                                  {"function", Json{{"name", "weather"}, {"arguments", "{}"}}}}})}},
-         Json{{"role", "tool"}, {"tool_call_id", ""}, {"content", "done"}}});
+         Json{{"role", "tool"}, {"tool_call_id", "call_weather"}, {"content", "done"}}});
     failures += check(parse(body).generation.has_tool_history(),
-                      "string tool-call identifiers may be empty without changing history");
+                      "an empty assistant tool-call id remains accepted in tool history");
+
+    body["messages"] = Json::array(
+        {Json{{"role", "assistant"},
+              {"content", nullptr},
+              {"tool_calls",
+               Json::array({Json{{"id", "call_weather"},
+                                 {"type", "function"},
+                                 {"function", Json{{"name", "weather"}, {"arguments", "{}"}}}}})}},
+         Json{{"role", "tool"}, {"tool_call_id", ""}, {"content", "done"}}});
+    const ApiError empty_tool_call_id = api_error([&] { (void)parse(body); });
+    failures += check(empty_tool_call_id.status == 400 && empty_tool_call_id.param == "messages",
+                      "an empty tool-message tool_call_id is rejected");
     return failures;
 }
 
@@ -764,13 +812,36 @@ int test_stream_observations() {
 
 int test_common_objects() {
     int failures      = 0;
-    const Json models = Json::parse(make_models_list("qwen", 7, 240000));
+    ModelConfig qwen;
+    qwen.id           = "qwen";
+    const std::vector<ModelConfig> list{qwen};
+    const Json models = Json::parse(make_models_list(list, 7, 240000, "qwen"));
     failures +=
         check(models["data"][0]["id"] == "qwen" && models["data"][0]["max_model_len"] == 240000,
               "models list advertises the configured context limit");
-    const Json model = Json::parse(make_model_object("qwen", 7, 240000));
+    const Json model = Json::parse(make_model_object(qwen, 7, 240000, /*loaded=*/true));
     failures += check(model["max_model_len"] == 240000,
                       "model lookup advertises the configured context limit");
+
+    // A per-model `maxContext` override wins over the server default in the discovery metadata
+    // (a model that sets overrides.max_context reports it; a sibling without one reports the
+    // default). This is the per-model context reporting the /v1/models + /v1/models/{id} fix.
+    ModelConfig big;
+    big.id                      = "big";
+    big.overrides.max_context   = 300000;
+    ModelConfig small;
+    small.id                    = "small"; // no override -> falls back to the server default
+    const std::vector<ModelConfig> override_list{big, small};
+    const Json override_models = Json::parse(make_models_list(override_list, 7, 240000, "big"));
+    failures += check(override_models["data"][0]["id"] == "big" &&
+                          override_models["data"][0]["max_model_len"] == 300000,
+                      "a model with a maxContext override reports the overridden limit");
+    failures += check(override_models["data"][1]["id"] == "small" &&
+                          override_models["data"][1]["max_model_len"] == 240000,
+                      "a model without an override reports the server default");
+    const Json override_model = Json::parse(make_model_object(big, 7, 240000, /*loaded=*/true));
+    failures += check(override_model["max_model_len"] == 300000,
+                      "model lookup reports the per-model override, not the server default");
     const Json error = Json::parse(make_error_body(
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",
@@ -779,6 +850,149 @@ int test_common_objects() {
 }
 
 } // namespace
+
+int test_llama_webui_dialect() {
+    int failures = 0;
+    // The webui omits `model`; parse fills it from the loaded artifact's public id.
+    Json base = Json{{"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
+
+    // Omitted model resolves to the loaded artifact; an explicit model field is preserved.
+    const OpenAIChatRequest filled = parse_model(base);
+    failures += check(filled.model == webui_model(), "omitted model resolves to the loaded artifact");
+    Json explicit_model = base;
+    explicit_model["model"] = "other-model";
+    failures += check(parse_model(explicit_model).model == "other-model", "an explicit model field is preserved");
+
+    // A non-string model is rejected (an empty or omitted model still falls through to the
+    // loaded artifact's public id).
+    Json numeric_model = base;
+    numeric_model["model"] = 123;
+    const ApiError numeric_model_error = api_error([&] { (void)parse_model(numeric_model); });
+    failures += check(numeric_model_error.status == 400 && numeric_model_error.param == "model",
+                      "a non-string model is rejected");
+
+    // chat_template_kwargs.enable_thinking (top-level or in kwargs; a conflict is a 400).
+    Json thinking_true = base;
+    thinking_true["chat_template_kwargs"] = Json{{"enable_thinking", true}};
+    failures += check(parse_model(thinking_true).generation.enable_thinking == true,
+                      "chat_template_kwargs.enable_thinking=true is parsed");
+    Json thinking_false = base;
+    thinking_false["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    failures += check(parse_model(thinking_false).generation.enable_thinking == false,
+                      "chat_template_kwargs.enable_thinking=false is parsed");
+    Json matching = base;
+    matching["enable_thinking"]      = true;
+    matching["chat_template_kwargs"] = Json{{"enable_thinking", true}};
+    failures += check(parse_model(matching).generation.enable_thinking == true,
+                      "matching top-level and kwargs enable_thinking is accepted");
+    Json conflicting = base;
+    conflicting["enable_thinking"]      = false;
+    conflicting["chat_template_kwargs"] = Json{{"enable_thinking", true}};
+    failures += check(api_error([&] { (void)parse_model(conflicting); }).code ==
+                          "conflicting_template_option",
+                      "conflicting enable_thinking values are a 400");
+
+    // max_tokens <= 0 resolves to the server default (the webui sends -1 for "unlimited").
+    Json unlimited = base;
+    unlimited["max_tokens"] = -1;
+    const OpenAIChatRequest unlimited_request = parse_model(unlimited);
+    failures += check(unlimited_request.generation.max_tokens == limits().default_max_tokens &&
+                          !unlimited_request.output_tokens_explicit,
+                      "max_tokens=-1 falls back to the server default");
+
+    // reasoning_effort=low reaches the prompt with thinking enabled.
+    Json low = base;
+    low["reasoning_effort"] = "low";
+    const OpenAIChatRequest low_request = parse_model(low);
+    failures += check(low_request.generation.reasoning_effort == RequestedReasoningEffort::Low,
+                      "reasoning_effort=low is parsed");
+    const ninfer::PromptInput low_prompt = effort_prompt(low_request.generation);
+    failures += check(low_prompt.options.enable_thinking &&
+                          low_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
+                      "low effort reaches the prompt with thinking enabled");
+
+    // reasoning_effort=low + enable_thinking=false is a 400 (the effort implies thinking).
+    Json low_conflict = low;
+    low_conflict["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    const OpenAIChatRequest low_conflict_request = parse_model(low_conflict);
+    failures += check(api_error([&] { (void)effort_semantics(low_conflict_request.generation); })
+                        .code == "conflicting_template_option",
+                      "reasoning effort conflicting with enable_thinking is a 400");
+
+    // reasoning_effort=high is rejected by the template capability (the chat template's surface).
+    Json high = base;
+    high["reasoning_effort"] = "high";
+    const OpenAIChatRequest high_request = parse_model(high);
+    failures += check(api_error([&] { (void)effort_semantics(high_request.generation); })
+                        .code == "reasoning_effort_not_supported",
+                      "reasoning_effort=high is rejected by the template capability");
+
+    // A full webui-shaped body is accepted end to end.
+    Json full = base;
+    full["stream"]               = true;
+    full["max_tokens"]           = -1;
+    full["temperature"]          = 0.7;
+    full["top_p"]                = 0.9;
+    full["top_k"]                = 20;
+    full["min_p"]                = 0.05;
+    full["chat_template_kwargs"] = Json{{"enable_thinking", true}};
+    failures += check(api_error([&] { (void)parse_model(full); }).status == 0,
+                      "a full webui-shaped body is accepted");
+    return failures;
+}
+
+int test_webui_discovery() {
+    int failures = 0;
+    // /v1/models entries carry the webui "loaded" status marker.
+    ModelConfig qwen;
+    qwen.id           = "qwen";
+    const std::vector<ModelConfig> list{qwen};
+    const Json model_list = Json::parse(make_models_list(list, 0, 8192, "qwen"));
+    failures += check(model_list.at("data").at(0).at("status").at("value") == "loaded",
+                      "/v1/models entries carry status {value: loaded}");
+    const Json model_object = Json::parse(make_model_object(qwen, 0, 8192, /*loaded=*/true));
+    failures += check(model_object.at("status").at("value") == "loaded",
+                      "a /v1/models/<id> object carries status {value: loaded}");
+
+    // The /props stub reports the configured defaults from the serve options.
+    ServeOptions options;
+    options.artifact_path       = "models/qwen3_6_27b.ninfer";
+    options.max_context         = 16384;
+    options.default_max_tokens  = 4096;
+    options.enable_vision       = true;
+    options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+    options.sampling_overrides.temperature = 1.0F;
+    options.sampling_overrides.top_k      = 20;
+
+    const Json props = Json::parse(make_props_stub(options, "qwen3.6-27b"));
+    failures += check(props.at("role") == "model", "props role is the model server role");
+
+    // A multi-model config reports the "router" role so the llama-ui webui enters router mode and
+    // lists every configured model (the list is served by /v1/models); a single-model config keeps
+    // the "model" role above.
+    ServeOptions multi = options;
+    ModelConfig model_a;
+    model_a.id       = "org/a";
+    model_a.artifact = "a.ninfer";
+    ModelConfig model_b;
+    model_b.id       = "org/b";
+    model_b.artifact = "b.ninfer";
+    multi.model_config.models.push_back(model_a);
+    multi.model_config.models.push_back(model_b);
+    const Json multi_props = Json::parse(make_props_stub(multi, "org/a"));
+    failures += check(multi_props.at("role") == "router", "props role is router for a multi-model config");
+    failures += check(props.at("modalities").at("vision") == true, "props vision from the options");
+    failures += check(props.at("modalities").at("audio") == false, "props audio is off");
+    const Json settings = props.at("default_generation_settings");
+    failures += check(settings.at("n_ctx") == 16384, "props n_ctx from --max-context");
+    failures += check(settings.at("speculative") == true, "props speculative from the MTP backend");
+    const Json params = settings.at("params");
+    failures += check(params.at("n_predict") == 4096, "props n_predict from the default budget");
+    failures += check(params.at("max_tokens") == 4096, "props max_tokens from the default budget");
+    failures += check(params.at("top_k") == 20, "props top_k from the process override");
+    failures += check(params.at("temperature") == 1.0, "props temperature from the process override");
+    return failures;
+}
 
 int main() {
     int failures = 0;
@@ -793,6 +1007,8 @@ int main() {
     failures += test_stream_response();
     failures += test_stream_observations();
     failures += test_common_objects();
+    failures += test_llama_webui_dialect();
+    failures += test_webui_discovery();
     if (failures == 0) { std::cout << "OpenAI Chat protocol tests passed\n"; }
     return failures == 0 ? 0 : 1;
 }

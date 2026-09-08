@@ -1,5 +1,4 @@
 #include "serve/serve_options.h"
-#include "product/speculative_options.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -45,31 +44,14 @@ std::uint64_t parse_u64(const char* text, const char* label) {
     return static_cast<std::uint64_t>(value);
 }
 
-KvCacheStorage parse_kv_dtype(const char* text) {
-    const std::string value(text);
-    if (value == "bf16") { return KvCacheStorage::BFloat16; }
-    if (value == "int8") { return KvCacheStorage::Int8Group64; }
-    if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
-    if (value == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
-    if (value == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
-    throw std::invalid_argument("invalid kv-dtype: " + value);
-}
-
-KvCapacityPolicy parse_kv_capacity(const char* text) {
-    if (std::string_view(text) == "auto") { return KvCapacityPolicy::automatic(); }
-    const int value = parse_nonnegative_int(text, "kv-capacity");
-    if (value == 0) { throw std::invalid_argument("--kv-capacity must be positive"); }
-    return KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(value));
-}
-
 } // namespace
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
+           " --config <file.json> [--host H] [--port N] [--api-key KEY] "
+           "[--model-id ID] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--log-stats-interval-ms N] [--device N] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -78,30 +60,27 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
-           "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
-           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
+           "[--default-thinking-budget N] "
+           "[--no-cuda-graph] [--no-prefix-reuse] "
+           "[--no-thinking] [--preserve-thinking] [--cors] "
+           "[--webui] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
-           "       --default-max-tokens defaults to " +
-           std::to_string(kDefaultMaxTokens) +
-           " when omitted\n"
+           "       per-model engine params (max-context, kv-capacity, kv-dtype, spec, draft-tokens,\n"
+           "       prefill-chunk, lm-head-draft, vision, default-max-tokens) are set in the model\n"
+           "       config JSON (ModelConfig fields), not via CLI flags\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       --media-cache-mib defaults to 1024; 0 disables retained media reuse\n"
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
+           "       --config <file.json> loads the multi-model serve config (ordered models; the first is resident)\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
-           "       --vision enables media and loads the fixed Vision GPU allocations\n"
-           "       --kv-capacity auto leaves " +
-           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
@@ -112,6 +91,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
+           "       --webui serves the bundled prebuilt webui at / alongside the API\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
 }
 
@@ -128,22 +108,23 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.startup_argv.emplace_back(argv[i] == nullptr ? "" : argv[i]);
         redact_next = options.startup_argv.back() == "--api-key";
     }
-    bool default_max_tokens_explicit = false;
-    bool kv_capacity_explicit        = false;
     bool context_capacity_explicit   = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
     }
-    if (argc < 2) { throw std::invalid_argument("artifact path is required"); }
-    options.artifact_path = argv[1];
-    for (int i = 2; i < argc; ++i) {
+    std::string config_path;
+    bool config_provided = false;
+    for (int i = 1; i < argc; ++i) {
         const std::string arg    = argv[i];
         const auto require_value = [&](const char* flag) -> const char* {
             if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
             return argv[i];
         };
-        if (arg == "--host") {
+        if (arg == "--config") {
+            config_path = require_value("--config");
+            config_provided = true;
+        } else if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
@@ -154,12 +135,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.model_id_override->empty()) {
                 throw std::invalid_argument("--model-id must not be empty");
             }
-        } else if (arg == "--max-context") {
-            options.max_context = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--max-context"), "max-context"));
-        } else if (arg == "--kv-capacity") {
-            options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
-            kv_capacity_explicit = true;
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
@@ -169,9 +144,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
-        } else if (arg == "--prefill-chunk") {
-            options.prefill_chunk = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {
@@ -259,18 +231,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
-        } else if (arg == "--kv-dtype") {
-            options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
-        } else if (arg == "--spec") {
-            options.speculative.backend =
-                product::parse_speculative_backend(require_value("--spec"));
-        } else if (arg == "--draft-tokens") {
-            options.speculative.draft_tokens = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
-        } else if (arg == "--default-max-tokens") {
-            options.default_max_tokens =
-                parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
-            default_max_tokens_explicit = true;
         } else if (arg == "--default-thinking-budget") {
             const std::uint64_t budget =
                 parse_u64(require_value("--default-thinking-budget"), "default-thinking-budget");
@@ -278,20 +238,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--default-thinking-budget is out of range");
             }
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
-        } else if (arg == "--vision") {
-            options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
-        } else if (arg == "--lm-head-draft") {
-            options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
         } else if (arg == "--cors") {
             options.enable_cors = true;
+        } else if (arg == "--webui") {
+            options.webui_auto = true;
         } else if (arg == "--temperature") {
             options.sampling_overrides.temperature =
                 parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
@@ -321,9 +279,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + arg);
         }
     }
-    if (!kv_capacity_explicit) {
-        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    if (!config_provided) {
+        throw std::invalid_argument("--config <file> is required (see serve usage)");
     }
+    options.model_config = load_config(config_path);
+    if (options.model_config.models.empty()) {
+        throw std::invalid_argument("the config must define at least one model under `models`");
+    }
+    options.artifact_path = options.model_config.models.front().artifact;
+    // Per-model engine params (max-context, kv-capacity, kv-dtype, spec, draft-tokens, prefill-chunk,
+    // lm-head-draft, vision, default-max-tokens) are set via ModelConfig, not CLI. The defaults
+    // below are the fallback for models that do not specify them.
+    options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     if (!options.allow_prefix_reuse) {
         if (context_capacity_explicit) {
             throw std::invalid_argument(
@@ -336,11 +303,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
-    if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
-        options.kv_capacity.explicit_tokens < options.max_context) {
-        throw std::invalid_argument("--kv-capacity must be at least --max-context");
-    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");
     }
@@ -352,15 +314,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
-    }
-    if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
-        throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
-    }
-    product::validate_speculative_cli_options(options.speculative);
-    if (default_max_tokens_explicit) {
-        if (options.default_max_tokens <= 0) {
-            throw std::invalid_argument("--default-max-tokens must be positive");
-        }
     }
     return options;
 }

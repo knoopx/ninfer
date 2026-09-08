@@ -3,6 +3,8 @@
 #include "ninfer/types.h"
 #include "product/logging/logging.h"
 
+#include "serve/model_config.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -22,6 +24,7 @@ inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 struct ServeOptions {
     bool help_requested = false;
     std::string artifact_path;
+    Config model_config; // ordered multi-model serve config; the first model is the resident
     std::string host = "127.0.0.1";
     int port         = 8080;
     std::string api_key;                          // empty => no auth
@@ -54,6 +57,8 @@ struct ServeOptions {
     std::optional<std::uint32_t> default_thinking_budget;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
+    bool webui_auto        = false; // --webui: serve the bundled prebuilt webui
+    std::string webui_dir;          // resolved bundled webui dir (set internally when --webui)
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;
