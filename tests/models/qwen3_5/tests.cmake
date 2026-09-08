@@ -87,6 +87,12 @@ set_tests_properties(
   ninfer_qwen3_5_dflash_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_load_plan.cpp"
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_tool_call_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../test_tool_call_parser.cpp"
   LIBRARIES ninfer_engine ninfer::json)

@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -177,27 +178,199 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
     request.allow_engine_automatic_shared_prefixes = false;
 }
 
-std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t max_model_len) {
-    // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
-    const Json payload = {{"object", "list"},
-                          {"data", Json::array({Json{{"id", model_id},
-                                                     {"object", "model"},
-                                                     {"created", created},
-                                                     {"owned_by", "ninfer"},
-                                                     {"max_model_len", max_model_len}}})}};
+std::string make_models_list(const std::vector<ModelConfig>& models, std::int64_t created,
+                             std::uint32_t default_max_context, std::string_view loaded_id) {
+    // vLLM/llama.cpp-compatible discovery metadata. Each model reports its OWN effective
+    // per-request context limit: the per-model `maxContext` override when set, else the server
+    // default (the single value passed in). `status` carries the webui "loaded" indicator the
+    // model browser expects; it is set dynamically from the router's live loaded model (an empty
+    // loaded_id means no model is currently loaded).
+    Json data = Json::array();
+    for (const auto& model : models) {
+        const bool loaded = !loaded_id.empty() && model.id == loaded_id;
+        const std::uint32_t max_model_len =
+            model.overrides.max_context.value_or(default_max_context);
+        data.push_back(Json{{"id", model.id},
+                            {"object", "model"},
+                            {"created", created},
+                            {"owned_by", "ninfer"},
+                            {"max_model_len", max_model_len},
+                            {"status", Json{{"value", loaded ? "loaded" : "unloaded"}}}});
+    }
+    const Json payload = {{"object", "list"}, {"data", std::move(data)}};
     return payload.dump();
 }
 
-std::string make_model_object(const std::string& model_id, std::int64_t created,
-                              std::uint32_t max_model_len) {
-    // vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit.
-    const Json payload = {{"id", model_id},
+std::string make_model_object(const ModelConfig& model, std::int64_t created,
+                              std::uint32_t default_max_context, bool loaded) {
+    // vLLM/llama.cpp-compatible discovery metadata; `status` carries the webui "loaded"
+    // indicator. The reported limit is this model's effective per-request context (its
+    // per-model `maxContext` override when set, else the server default passed in).
+    const std::uint32_t max_model_len = model.overrides.max_context.value_or(default_max_context);
+    const Json payload = {{"id", model.id},
                           {"object", "model"},
                           {"created", created},
                           {"owned_by", "ninfer"},
-                          {"max_model_len", max_model_len}};
+                          {"max_model_len", max_model_len},
+                          {"status", Json{{"value", loaded ? "loaded" : "unloaded"}}}};
     return payload.dump();
+}
+
+std::string make_slots_list(std::uint32_t max_concurrency, std::string_view loaded_id,
+                           std::string_view model_filter, int in_flight_total, bool is_swapping,
+                           int prefilling_requests) {
+    // The target model: an explicit ?model= filter, else the resident model. Only the resident
+    // model can run generations (one GPU, one resident); a non-resident (or absent) target has no
+    // in-flight generations, so its slots are all idle (a load/swap is required to use them).
+    // This keeps the webui's "is the server free?" probe (areAllSlotsIdle) honest: it is true
+    // exactly when no generation for that model is running.
+    const std::string target =
+        !model_filter.empty() ? std::string(model_filter) : std::string(loaded_id);
+    const bool target_is_resident = !target.empty() && target == loaded_id;
+    // Slots actually in use: the resident's in-flight generations, bounded by the concurrency.
+    const int busy =
+        target_is_resident ? std::min(in_flight_total, static_cast<int>(max_concurrency)) : 0;
+    const auto slot_state = [&](int index) {
+        if (!target_is_resident) { return std::string("idle"); } // a load/swap is required
+        if (is_swapping) { return std::string("loading"); } // the model set is in transition
+        if (index < busy) { return prefilling_requests > 0 ? std::string("prefill")
+                                                            : std::string("decode"); }
+        return std::string("idle");
+    };
+    const Json slots = [&] {
+        Json array = Json::array();
+        for (std::uint32_t i = 0; i < max_concurrency; ++i) {
+            const bool processing = static_cast<int>(i) < busy;
+            array.push_back(Json{{"id", i},
+                                 {"model", target},
+                                 {"is_processing", processing},
+                                 {"state", slot_state(static_cast<int>(i))}});
+        }
+        return array;
+    }();
+    return slots.dump();
+}
+
+std::string make_props_stub(const ServeOptions& options, const std::string& model_id) {
+    // The webui expects the llama.cpp server-properties shape; NInfer fills the fields it knows
+    // from the serve options and leaves the rest at neutral defaults so the panel renders.
+    const auto optional_float = [](std::optional<float> value) {
+        return value.has_value() ? Json(static_cast<double>(*value)) : Json();
+    };
+    const auto optional_int = [](std::optional<std::int32_t> value) {
+        return value.has_value() ? Json(*value) : Json();
+    };
+
+    const auto& ov = options.sampling_overrides;
+    Json params = Json::object();
+    params["n_predict"]         = options.default_max_tokens;
+    params["seed"]              = ov.seed ? static_cast<double>(*ov.seed) : 0;
+    params["temperature"]       = ov.temperature ? static_cast<double>(*ov.temperature) : 0;
+    params["top_p"]             = optional_float(ov.top_p);
+    params["top_k"]             = optional_int(ov.top_k);
+    params["min_p"]             = optional_float(ov.min_p);
+    params["presence_penalty"]  = optional_float(ov.presence_penalty);
+    params["frequency_penalty"] = optional_float(ov.frequency_penalty);
+    // Neutral stub values for fields NInfer does not expose through its sampling overrides.
+    params["repeat_penalty"]     = Json();
+    params["repeat_last_n"]      = Json();
+    params["dynatemp_exponent"]  = Json();
+    params["typical_p"]          = Json();
+    params["mlock"]              = false;
+    params["mmap"]               = false;
+    params["n_gpu_layers"]       = -1;
+    params["n_batch"]            = 2048;
+    params["n_ubatch"]           = 512;
+    params["n_threads"]          = 8;
+    params["n_threads_batch"]    = 8;
+    params["n_cpu_mempolicy"]    = 0;
+    params["n_probs"]            = 0;
+    params["logdir"]             = "";
+    params["main_gpu"]           = 0;
+    params["no_kv_transfer"]     = false;
+    params["flash_attn"]         = false;
+    params["rag_ch"]             = 0;
+    params["cache_type_k"]       = "f16";
+    params["cache_type_v"]       = "f16";
+    params["cache_state_tiling"] = false;
+    params["cache_reuse"]        = 0;
+    params["numa"]               = "none";
+    params["n_par"]              = 1;
+    params["n_ctx"]              = options.max_context;
+    params["n_ctx_overwrite"]    = 0;
+    params["n_batch_overwrite"]  = 0;
+    params["min_keep"]           = 0;
+    params["stop"]               = Json::array();
+    params["jinja"]              = false;
+    params["reasoning_format"]   = "deepseek";
+    params["mcp_server"]         = "";
+    params["image"]              = Json::array();
+    params["audio"]              = Json::array();
+    params["max_tokens"]         = options.default_max_tokens;
+    params["grammar"]            = "";
+    params["penalty_prompt"]     = Json::array();
+    params["mirostat"]           = 0;
+    params["mirostat_mu"]        = 2.0;
+    params["mirostat_tau"]       = 0.5;
+    params["mirostat_skill"]     = 1.0;
+    params["n_save"]             = 0;
+    params["n_keep"]             = 0;
+    params["lcm"]                = false;
+    params["lcm_s"]              = 1.0;
+    params["smin"]               = 0.0;
+    params["smoe"]               = 0.0;
+    params["pmin"]               = 0.0;
+
+    Json next_token = Json{{"id", 0},
+                           {"token", "<|endoftext|>"},
+                           {"text", ""},
+                           {"prob", 0.0},
+                           {"utf8", ""},
+                           {"lprob", 0.0},
+                           {"tprob", 0.0},
+                           {"timestart", 0.0},
+                           {"timeend", 0.0},
+                           {"is_unknown", false},
+                           {"content", ""},
+                           {"type", 0},
+                           {"is_special", false}};
+    Json models = Json::array();
+    models.push_back(Json{{"name", model_id}, {"id", model_id}, {"meta_path", ""}});
+
+    Json props = Json::object();
+    props["default_generation_settings"] = {
+        {"id", 0},
+        {"id_task", 0},
+        {"n_ctx", static_cast<int>(options.max_context)},
+        {"speculative", options.speculative.backend != SpeculativeBackend::None},
+        {"is_processing", false},
+        {"params", params},
+        {"prompt", ""},
+        {"next_token", Json::array({std::move(next_token)})},
+    };
+    props["slots"]        = Json::array();
+    props["server"]       = Json{{"models", std::move(models)}};
+    props["status"]       = Json{{"msg", "ok"},
+                                  {"slots_total", 0},
+                                  {"slots_used", 0},
+                                  {"n_ctx_max", options.max_context},
+                                  {"n_ctx_now", options.max_context},
+                                  {"n_cpu_mempolicy", 0},
+                                  {"ngl", -1},
+                                  {"use_mmap", false},
+                                  {"use_mlock", false}};
+    // The llama-ui webui enters multi-model (router) mode only when the /props role is "router";
+    // otherwise it falls back to single-model mode and lists only one model. Report "router" when
+    // the config declares more than one model so the webui's model browser shows every configured
+    // model (the list is served by /v1/models); a single-model config keeps the single-model "model" role.
+    props["role"] = options.model_config.models.size() > 1 ? "router" : "model";
+    props["public_key"]   = "unknown";
+    props["capabilities"] = Json::array();
+    Json modalities = Json::object();
+    modalities["vision"] = options.enable_vision;
+    modalities["audio"]  = false;
+    props["modalities"] = modalities;
+    return props.dump();
 }
 
 std::string make_error_body(const ApiError& error) {
@@ -211,17 +384,6 @@ std::int64_t unix_time_now() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
-}
-
-void validate_openai_model(std::string_view requested, std::string_view available) {
-    if (requested == available) { return; }
-    ApiError error;
-    error.status  = 404;
-    error.type    = "invalid_request_error";
-    error.param   = "model";
-    error.code    = "model_not_found";
-    error.message = "model '" + std::string(requested) + "' not found";
-    throw ApiException(std::move(error));
 }
 
 std::string new_openai_chat_completion_id() { return chat_identifier("chatcmpl-"); }
