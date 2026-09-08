@@ -14,6 +14,11 @@ class logger;
 
 namespace ninfer::serve {
 
+class ModelBackend; // forward declaration: engine_capacity reads a router backend's diagnostics.
+class EngineModelBackend; // forward declaration: model_preset reads the merged per-model options.
+struct ModelConfig; // forward declaration: model_preset reports the per-model override set.
+struct ServeOptions; // forward declaration: model_preset reports the shared serving defaults.
+
 enum class OperationalSeverity : std::uint8_t {
     Info,
     Warning,
@@ -49,7 +54,13 @@ public:
     void throughput(const ThroughputReport& report) const;
     void http_failure(std::string_view endpoint, const RequestFailure& failure,
                       std::string_view request_id = {}) const;
-    void engine_capacity(const GenerationService& service) const;
+    void engine_capacity(const ModelBackend& backend) const;
+    // Log the complete preset parameter set of a loaded model (identity + admission, the
+    // normalized engine parameters, the shared memory/ingress/serving values, thinking mode,
+    // explicit sampling overrides, and which per-model overrides the serve config set).
+    // Called once per model load (the backend factory in the serving entry point).
+    void model_preset(const EngineModelBackend& backend, const ModelConfig& model,
+                      const ServeOptions& base) const;
     void warmup_started() const;
     void warmup_complete(double seconds) const;
     void warmup_failure(double seconds, std::string_view detail) const;

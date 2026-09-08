@@ -14,6 +14,37 @@
       };
       cuda = pkgs.cudaPackages_13_2;
 
+      # Prebuilt llama.cpp webui (ggml-org/llama-ui), pinned to a specific build
+      # rather than the rolling "latest" pointer for reproducibility. A single
+      # prebuilt dist.tar.gz is published per build; its entries are ./-prefixed,
+      # so extracting it directly yields the servable tree (index.html at root).
+      llamaWebui = pkgs.stdenvNoCC.mkDerivation rec {
+        pname = "llama-ui-webui";
+        version = "b10021";
+
+        src = pkgs.fetchurl {
+          url = "https://huggingface.co/buckets/ggml-org/llama-ui/resolve/${version}/dist.tar.gz";
+          # Matches the upstream-published dist.tar.gz.sha256 sidecar.
+          sha256 = "7726ec9d4b7fe63536f70dcd14813a4054819317ba4df78539ea2bfc5aa7db2a";
+        };
+
+        # The prebuilt archive is the whole deliverable: extract it straight into
+        # $out and skip the (vacuous) build/install phases.
+        dontConfigure = true;
+        dontBuild = true;
+        dontCheck = true;
+        unpackPhase = ''
+          mkdir -p "$out/share/ninfer/webui"
+          tar xzf "$src" -C "$out/share/ninfer/webui"
+        '';
+        buildPhase = ":";
+        installPhase = ":";
+
+        meta = with pkgs.lib; {
+          description = "Prebuilt llama.cpp webui (ggml-org/llama-ui), pinned build ${version}";
+        };
+      };
+
       # CMake 4.x + Ninja: the Clang CXX compiler module (Clang-CXX.cmake) sets
       # CMAKE_CXX_SCANDEP_SOURCE *unconditionally* for Clang >= 16 with the GNU
       # frontend, so the Ninja generator emits a clang-scan-deps `.ddi` (Dynamic
@@ -71,10 +102,14 @@
           pkgs.nlohmann_json
           (pkgs.spdlog.override { staticBuild = true; })
           pkgs.utf8proc
+          llamaWebui
         ];
 
+        # CMake also bundles the tree into the build dir (build/share/ninfer/webui) for
+        # dev builds; the flake points NINFER_WEBUI_SRC at the fetched webui tree.
         cmakeFlags = [
           "-DCMAKE_CUDA_ARCHITECTURES=120a"
+          "-DNINFER_WEBUI_SRC=${llamaWebui}/share/ninfer/webui"
           # Opt out of the Ninja clang-scan-deps `.ddi` rule (see the comment on
           # the scandepsDisable store path): with CMAKE_CXX_SCANDEP_SOURCE unset
           # the Ninja generator falls back to compiler-based dependency
@@ -99,6 +134,10 @@
           runHook preInstall
           install -Dm0755 apps/ninfer "$out/bin/ninfer"
           install -Dm0755 apps/ninfer-serve "$out/bin/ninfer-serve"
+          # Bundle the prebuilt webui so --webui can serve it from
+          # <exe-dir>/../share/ninfer/webui with no runtime download.
+          install -d "$out/share/ninfer/webui"
+          cp -a "${llamaWebui}/share/ninfer/webui/." "$out/share/ninfer/webui/"
           runHook postInstall
         '';
 
@@ -113,6 +152,7 @@
       packages.${system} = {
         default = ninfer;
         ninfer = ninfer;
+        llamaWebui = llamaWebui;
       };
 
       apps.${system} = {

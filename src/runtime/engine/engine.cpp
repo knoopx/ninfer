@@ -160,6 +160,7 @@ public:
         auto constructed    = runtime::construct_model(options, device);
         active              = std::move(constructed.instance);
         load                = std::move(constructed.load);
+        model_metadata      = std::move(constructed.model_metadata);
         load.cuda_sync_mode = device.sync_mode();
         sampling_defaults   = active->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
@@ -184,6 +185,7 @@ public:
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;
     LoadSummary load;
+    ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
     Core core;
 };
@@ -367,6 +369,11 @@ const EngineOptions& Engine::options() const {
 LoadSummary Engine::load_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return impl_->load;
+}
+
+ModelMetadata Engine::model_metadata() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->model_metadata;
 }
 
 MemorySummary Engine::memory_summary() const {
