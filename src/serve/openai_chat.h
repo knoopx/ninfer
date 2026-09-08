@@ -29,8 +29,12 @@ struct OpenAIChatRequest {
     bool return_progress   = false;
 };
 
+// `default_model_id` fills in when the request omits `model`: single-model clients such as the
+// llama.cpp webui run one loaded artifact and do not send a model field. When empty and no model is
+// present, the request is rejected as before.
 OpenAIChatRequest parse_chat_completion_request(const RequestJson& body,
-                                                const RequestLimits& limits);
+                                                const RequestLimits& limits,
+                                                const std::string& default_model_id = {});
 
 struct OpenAIChatResponseIdentity {
     std::string id;

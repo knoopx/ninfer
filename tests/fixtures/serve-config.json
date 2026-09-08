@@ -1,0 +1,47 @@
+{
+  "models": {
+    "qwen3.6-27b/groupwise-int": {
+      "artifact": "out/qwen3_6_27b-groupwise-int.ninfer",
+      "identity": "qwen3.6-27b/groupwise-int",
+      "ttl": 300,
+      "name": "Qwen 3.6 27B (groupwise-int)",
+      "description": "Qwen 3.6 27B dense model with groupwise INT8 quantization"
+    },
+    "qwen3.6-27b/nvfp4": {
+      "artifact": "out/qwen3_6_27b-nvfp4.ninfer",
+      "identity": "qwen3.6-27b/nvfp4",
+      "ttl": 300,
+      "name": "Qwen 3.6 27B (nvfp4)",
+      "description": "Qwen 3.6 27B dense model with NVFP4 quantization"
+    },
+    "qwen3.8-27b/groupwise-int": {
+      "artifact": "out/qwen3_8_27b-groupwise-int.ninfer",
+      "identity": "qwen3.8-27b/groupwise-int",
+      "ttl": 300,
+      "name": "Qwen 3.8 27B (groupwise-int)",
+      "description": "Qwen 3.8 27B dense model with groupwise INT8 quantization"
+    },
+    "qwen3.8-27b/nvfp4": {
+      "artifact": "out/qwen3_8_27b-nvfp4.ninfer",
+      "identity": "qwen3.8-27b/nvfp4",
+      "ttl": 300,
+      "name": "Qwen 3.8 27B (nvfp4)",
+      "description": "Qwen 3.8 27B dense model with NVFP4 quantization"
+    },
+    "qwen3.6-35b-a3b/groupwise-int": {
+      "artifact": "out/qwen3_6_35b_a3b-groupwise-int.ninfer",
+      "identity": "qwen3.6-35b-a3b/groupwise-int",
+      "ttl": 300,
+      "name": "Qwen 3.6 35B-A3B MoE (groupwise-int)",
+      "description": "Qwen 3.6 35B MoE (3B active) with groupwise INT8 quantization"
+    }
+  },
+  "routing": {
+    "scheduler": { "use": "fifo" },
+    "router": { "use": "group" }
+  },
+  "globalTTL": 600,
+  "unloadTimeout": 10,
+  "healthCheckTimeout": 120,
+  "startPort": 5800
+}
