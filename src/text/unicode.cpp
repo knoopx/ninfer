@@ -1,6 +1,6 @@
 #include "text/unicode.h"
 
-#include <utf8proc/utf8proc.h>
+#include <utf8proc.h>
 
 #include <cstdlib>
 #include <stdexcept>

@@ -63,10 +63,22 @@ if(NINFER_BUILD_MEDIA_ACQUIRE)
 endif()
 find_package(Threads REQUIRED)
 
+# Nixpkgs-provided libraries that were previously vendored in-tree. Discovery relies
+# on the devShell/package environment: CMAKE_PREFIX_PATH drives find_path (nlohmann) and
+# find_package (spdlog); PKG_CONFIG_PATH drives pkg_check_modules (httplib, utf8proc). Both are set
+# from the buildInputs' dev outputs.
+find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp)
+if(NOT NLOHMANN_JSON_INCLUDE_DIR)
+  message(FATAL_ERROR
+    "nlohmann/json.hpp not found. Add nixpkgs nlohmann_json to the build environment.")
+endif()
+pkg_check_modules(HTTPLIB REQUIRED IMPORTED_TARGET httplib)
+pkg_check_modules(UTF8PROC REQUIRED IMPORTED_TARGET libutf8proc)
+
 if(NINFER_BUILD_APPS OR BUILD_TESTING)
-  # Product operational logging is an offline, repository-pinned dependency. Core-only builds do
-  # not configure or link it.
-  add_subdirectory(third_party/spdlog)
+  # Product operational logging uses the distribution spdlog (static build, external fmt).
+  # Core-only builds do not configure or link it.
+  find_package(spdlog CONFIG REQUIRED)
 endif()
 
 # --- Subdirectories ----------------------------------------------------------

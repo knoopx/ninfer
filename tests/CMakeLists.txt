@@ -13,8 +13,8 @@ function(ninfer_add_test name)
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
-    ${PROJECT_SOURCE_DIR}/third_party
-    ${PROJECT_SOURCE_DIR}/third_party/utf8proc)
+    ${NLOHMANN_JSON_INCLUDE_DIR}
+    ${UTF8PROC_INCLUDE_DIRS})
   if(arg_LIBRARIES)
     target_link_libraries(${name} PRIVATE ${arg_LIBRARIES})
   else()
@@ -208,12 +208,12 @@ ninfer_add_test(ninfer_http_error_handler_test
   SOURCES test_http_error_handler.cpp
   LIBRARIES ninfer_serve)
 target_include_directories(ninfer_http_error_handler_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+  ${HTTPLIB_INCLUDE_DIRS})
 ninfer_add_test(ninfer_http_transport_test
   SOURCES test_http_transport.cpp
   LIBRARIES ninfer_serve)
 target_include_directories(ninfer_http_transport_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+  ${HTTPLIB_INCLUDE_DIRS})
 ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp
           ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_6_27b/ninfer_bench_support.cpp

@@ -2,8 +2,8 @@ function(ninfer_internal_includes target)
   target_include_directories(${target} PRIVATE
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
-    ${PROJECT_SOURCE_DIR}/third_party
-    ${PROJECT_SOURCE_DIR}/third_party/utf8proc)
+    ${NLOHMANN_JSON_INCLUDE_DIR}
+    ${UTF8PROC_INCLUDE_DIRS})
 endfunction()
 
 function(ninfer_cuda_archive target)
@@ -311,9 +311,9 @@ target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc
 
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC
-  text/unicode.cpp
-  ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
+  text/unicode.cpp)
 ninfer_internal_includes(ninfer_text)
+target_link_libraries(ninfer_text PUBLIC PkgConfig::UTF8PROC)
 
 add_library(ninfer_media_decode STATIC
   media/decode/decode.cpp)
@@ -392,9 +392,7 @@ if(NINFER_BUILD_SERVE)
     serve/openai_responses_http.cpp
     serve/serve_options.cpp)
   ninfer_internal_includes(ninfer_serve)
-  target_include_directories(ninfer_serve PRIVATE
-    ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire ninfer_product_logging CUDA::cudart)
+    PRIVATE ninfer_media_acquire ninfer_product_logging CUDA::cudart PkgConfig::HTTPLIB)
 endif()

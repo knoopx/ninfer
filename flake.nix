@@ -33,6 +33,11 @@
           pkgs.curl.dev
           cuda.cuda_cudart
           cuda.cuda_nvtx
+          # Nixpkgs-provided libraries that were previously vendored under third_party/.
+          pkgs.httplib
+          pkgs.nlohmann_json
+          (pkgs.spdlog.override { staticBuild = true; })
+          pkgs.utf8proc
         ];
 
         cmakeFlags = [ "-DCMAKE_CUDA_ARCHITECTURES=120a" ];
@@ -82,6 +87,11 @@
           pkgs.curl
           cuda.cuda_cudart
           cuda.cuda_nvtx
+          # Nixpkgs-provided libraries that were previously vendored under third_party/.
+          pkgs.httplib
+          pkgs.nlohmann_json
+          (pkgs.spdlog.override { staticBuild = true; })
+          pkgs.utf8proc
         ];
       };
     };
