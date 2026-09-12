@@ -23,11 +23,18 @@ void require_object(const Json& value, std::string_view name = "request body") {
 
 std::string require_function_name(const Json& object, const char* param) {
     if (!object.contains("name") || !object.at("name").is_string()) {
-        bad_request("function name must be a string", param);
+        bad_request("function name must be a string, got " +
+                        std::string(object.contains("name")
+                                        ? request_json_type_name(object.at("name"))
+                                        : "no name field"),
+                    param);
     }
     const std::string name = object.at("name").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
-        bad_request("function name must match [A-Za-z0-9_-]{1,64}", param);
+    if (!valid_tool_name(name, kMaximumToolNameLength)) {
+        bad_request("function name '" + ascii_preview(name) + "' (" +
+                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1," +
+                        std::to_string(kMaximumToolNameLength) + "}",
+                    param);
     }
     return name;
 }
@@ -35,23 +42,34 @@ std::string require_function_name(const Json& object, const char* param) {
 std::optional<std::string> optional_namespace_name(const Json& object, const char* param) {
     if (!object.contains("namespace") || object.at("namespace").is_null()) { return std::nullopt; }
     if (!object.at("namespace").is_string()) {
-        bad_request("function namespace must be a string or null", param);
+        bad_request("function namespace must be a string or null, got " +
+                        std::string(request_json_type_name(object.at("namespace"))),
+                    param);
     }
     const std::string name = object.at("namespace").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
-        bad_request("function namespace must match [A-Za-z0-9_-]{1,64}", param,
-                    "invalid_tool_name");
+    if (!valid_tool_name(name, kMaximumToolNameLength)) {
+        bad_request("function namespace '" + ascii_preview(name) + "' (" +
+                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1," +
+                        std::to_string(kMaximumToolNameLength) + "}",
+                    param, "invalid_tool_name");
     }
     return name;
 }
 
 std::string require_namespace_tool_name(const Json& object) {
     if (!object.contains("name") || !object.at("name").is_string()) {
-        bad_request("namespace name must be a string", "tools");
+        bad_request("namespace name must be a string, got " +
+                        std::string(object.contains("name")
+                                        ? request_json_type_name(object.at("name"))
+                                        : "no name field"),
+                    "tools");
     }
     const std::string name = object.at("name").get<std::string>();
-    if (!valid_tool_name(name, 64)) {
-        bad_request("namespace name must match [A-Za-z0-9_-]{1,64}", "tools", "invalid_tool_name");
+    if (!valid_tool_name(name, kMaximumToolNameLength)) {
+        bad_request("namespace name '" + ascii_preview(name) + "' (" +
+                        std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1," +
+                        std::to_string(kMaximumToolNameLength) + "}",
+                    "tools", "invalid_tool_name");
     }
     return name;
 }
@@ -68,9 +86,10 @@ std::string lower_function_identity(
     const char* param) {
     const std::string engine_name =
         identity.wire_namespace ? *identity.wire_namespace + "__" + identity.name : identity.name;
-    if (!valid_tool_name(engine_name, 64)) {
+    if (!valid_tool_name(engine_name, kMaximumToolNameLength)) {
         bad_request("flattened function identity '" + engine_name +
-                        "' exceeds the Engine tool-name contract [A-Za-z0-9_-]{1,64}",
+                        "' exceeds the Engine tool-name contract [A-Za-z0-9_-]{1," +
+                        std::to_string(kMaximumToolNameLength) + "}",
                     param, "invalid_tool_name");
     }
     const auto [position, inserted] = identities.emplace(engine_name, identity);
@@ -920,7 +939,13 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     static const std::unordered_set<std::string> allowed = {"effort", "context", "summary",
                                                             "generate_summary", "mode"};
     reject_nonnull_unknown_members(reasoning, allowed, "reasoning");
-    for (const char* key : {"context", "summary", "generate_summary", "mode"}) {
+    if (reasoning.contains("summary") && !reasoning.at("summary").is_null()) {
+        if (!reasoning.at("summary").is_string()) {
+            bad_request("reasoning.summary must be a string", "reasoning");
+        }
+        out.reasoning_summary = reasoning.at("summary").get<std::string>();
+    }
+    for (const char* key : {"context", "generate_summary", "mode"}) {
         if (reasoning.contains(key) && !reasoning.at(key).is_null()) {
             bad_request("reasoning." + std::string(key) +
                             " changes reasoning input or output and is not supported",
@@ -1187,12 +1212,16 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
                         "background_not_supported");
         }
     }
-    if (body.contains("include") && !body.at("include").is_null()) {
+    if (body.contains("include")) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("the requested additional response fields have no available response "
-                        "representation",
-                        "include", "include_not_supported");
+        for (const Json& field : body.at("include")) {
+            if (!field.is_string()) { bad_request("include entries must be strings", "include"); }
+            const std::string value = field.get<std::string>();
+            if (value != "reasoning.encrypted_content") {
+                bad_request("additional response field '" + value + "' is not supported", "include",
+                            "include_not_supported");
+            }
+            out.include_reasoning_encrypted_content = true;
         }
     }
     if (body.contains("stream_options") && !body.at("stream_options").is_null()) {

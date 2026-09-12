@@ -197,8 +197,11 @@ int main() {
     GenerationRequest request;
     request.max_tokens   = 1;
     const auto semantics = resolve_prompt_semantics(request, defaults);
-    failures += check(!semantics.reasoning_effort && !semantics.enable_thinking &&
-                          !semantics.reasoning_effort,
+    // An omitted effort resolves to the template default: no forced reasoning effort, and
+    // enable_thinking made concrete (enabled) so the template-layer continuation guard is
+    // authoritative. The server default is nullopt, so the concrete value is true.
+    failures += check(!semantics.reasoning_effort && semantics.enable_thinking &&
+                          *semantics.enable_thinking,
                       "omitted reasoning effort did not resolve to the template default");
     failures +=
         check(to_request_options(request, defaults, semantics, true).execution.allow_prefix_reuse,

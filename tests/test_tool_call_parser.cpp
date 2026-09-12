@@ -563,11 +563,6 @@ int test_strict_structure_and_active_tool_set() {
                                ninfer::ToolCallParseFallbackReason::MalformedStructure,
                                "missing parameter close was repaired");
 
-    const std::string duplicate = tool_call("configure", {{"value", "first"}, {"value", "second"}});
-    failures +=
-        check_rejected(duplicate, contract, ninfer::ToolCallParseFallbackReason::DuplicateParameter,
-                       "duplicate parameter was silently overwritten");
-
     const std::string unknown_tool = tool_call("other", {{"value", "x"}});
     failures +=
         check_rejected(unknown_tool, contract, ninfer::ToolCallParseFallbackReason::UndeclaredTool,
@@ -640,6 +635,74 @@ int test_all_or_nothing_structural_commit() {
                              "\n<tool_call>\n<function=configure>\n<parameter=flag>\nfalse\n";
     return check_rejected(text, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
                           "partially valid tool-call region was partially committed");
+}
+
+int test_quoted_marker_before_real_call() {
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string quoted =
+        "<tool_call>\\n<function=shell>\\n<function=command>\\nprintf broken\\n</parameter>\\n"
+        "</function>\\n</tool_call>";
+    const std::string text = "explaining " + quoted + " then the real turn\n" +
+                             tool_call("bash", {{"command", "echo ok"}});
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          parsed.tool_calls.front().name == "bash",
+                      "a quoted marker before the real call demoted the structured turn");
+    failures += check(parsed.content == "explaining " + quoted + " then the real turn",
+                      "quoted marker or intervening prose was not retained as content");
+    if (parsed.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+        failures += check(args.at("command") == "echo ok", "recovered call arguments changed");
+    }
+    return failures;
+}
+
+int test_later_candidate_must_consume_the_end() {
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string quoted =
+        "<tool_call>\\n<function=shell>\\n<parameter=command>\\nbroken\\n</parameter>\\n"
+        "</function>\\n</tool_call>";
+    const std::string text =
+        quoted + "\n" + tool_call("bash", {{"command", "echo ok"}}) + "\nstill explaining";
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+
+    int failures = 0;
+    failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty() &&
+                          parsed.content == text && parsed.diagnostics.marker_seen &&
+                          parsed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                      "a quoted marker before a non-terminal call was partially committed");
+    return failures;
+}
+
+int test_incremental_quoted_marker_preserves_bytes() {
+    auto contract = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string quoted =
+        "<tool_call>\\n<function=shell>\\n<function=command>\\nbroken\\n</parameter>\\n"
+        "</function>\\n</tool_call>";
+    const std::string text = "explaining " + quoted + " then the real turn\n" +
+                             tool_call("bash", {{"command", "echo ok"}});
+
+    fi::ToolCallOutputDecoder decoder(std::move(contract), 64);
+    std::string visible;
+    constexpr std::size_t kChunk = 5;
+    for (std::size_t offset = 0; offset < text.size(); offset += kChunk) {
+        visible += decoder.feed(std::string_view(text).substr(offset, kChunk));
+    }
+    auto terminal = decoder.finish();
+
+    int failures = 0;
+    failures += check(terminal.tool_calls.size() == 1 && terminal.tool_calls.front().name == "bash",
+                      "incremental quoted marker hid the real tool call");
+    failures += check(visible + terminal.content == "explaining " + quoted + " then the real turn",
+                      "incremental quoted marker lost or duplicated bytes");
+    failures +=
+        check(terminal.diagnostics.marker_seen && terminal.diagnostics.structured_call_count == 1 &&
+                  terminal.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+              "incremental quoted marker changed terminal diagnostics");
+    return failures;
 }
 
 int test_incremental_valid_and_boolean() {
@@ -733,10 +796,421 @@ int test_incremental_embedded_parameter_markup() {
     return failures;
 }
 
+int test_claude_code_xml_markup_variants() {
+    const auto contract =
+        contract_for("TaskCreate", Json{{"description", Json{{"type", "string"}}}});
+    int failures = 0;
+
+    const std::string standard_xml =
+        "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Initial setup\n</parameter>\n</function>\n</tool_call>";
+    const auto parsed_standard = fi::parse_qwen_tool_call_output(standard_xml, 128, contract);
+    failures += check(parsed_standard.is_tool_call_response &&
+                          parsed_standard.tool_calls.size() == 1 &&
+                          parsed_standard.tool_calls.front().name == "TaskCreate",
+                      "function name attribute syntax was not parsed");
+    if (parsed_standard.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed_standard.tool_calls.front().arguments_json);
+        failures += check(args.at("description") == "Initial setup",
+                          "function name attribute argument changed");
+    }
+
+    const std::string invoke_xml =
+        "<tool_call>\n<invoke name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Create tasks\n</parameter>\n</invoke>\n</tool_call>";
+    const auto parsed_invoke = fi::parse_qwen_tool_call_output(invoke_xml, 128, contract);
+    failures += check(parsed_invoke.is_tool_call_response && parsed_invoke.tool_calls.size() == 1 &&
+                          parsed_invoke.tool_calls.front().name == "TaskCreate",
+                      "invoke tag syntax was not parsed");
+
+    const std::string function_calls_xml =
+        "<function_calls>\n<invoke name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Function calls container\n</parameter>\n</invoke>\n</function_calls>";
+    const auto parsed_function_calls =
+        fi::parse_qwen_tool_call_output(function_calls_xml, 128, contract);
+    failures += check(parsed_function_calls.is_tool_call_response &&
+                          parsed_function_calls.tool_calls.size() == 1 &&
+                          parsed_function_calls.tool_calls.front().name == "TaskCreate",
+                      "function_calls container syntax was not parsed");
+
+    const std::string standalone_invoke =
+        "Plan is ready:\n<invoke name=\"TaskCreate\">\n<param name=\"description\">\n"
+        "Standalone invoke\n</param>\n</invoke>";
+    const auto parsed_standalone = fi::parse_qwen_tool_call_output(standalone_invoke, 128, contract);
+    failures += check(parsed_standalone.is_tool_call_response &&
+                          parsed_standalone.content == "Plan is ready:" &&
+                          parsed_standalone.tool_calls.size() == 1 &&
+                          parsed_standalone.tool_calls.front().name == "TaskCreate",
+                      "standalone invoke after plan was not parsed");
+
+    return failures;
+}
+
+int test_duplicate_parameters_keep_last_value() {
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    int failures        = 0;
+
+    // A repeated identical parameter is the common agent-harness case: the second write leaves the
+    // value alone, and the repair is still counted.
+    const std::string identical_dup =
+        "<tool_call>\n<function=configure>\n<parameter=value>\nfirst\n</parameter>\n"
+        "<parameter=value>\nfirst\n</parameter>\n</function>\n</tool_call>";
+    const auto parsed_identical = fi::parse_qwen_tool_call_output(identical_dup, 64, contract);
+    failures += check(parsed_identical.is_tool_call_response &&
+                          parsed_identical.tool_calls.size() == 1,
+                      "duplicate identical parameter was not accepted");
+    if (parsed_identical.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed_identical.tool_calls.front().arguments_json);
+        failures += check(args.at("value") == "first",
+                          "repeated identical parameter value changed");
+    }
+    failures += check(parsed_identical.diagnostics.duplicate_parameters_repaired == 1,
+                      "identical duplicate parameter repair was not recorded");
+
+    // A conflicting repeat keeps the last value, matching the JSON-object rule the `=<name>`
+    // markup already follows.
+    const std::string conflicting_dup =
+        "<tool_call>\n<function=configure>\n<parameter=value>\nfirst\n</parameter>\n"
+        "<parameter=value>\nsecond\n</parameter>\n</function>\n</tool_call>";
+    const auto parsed_conflicting = fi::parse_qwen_tool_call_output(conflicting_dup, 64, contract);
+    failures += check(parsed_conflicting.is_tool_call_response &&
+                          parsed_conflicting.tool_calls.size() == 1,
+                      "conflicting duplicate parameter fell back to text");
+    if (parsed_conflicting.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed_conflicting.tool_calls.front().arguments_json);
+        failures += check(args.at("value") == "second",
+                          "conflicting duplicate parameter did not keep the last value");
+    }
+    failures += check(parsed_conflicting.diagnostics.duplicate_parameters_repaired == 1,
+                      "conflicting duplicate parameter repair was not recorded");
+
+    return failures;
+}
+
+int test_attribute_token_boundary() {
+    const auto contract =
+        contract_for("TaskCreate", Json{{"description", Json{{"type", "string"}}}});
+    int failures = 0;
+
+    const std::string text =
+        "<tool_call>\n<function filename=\"x\" name=\"TaskCreate\">\n"
+        "<parameter filename=\"ignored\" name=\"description\">\nCreate task\n</parameter>\n"
+        "</function>\n</tool_call>";
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 128, contract);
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          parsed.tool_calls.front().name == "TaskCreate",
+                      "attribute token boundary failed to extract correct name");
+    if (parsed.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+        failures += check(args.at("description") == "Create task",
+                          "parameter attribute token boundary failed");
+    }
+    return failures;
+}
+
+int test_mismatched_closing_tags_rejected() {
+    const auto contract =
+        contract_for("TaskCreate", Json{{"description", Json{{"type", "string"}}}});
+    int failures = 0;
+
+    const std::string fn_invoke_mismatch =
+        "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Value\n</parameter>\n</invoke>\n</tool_call>";
+    failures += check_rejected(fn_invoke_mismatch, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "function opening with invoke closing tag was accepted");
+
+    const std::string invoke_fn_mismatch =
+        "<tool_call>\n<invoke name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Value\n</parameter>\n</function>\n</tool_call>";
+    failures += check_rejected(invoke_fn_mismatch, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "invoke opening with function closing tag was accepted");
+
+    const std::string param_mismatch =
+        "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Value\n</param>\n</function>\n</tool_call>";
+    failures += check_rejected(param_mismatch, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "parameter opening with param closing tag was accepted");
+
+    const std::string param_open_mismatch =
+        "<tool_call>\n<function name=\"TaskCreate\">\n<param name=\"description\">\n"
+        "Value\n</parameter>\n</function>\n</tool_call>";
+    failures += check_rejected(param_open_mismatch, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "param opening with parameter closing tag was accepted");
+
+    return failures;
+}
+
+int test_claude_code_plan_and_task_create_exact_repro() {
+    const std::string task_create_def = tool_definition(
+        "TaskCreate",
+        Json{{"description", Json{{"type", "string"}}},
+             {"task_type", Json{{"type", "string"}}},
+             {"priority", Json{{"type", "integer"}}}});
+    const std::string task_update_def = tool_definition(
+        "TaskUpdate",
+        Json{{"taskId", Json{{"type", "string"}}}, {"status", Json{{"type", "string"}}}});
+    const auto contract = contract_from_definitions({task_create_def, task_update_def});
+
+    const std::string full_response =
+        "I have analyzed the repository requirements. Here is the implementation plan:\n\n"
+        "### Plan\n"
+        "1. Inspect existing CUDA kernels in `src/ops/softmax_attention/`\n"
+        "2. Add test coverage for long context attention splits\n"
+        "3. Update frontend tool call decoder\n\n"
+        "Let me create the first task in the tracking system now:\n\n"
+        "<tool_call>\n"
+        "<function name=\"TaskCreate\">\n"
+        "<parameter name=\"description\">\n"
+        "Implement split-KV page-safety and bounded loops\n"
+        "</parameter>\n"
+        "<parameter name=\"task_type\">\n"
+        "feature\n"
+        "</parameter>\n"
+        "<parameter name=\"priority\">\n"
+        "1\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+
+    const auto parsed = fi::parse_qwen_tool_call_output(full_response, 128, *contract);
+    int failures      = 0;
+    failures += check(parsed.is_tool_call_response,
+                      "Claude Code Plan + TaskCreate failed to parse as tool call");
+    failures += check(parsed.tool_calls.size() == 1, "tool call count != 1");
+    failures += check(parsed.content.starts_with("I have analyzed"), "plan content prefix lost");
+    failures += check(parsed.content.ends_with("tracking system now:"), "plan content tail lost");
+
+    if (parsed.tool_calls.size() == 1) {
+        const auto& call = parsed.tool_calls.front();
+        failures += check(call.name == "TaskCreate", "tool name != TaskCreate");
+        const Json args = Json::parse(call.arguments_json);
+        failures += check(args.at("description") == "Implement split-KV page-safety and bounded loops",
+                          "TaskCreate description argument changed");
+        failures += check(args.at("task_type") == "feature", "TaskCreate task_type argument changed");
+        failures += check(args.at("priority") == 1, "TaskCreate priority argument changed");
+    }
+
+    return failures;
+}
+
 } // namespace
+
+int test_duplicate_parameter_keeps_last_value() {
+    int failures = 0;
+    const fi::ToolCallOutputContract contract =
+        contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    const std::string duplicate = tool_call("configure", {{"value", "first"}, {"value", "second"}});
+    const auto parsed = fi::parse_qwen_tool_call_output(duplicate, 64, contract);
+
+    failures += check(parsed.is_tool_call_response, "duplicate parameter still fell back to text");
+    failures += check(parsed.content.empty(), "duplicate parameter left prose behind");
+    failures += check(parsed.tool_calls.size() == 1, "duplicate parameter did not yield one call");
+    if (parsed.tool_calls.size() == 1) {
+        failures += check(parsed.tool_calls.front().arguments_json == R"({"value":"second"})",
+                          "duplicate parameter did not keep the last value");
+    }
+    failures += check(parsed.diagnostics.fallback_reason ==
+                          ninfer::ToolCallParseFallbackReason::None,
+                      "duplicate parameter still reported a fallback reason");
+    failures += check(parsed.diagnostics.duplicate_parameters_repaired == 1,
+                      "duplicate parameter repair was not recorded in diagnostics");
+    return failures;
+}
+
+int test_tolerant_recovery() {
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    int failures = 0;
+    const std::string suffixed = tool_call("configure", {{"value", "x"}}) + "\nextra answer";
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    const auto tolerant = fi::parse_qwen_tool_call_output(suffixed, 64, contract, true);
+    failures += check(tolerant.is_tool_call_response, "tolerant suffix was not recovered");
+    failures += check(tolerant.tool_calls.size() == 1 && tolerant.tool_calls.front().name == "configure",
+                      "tolerant suffix lost the recovered call");
+    failures += check(tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
+                      "tolerant suffix was not flagged as a truncated tail");
+    const auto strict = fi::parse_qwen_tool_call_output(suffixed, 64, contract);
+    failures += check(!strict.is_tool_call_response, "strict suffix was recovered instead of text");
+    failures += check(strict.tool_calls.empty(), "strict suffix retained the recovered call");
+    failures += check(strict.diagnostics.fallback_reason == Reason::TrailingContent,
+                      "strict suffix was not flagged as trailing content");
+
+    const std::string two = tool_call("first", {{"value", "a"}}) + "\n" + "<tool_call>\n<function=broken>";
+    const auto tolerant_two = fi::parse_qwen_tool_call_output(two, 64, kLegacyContract, true);
+    failures += check(tolerant_two.is_tool_call_response, "tolerant multi-call was not recovered");
+    failures += check(tolerant_two.tool_calls.size() == 1 && tolerant_two.tool_calls.front().name == "first",
+                      "tolerant multi-call kept the malformed second call");
+    failures += check(tolerant_two.diagnostics.fallback_reason == Reason::TruncatedTail,
+                      "tolerant multi-call was not flagged as a truncated tail");
+    const auto strict_two = fi::parse_qwen_tool_call_output(two, 64, kLegacyContract);
+    failures += check(!strict_two.is_tool_call_response, "strict multi-call kept the recovered call");
+
+    const auto decoder_contract =
+        output_contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    fi::ToolCallOutputDecoder decoder(decoder_contract, 64, /*tolerant*/ true);
+    std::string visible;
+    constexpr std::size_t kChunk = 7;
+    for (std::size_t offset = 0; offset < suffixed.size(); offset += kChunk) {
+        visible += decoder.feed(std::string_view(suffixed).substr(offset, kChunk));
+    }
+    auto terminal = decoder.finish();
+    failures += check(visible.empty() && terminal.content.empty(),
+                      "tolerant increment leaked recovered bytes to visible content");
+    failures += check(terminal.tool_calls.size() == 1,
+                      "tolerant increment did not commit the recovered call");
+    failures += check(terminal.diagnostics.fallback_reason == Reason::TruncatedTail,
+                      "tolerant increment lost the truncated-tail diagnostic");
+    return failures;
+}
+
+int test_tolerant_truncated_final_call() {
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    const auto contract =
+        output_contract_for("delete_file", Json{{"filePath", Json{{"type", "string"}}}});
+    const std::string open_tag = std::string("<") + "parameter=filePath>\n";
+    const std::string close_tag = std::string("</") + "parameter>";
+    const std::string truncated_tool_close =
+        "Now let me verify.\n"
+        "<tool_call>\n"
+        "<function=delete_file>\n"
+        + open_tag + "/tmp/out.js\n" + close_tag + "\n" + "</function>";
+    const std::string truncated_function_close = "Now let me verify.\n"
+                                                 "<tool_call>\n"
+                                                 "<function=delete_file>\n"
+                                                 + open_tag + "/tmp/out.js\n" + close_tag;
+    const std::vector<std::pair<const char*, std::string>> cases = {
+        {"missing tool close", truncated_tool_close},
+        {"missing function close", truncated_function_close}};
+    int failures = 0;
+    for (const auto& [label, text] : cases) {
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, *contract, /*tolerant*/ true);
+        failures += check(parsed.is_tool_call_response,
+                          std::string("tolerant did not recover ") + label);
+        failures += check(parsed.tool_calls.size() == 1,
+                          std::string("tolerant recovered wrong call count for ") + label);
+        if (parsed.tool_calls.size() == 1) {
+            failures += check(parsed.tool_calls.front().name == "delete_file",
+                              std::string("tolerant lost call name for ") + label);
+            const Json arguments = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(arguments == Json{{"filePath", "/tmp/out.js"}},
+                              std::string("tolerant lost arguments for ") + label);
+        }
+        failures += check(parsed.diagnostics.fallback_reason == Reason::TruncatedTail,
+                          std::string("tolerant did not flag ") + label + " as truncated tail");
+        const auto strict = fi::parse_qwen_tool_call_output(text, 64, *contract);
+        failures += check(!strict.is_tool_call_response,
+                          std::string("strict recovered a truncated final call: ") + label);
+        failures += check(strict.tool_calls.empty(),
+                          std::string("strict retained a truncated final call: ") + label);
+    }
+    return failures;
+}
+
+int test_tolerant_missing_function_close_bracket() {
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    const auto contract = output_contract_for(
+        "memory",
+        Json{{"command", Json{{"type", "string"}}}, {"path", Json{{"type", "string"}}}});
+    const std::string open_cmd = std::string("<") + "parameter=command>\n";
+    const std::string open_path = std::string("<") + "parameter=path>\n";
+    const std::string close_tag = std::string("</") + "parameter>";
+    const std::string text =
+        "Let me check my memory file first.\n"
+        "<tool_call>\n"
+        "<function=memory\n"
+        + open_cmd + "str_replace\n" + close_tag + "\n"
+        + open_path + "/memories/repo/notes.md\n" + close_tag + "\n"
+        "</function>\n"
+        "</tool_call>";
+    int failures = 0;
+    const auto tolerant = fi::parse_qwen_tool_call_output(text, 64, *contract, /*tolerant*/ true);
+    failures += check(tolerant.is_tool_call_response,
+                      "tolerant mode did not recover a missing closing bracket after the function name");
+    failures += check(tolerant.tool_calls.size() == 1, "tolerant mode recovered wrong call count");
+    if (tolerant.tool_calls.size() == 1) {
+        const auto& call = tolerant.tool_calls.front();
+        failures += check(call.name == "memory", "recovered call lost the function name");
+        const Json args = Json::parse(call.arguments_json);
+        failures += check(args.at("command").get<std::string>() == "str_replace",
+                          "recovered call lost command arg");
+        failures += check(args.at("path").get<std::string>() == "/memories/repo/notes.md",
+                          "recovered call lost path arg");
+    }
+    failures += check(tolerant.diagnostics.fallback_reason == Reason::None,
+                      "tolerant recovery of a missing bracket reported a spurious fallback reason");
+    const auto strict = fi::parse_qwen_tool_call_output(text, 64, *contract);
+    failures += check(!strict.is_tool_call_response,
+                      "strict mode recovered a call with a missing closing bracket after the function name");
+    failures += check(strict.tool_calls.empty(),
+                      "strict mode retained an invalid tool name call");
+    return failures;
+}
+
+int test_tolerant_undeclared_and_value_cut() {
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    const auto contract =
+        output_contract_for("delete_file", Json{{"filePath", Json{{"type", "string"}}}});
+    int failures = 0;
+    const std::string open_tag = std::string("<") + "parameter=filePath>\n";
+    const std::string close_tag = std::string("</") + "parameter>";
+    const std::string undeclared = "<tool_call>\n"
+                                   "<function=not_a_declared_tool>\n"
+                                   + open_tag + "/tmp/out.js\n" + close_tag + "\n"
+                                   "</function>\n"
+                                   "</tool_call>";
+    const auto tolerant = fi::parse_qwen_tool_call_output(undeclared, 64, *contract, true);
+    failures += check(tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1 &&
+                          tolerant.tool_calls.front().name == "not_a_declared_tool",
+                      "tolerant mode did not keep the undeclared-name call structured");
+    failures += check(tolerant.diagnostics.fallback_reason == Reason::None,
+                      "tolerant undeclared call reported a fallback reason");
+    const auto strict = fi::parse_qwen_tool_call_output(undeclared, 64, *contract);
+    failures += check(!strict.is_tool_call_response &&
+                          strict.diagnostics.fallback_reason == Reason::UndeclaredTool,
+                      "strict mode did not reject the undeclared-name call");
+
+    const std::string value_cut = "Now\n"
+                                  "<tool_call>\n"
+                                  "<function=delete_file>\n"
+                                  + open_tag + "/tmp/out";
+    const auto cut_tolerant = fi::parse_qwen_tool_call_output(value_cut, 64, *contract, true);
+    failures += check(cut_tolerant.is_tool_call_response && cut_tolerant.tool_calls.size() == 1 &&
+                          cut_tolerant.tool_calls.front().name == "delete_file",
+                      "tolerant mode did not keep the value-cut call");
+    if (cut_tolerant.tool_calls.size() == 1) {
+        const Json args = Json::parse(cut_tolerant.tool_calls.front().arguments_json);
+        failures += check(args.at("filePath").get<std::string>() == "/tmp/out",
+                          "tolerant mode lost the partial value-cut argument");
+    }
+    failures += check(cut_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
+                      "tolerant value-cut was not flagged as a truncated tail");
+    const auto cut_strict = fi::parse_qwen_tool_call_output(value_cut, 64, *contract);
+    failures += check(!cut_strict.is_tool_call_response &&
+                          cut_strict.diagnostics.fallback_reason == Reason::MalformedStructure,
+                      "strict mode did not reject the value-cut call");
+
+    // A call cut after the name but before any parameter completed carries no arguments, so
+    // even tolerant mode returns the region as text (with the reason recorded).
+    const std::string name_only = "<tool_call>\n"
+                                  "<function=delete_file>\n";
+    const auto name_tolerant = fi::parse_qwen_tool_call_output(name_only, 64, *contract, true);
+    failures += check(!name_tolerant.is_tool_call_response && name_tolerant.tool_calls.empty(),
+                      "tolerant mode kept a zero-parameter truncated call");
+    failures += check(name_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
+                      "zero-parameter truncation was not flagged as a truncated tail");
+    const auto name_strict = fi::parse_qwen_tool_call_output(name_only, 64, *contract);
+    failures += check(!name_strict.is_tool_call_response &&
+                          name_strict.diagnostics.fallback_reason == Reason::MalformedStructure,
+                      "strict mode misclassified a zero-parameter truncated call");
+    return failures;
+}
 
 int main() {
     int failures = 0;
+    failures += test_duplicate_parameter_keeps_last_value();
     failures += test_basic_legacy_parsing();
     failures += test_multiple_calls();
     failures += test_declared_strings_preserve_text();
@@ -753,9 +1227,21 @@ int main() {
     failures += test_name_limits_and_non_strict_omissions();
     failures += test_conflicting_duplicate_tool_contracts_use_legacy_normalization();
     failures += test_all_or_nothing_structural_commit();
+    failures += test_quoted_marker_before_real_call();
+    failures += test_later_candidate_must_consume_the_end();
+    failures += test_incremental_quoted_marker_preserves_bytes();
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();
+    failures += test_claude_code_xml_markup_variants();
+    failures += test_duplicate_parameters_keep_last_value();
+    failures += test_attribute_token_boundary();
+    failures += test_mismatched_closing_tags_rejected();
+    failures += test_claude_code_plan_and_task_create_exact_repro();
+    failures += test_tolerant_recovery();
+    failures += test_tolerant_truncated_final_call();
+    failures += test_tolerant_missing_function_close_bracket();
+    failures += test_tolerant_undeclared_and_value_cut();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
