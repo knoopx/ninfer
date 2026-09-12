@@ -19,7 +19,10 @@ namespace {
 
 using Json = RequestJson;
 
-constexpr std::size_t kMaxToolNameLength = 128;
+// Shares the protocol-wide limit (serve/request.h). Anthropic's own boundary is
+// narrower, but agent hosts send longer names — VS Code Copilot wraps MCP tools
+// as "activate_fallback_mcp_<server>_<tool>", past 64 bytes.
+constexpr std::size_t kMaxToolNameLength = kMaximumToolNameLength;
 
 enum class ParsePurpose {
     Messages,
@@ -87,7 +90,9 @@ std::string require_tool_name(const Json& object, const char* param) {
     }
     std::string name = object.at("name").get<std::string>();
     if (!valid_tool_name(name, kMaxToolNameLength)) {
-        bad_request("tool name must match [A-Za-z0-9_-]{1,128}", param);
+        bad_request("tool name must match [A-Za-z0-9_-]{1," +
+                        std::to_string(kMaxToolNameLength) + "}",
+                    param);
     }
     return name;
 }
@@ -630,14 +635,6 @@ void parse_messages(const Json& body, GenerationRequest& request) {
     lower_messages(std::move(parsed), request);
 
     if (!request.messages.empty() && request.messages.back().role == ChatRole::Assistant) {
-        const ChatTurn& final = request.messages.back();
-        if (final.content.empty() || !final.reasoning_content.empty() ||
-            !final.tool_calls.empty() ||
-            std::any_of(final.content.begin(), final.content.end(),
-                        [](const ContentPart& part) { return part.kind != ContentKind::Text; })) {
-            bad_request("a final assistant prefill must contain only text", "messages",
-                        "assistant_prefill_not_supported");
-        }
         request.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
     }
 }

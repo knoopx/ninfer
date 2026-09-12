@@ -170,17 +170,26 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
     return {};
 }
 
+// Maximum tool-name length accepted at every protocol boundary and enforced on
+// model-generated tool-call names. The OpenAI schema allows 64 bytes, but agent
+// hosts synthesize longer names: VS Code Copilot wraps MCP tools as
+// "activate_fallback_mcp_<server>_<tool>" (67 bytes observed), and the Anthropic
+// adapter already accepted 128. 256 keeps real client names valid while still
+// bounding prompt rendering and the streaming parser.
+inline constexpr std::size_t kMaximumToolNameLength = 256;
+
 struct GenerationRequest {
     std::vector<ChatTurn> messages;
     std::vector<ToolDefinition> tools;
-    std::size_t tool_name_max_length = 64;
+    std::size_t tool_name_max_length = kMaximumToolNameLength;
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
     bool stop_strings_apply_to_reasoning = false;
-    int max_tokens                       = 0; // resolved output budget; the chat path pins a
-                                              // positive value (a non-positive client request
-                                              // resolves to the server default), zero remains the
-                                              // no-generation signal for direct callers
+    // Benchmark/serving extension shared with vLLM, SGLang and llama.cpp: suppress the
+    // checkpoint's default stop tokens so generation runs to the requested token budget.
+    // Caller-supplied stop tokens and stop strings still apply.
+    bool ignore_eos = false;
+    int max_tokens                       = 0; // resolved budget; zero means immediate output limit
     std::optional<bool> enable_thinking;      // unset => use the server default
     std::optional<std::uint32_t> thinking_budget;
     std::optional<RequestedReasoningEffort> reasoning_effort;

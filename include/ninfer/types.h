@@ -306,6 +306,10 @@ enum class ToolCallParseFallbackReason : std::uint8_t {
     InvalidToolName,
     UndeclaredTool,
     TrailingContent,
+    // Tolerant recovery discarded a trailing suffix after an otherwise complete call, or kept a
+    // call whose closing tags were cut off at the region end. A structured response was still
+    // produced, so this is surfaced for transparency, not as a fallback-to-text failure.
+    TruncatedTail,
 };
 
 [[nodiscard]] inline constexpr const char*
@@ -323,16 +327,19 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "undeclared_tool";
     case ToolCallParseFallbackReason::TrailingContent:
         return "trailing_content";
+    case ToolCallParseFallbackReason::TruncatedTail:
+        return "truncated_tail";
     }
     return "malformed_structure";
 }
 
 struct ToolCallParseDiagnostics {
-    bool marker_seen                            = false;
-    std::uint32_t structured_call_count         = 0;
-    std::uint32_t empty_arguments_omitted       = 0;
-    std::uint32_t schema_mismatch_arguments     = 0;
-    ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
+    bool marker_seen                              = false;
+    std::uint32_t structured_call_count           = 0;
+    std::uint32_t empty_arguments_omitted         = 0;
+    std::uint32_t schema_mismatch_arguments       = 0;
+    std::uint32_t duplicate_parameters_repaired   = 0;
+    ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
