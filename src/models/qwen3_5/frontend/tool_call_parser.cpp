@@ -18,11 +18,14 @@ using SchemaType          = Contract::SchemaType;
 using TypeSet             = Contract::TypeSet;
 
 constexpr std::string_view kToolOpen      = "<tool_call>";
-constexpr std::string_view kToolClose     = "</tool_call>";
 constexpr std::string_view kFunctionOpen  = "<function=";
-constexpr std::string_view kFunctionClose = "</function>";
 constexpr std::string_view kParamOpen     = "<parameter=";
-constexpr std::string_view kParamClose    = "</parameter>";
+// Tolerant close-tag prefixes: a closing tag may carry whitespace before '>'
+// (e.g. "</function >"). Matching is prefix + optional whitespace + '>'.
+constexpr std::string_view kToolOpenPrefix      = "<tool_call";
+constexpr std::string_view kToolClosePrefix     = "</tool_call";
+constexpr std::string_view kFunctionClosePrefix = "</function";
+constexpr std::string_view kParamClosePrefix    = "</parameter";
 
 struct RawParameter {
     std::string_view name;
@@ -30,8 +33,9 @@ struct RawParameter {
 };
 
 struct RawToolCall {
-    std::string_view name;
+    std::string name;
     std::vector<RawParameter> parameters;
+    std::string arguments_json; // non-empty => direct JSON payload (JSON-object call form)
 };
 
 enum class JsonValueKind : std::uint8_t {
@@ -85,6 +89,53 @@ void skip_format_whitespace(std::string_view text, std::size_t& pos) {
 
 bool starts_with_at(std::string_view text, std::size_t pos, std::string_view prefix) {
     return pos <= text.size() && text.substr(pos, prefix.size()) == prefix;
+}
+
+// Tolerant tag matching: a close/open tag is the prefix, optional whitespace, then '>'.
+bool is_tag_close_match(std::string_view text, std::size_t pos, std::string_view tag_name,
+                        std::size_t& tag_end) {
+    if (!starts_with_at(text, pos, tag_name)) { return false; }
+    std::size_t p = pos + tag_name.size();
+    while (p < text.size() && is_format_whitespace(text[p])) { ++p; }
+    if (p < text.size() && text[p] == '>') {
+        tag_end = p + 1;
+        return true;
+    }
+    return false;
+}
+
+std::size_t find_tag_close(std::string_view text, std::size_t pos, std::string_view tag_name,
+                           std::size_t& tag_end) {
+    while (pos < text.size()) {
+        const std::size_t idx = text.find(tag_name, pos);
+        if (idx == std::string_view::npos) { return std::string_view::npos; }
+        if (is_tag_close_match(text, idx, tag_name, tag_end)) { return idx; }
+        pos = idx + tag_name.size();
+    }
+    return std::string_view::npos;
+}
+
+bool is_tag_open_match(std::string_view text, std::size_t pos, std::string_view tag_name,
+                       std::size_t& tag_end) {
+    if (!starts_with_at(text, pos, tag_name)) { return false; }
+    std::size_t p = pos + tag_name.size();
+    while (p < text.size() && is_format_whitespace(text[p])) { ++p; }
+    if (p < text.size() && text[p] == '>') {
+        tag_end = p + 1;
+        return true;
+    }
+    return false;
+}
+
+std::size_t find_tag_open(std::string_view text, std::size_t pos, std::string_view tag_name,
+                          std::size_t& tag_end) {
+    while (pos < text.size()) {
+        const std::size_t idx = text.find(tag_name, pos);
+        if (idx == std::string_view::npos) { return std::string_view::npos; }
+        if (is_tag_open_match(text, idx, tag_name, tag_end)) { return idx; }
+        pos = idx + tag_name.size();
+    }
+    return std::string_view::npos;
 }
 
 bool valid_function_name(std::string_view name, std::size_t max_name_length) {
@@ -407,6 +458,37 @@ NormalizedParameter normalize_parameter(std::string_view encoded_value,
     return {.json_value = encode_json_string(value)};
 }
 
+// Balanced-brace end of a JSON object body starting at text[pos] == '{', with
+// string/escape awareness. Returns the index just past the matching '}', or npos.
+std::size_t json_object_end(std::string_view text, std::size_t pos) {
+    if (pos >= text.size() || text[pos] != '{') { return std::string_view::npos; }
+    int depth      = 0;
+    bool in_string = false;
+    bool escaped   = false;
+    for (std::size_t i = pos; i < text.size(); ++i) {
+        const char c = text[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '{') {
+            ++depth;
+        } else if (c == '}') {
+            --depth;
+            if (depth == 0) { return i + 1; }
+        }
+    }
+    return std::string_view::npos;
+}
+
 class QwenToolRegionParser {
 public:
     QwenToolRegionParser(std::string_view text, std::size_t max_name_length,
@@ -420,14 +502,18 @@ public:
             if (pos == text_.size()) {
                 return calls.empty() ? FallbackReason::MalformedStructure : FallbackReason::None;
             }
-            if (!starts_with_at(text_, pos, kToolOpen)) {
-                return calls.empty() ? FallbackReason::MalformedStructure
-                                     : FallbackReason::TrailingContent;
+            if (!at_tool_open(pos)) {
+                // Trailing (non-tool) content after recovered calls is discarded; a region
+                // with zero recovered calls falls back to plain text.
+                return calls.empty() ? FallbackReason::MalformedStructure : FallbackReason::None;
             }
 
             RawToolCall call;
             const FallbackReason failure = parse_tool_call(pos, call);
-            if (failure != FallbackReason::None) { return failure; }
+            if (failure != FallbackReason::None) {
+                // A later malformed call no longer discards the calls already recovered.
+                return calls.empty() ? failure : FallbackReason::None;
+            }
             calls.push_back(std::move(call));
         }
     }
@@ -439,16 +525,37 @@ private:
         return true;
     }
 
+    bool at_tool_open(std::size_t pos) const {
+        std::size_t open_end = 0;
+        return is_tag_open_match(text_, pos, kToolOpenPrefix, open_end);
+    }
+
     FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call) const {
-        if (!consume(pos, kToolOpen)) { return FallbackReason::MalformedStructure; }
+        std::size_t open_end = 0;
+        if (!is_tag_open_match(text_, pos, kToolOpenPrefix, open_end)) {
+            return FallbackReason::MalformedStructure;
+        }
+        pos = open_end;
         skip_format_whitespace(text_, pos);
         const FallbackReason failure = parse_function(pos, call);
         if (failure != FallbackReason::None) { return failure; }
+        // The </tool_call> close is optional under tolerant recovery: a missing/malformed
+        // close no longer forces a whole-region fallback once the call body was recovered.
         skip_format_whitespace(text_, pos);
-        return consume(pos, kToolClose) ? FallbackReason::None : FallbackReason::MalformedStructure;
+        std::size_t close_end = 0;
+        if (is_tag_close_match(text_, pos, kToolClosePrefix, close_end)) {
+            pos = close_end;
+        }
+        return FallbackReason::None;
     }
 
     FallbackReason parse_function(std::size_t& pos, RawToolCall& call) const {
+        // JSON-object call form: the <tool_call> body may be a JSON object carrying
+        // "name" and "arguments"/"parameters" instead of the <function=...> tag form.
+        if (pos < text_.size() && text_[pos] == '{') {
+            return parse_json_function(pos, call);
+        }
+
         if (!consume(pos, kFunctionOpen)) { return FallbackReason::MalformedStructure; }
         const std::size_t name_begin = pos;
         const std::size_t name_end   = text_.find('>', name_begin);
@@ -467,10 +574,44 @@ private:
 
         for (;;) {
             skip_format_whitespace(text_, pos);
-            if (consume(pos, kFunctionClose)) { return FallbackReason::None; }
+            std::size_t close_end = 0;
+            if (is_tag_close_match(text_, pos, kFunctionClosePrefix, close_end)) {
+                pos = close_end;
+                return FallbackReason::None;
+            }
             const FallbackReason failure = parse_parameter(pos, call);
             if (failure != FallbackReason::None) { return failure; }
         }
+    }
+
+    // JSON-object call form: the arguments are already a JSON payload; the client owns
+    // schema validation, so they are carried verbatim (no per-key contract coercion).
+    FallbackReason parse_json_function(std::size_t& pos, RawToolCall& call) const {
+        const std::size_t end = json_object_end(text_, pos);
+        if (end == std::string_view::npos) { return FallbackReason::MalformedStructure; }
+        const Json root = Json::parse(text_.substr(pos, end - pos), nullptr, false);
+        if (root.is_discarded() || !root.is_object() || !root.contains("name") ||
+            !root["name"].is_string()) {
+            return FallbackReason::MalformedStructure;
+        }
+        std::string name = root["name"].get<std::string>();
+        name             = std::string(trim_format_whitespace(name));
+        if (!valid_function_name(name, max_name_length_)) { return FallbackReason::InvalidToolName; }
+        if (contract_.enforce_declared_names && find_tool_contract(contract_, name) == nullptr) {
+            return FallbackReason::UndeclaredTool;
+        }
+        call.name = std::move(name);
+        if (root.contains("arguments")) {
+            const Json& args = root["arguments"];
+            call.arguments_json = args.is_string() ? args.get<std::string>() : args.dump();
+        } else if (root.contains("parameters")) {
+            const Json& args = root["parameters"];
+            call.arguments_json = args.is_string() ? args.get<std::string>() : args.dump();
+        } else {
+            call.arguments_json = "{}";
+        }
+        pos = end;
+        return FallbackReason::None;
     }
 
     FallbackReason parse_parameter(std::size_t& pos, RawToolCall& call) const {
@@ -488,12 +629,13 @@ private:
 
         const std::size_t value_begin = name_end + 1;
         std::size_t value_end         = 0;
-        if (!find_parameter_close(value_begin, value_end)) {
+        std::size_t tag_end           = 0;
+        if (!find_parameter_close(value_begin, value_end, tag_end)) {
             return FallbackReason::MalformedStructure;
         }
         call.parameters.push_back(RawParameter{
             .name = name, .value = text_.substr(value_begin, value_end - value_begin)});
-        pos = value_end + kParamClose.size();
+        pos = tag_end;
         return FallbackReason::None;
     }
 
@@ -512,11 +654,13 @@ private:
         return false;
     }
 
-    bool find_parameter_close(std::size_t value_begin, std::size_t& value_end) const {
+    bool find_parameter_close(std::size_t value_begin, std::size_t& value_end,
+                              std::size_t& tag_end) const {
         std::size_t depth = 1;
         std::size_t scan  = value_begin;
         for (;;) {
-            const std::size_t close = text_.find(kParamClose, scan);
+            std::size_t close_end = 0;
+            const std::size_t close = find_tag_close(text_, scan, kParamClosePrefix, close_end);
             if (close == std::string_view::npos) { return false; }
 
             std::size_t nested_open_end = 0;
@@ -529,9 +673,10 @@ private:
             --depth;
             if (depth == 0) {
                 value_end = close;
+                tag_end   = close_end;
                 return true;
             }
-            scan = close + kParamClose.size();
+            scan = close_end;
         }
     }
 
@@ -542,6 +687,13 @@ private:
 
 GeneratedToolCall normalize_raw_tool_call(const RawToolCall& raw, const Contract& contract,
                                           ToolCallParseDiagnostics& diagnostics) {
+    if (!raw.arguments_json.empty()) {
+        // JSON-object call form: the arguments are already a JSON payload; the client owns
+        // schema validation, so emit them verbatim (no per-key contract coercion).
+        return GeneratedToolCall{.name         = raw.name,
+                                 .arguments_json = raw.arguments_json};
+    }
+
     const Contract::Tool* tool = find_tool_contract(contract, raw.name);
     if (tool != nullptr && !tool->unambiguous) { tool = nullptr; }
 
@@ -598,8 +750,10 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length,
                                                  const ToolCallOutputContract& contract) {
-    const std::size_t first = text.find(kToolOpen);
-    if (first == std::string::npos) { return fallback(text); }
+    std::size_t open_end = 0;
+    const std::size_t found = find_tag_open(text, 0, kToolOpenPrefix, open_end);
+    if (found == std::string::npos) { return fallback(text); }
+    const std::size_t first = found;
 
     ParsedToolCallOutput out;
     out.content                 = rtrim_format_whitespace(std::string_view(text).substr(0, first));
