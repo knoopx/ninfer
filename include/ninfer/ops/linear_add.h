@@ -41,7 +41,8 @@ namespace ninfer::ops {
  *   [5120,6144], Q5_G64_FP16 RowSplit [5120,17408] or [5120,6144], Q8_G32_FP16 RowSplit
  *   [2048,4096], [2048,6144], [5120,6144] or [5120,17408], NVFP4
  *   BlockScaleK16M128x4 [5120,6144] or [5120,17408], row-scaled
- *   FP8_E4M3FN_ROW_BF16 [5120,6144] or [5120,17408], or BF16 Contiguous [5120,6144]. T may
+ *   FP8_E4M3FN_ROW_BF16 [5120,6144] or [5120,17408], TERNARY_PQ2_0 TernaryPq2Block
+ *   [5120,6144], [5120,17408], [2048,4096] or [2048,6144], or BF16 Contiguous [5120,6144]. T may
  *   be any positive value.
  *
  * Numeric:
@@ -56,7 +57,8 @@ namespace ninfer::ops {
  * Compute policy:
  *   All policies permit the A16 implementations of Q4, Q5, Q8 and BF16. NVFP4 uses A16 for
  *   A16Only/AllowA8 and may use A4 under AllowA4. FP8 may use A8 under AllowA8/AllowA4.
- *   Each registration owns its production plan. A permissive policy
+ *   TERNARY_PQ2_0 resolves every policy to the A16 routes at zero transient bytes (plain
+ *   writing). Each registration owns its production plan. A permissive policy
  *   allows the private resolver to select either qualified
  *   arithmetic profile; it does not itself prescribe a kernel.
  *

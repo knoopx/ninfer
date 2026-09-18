@@ -16,6 +16,7 @@ enum class QType : std::uint16_t {
     INT32               = 6,
     NVFP4               = 7,
     FP8_E4M3FN_ROW_BF16 = 8,
+    TERNARY_PQ2_0       = 9,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -23,7 +24,16 @@ enum class QuantLayout : std::uint16_t {
     Contiguous          = 1,
     BlockScaleK16M128x4 = 2,
     RowScale            = 3,
+    TernaryPq2Block     = 4,
 };
+
+// Ternary PQ2_0 block constants: a 34-byte block holds one binary16 scale and 32 code
+// bytes (2 bits per weight) for 128 weights, followed by a per-tensor rotation auxiliary.
+inline constexpr std::uint32_t kTernaryPq2GroupSize       = 128;
+inline constexpr std::uint32_t kTernaryPq2BlockBytes      = 34;
+inline constexpr std::uint32_t kTernaryPq2RotationBlockSize = 1024;
+inline constexpr std::uint32_t kTernaryPq2RotationHeaderBytes = 16;
+inline constexpr std::uint32_t kTernaryPq2SignWordBytes   = 4;
 
 struct Weight {
     const void* payload            = nullptr;
@@ -47,6 +57,9 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
+    // Ternary PQ2_0 per-tensor rotation auxiliary (Hadamard header + sign vector).
+    const void* rotation         = nullptr;
+    std::uint64_t rotation_bytes = 0;
 };
 
 } // namespace ninfer

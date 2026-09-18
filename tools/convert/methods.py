@@ -240,6 +240,38 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
+def import_ternary_pq2_0(request: PrepareRequest) -> PreparedMethod:
+    """Preserve the MLX Hadamard ternary PQ2_0 codes, scales and rotation auxiliary."""
+    if request.target.format != "ternary_pq2_0" or len(request.target.shape) != 2:
+        raise ValueError("import_ternary_pq2_0 requires a ternary PQ2_0 matrix target")
+    _preflight(request, values=False)
+    for item in request.inputs:
+        source = item.source
+        if source.read_encoded is None:
+            raise ValueError(f"{item.parameter}: encoded rows are unavailable")
+        first = source.read_encoded(0, 1)
+        if first.format != "ternary_pq2_0":
+            raise ValueError(
+                f"{item.parameter}: source {first.format} differs from target "
+                "ternary_pq2_0"
+            )
+    n = request.target.shape[0]
+
+    def produce(output):
+        for begin in range(0, n, request.rows_per_chunk):
+            end = min(n, begin + request.rows_per_chunk)
+            words = request.encoded_rows(begin, end)
+            if words.weight_divisor is None:
+                raise ValueError(
+                    f"{request.target.id}: ternary PQ2_0 rows lack the rotation auxiliary"
+                )
+            output.write_codes(
+                begin, words.codes, words.scales, words.weight_divisor
+            )
+
+    return request.job(produce=produce)
+
+
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
     """Preserve the current FP8/NVFP4 source codes, scales and weight divisor."""
     if (
@@ -297,5 +329,6 @@ METHODS: dict[str, Method] = {
     "cast_direct": cast_direct,
     "grouped_absmax": grouped_absmax,
     "fp8_row_maxabs": fp8_row_maxabs,
+    "import_ternary_pq2_0": import_ternary_pq2_0,
     "import_encoded": import_encoded,
 }

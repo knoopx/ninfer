@@ -1,6 +1,8 @@
 #pragma once
 
 #include "ops/common/math.h"
+#include "ops/common/fwt.cuh"
+#include "core/weight.h"
 
 // ninfer::ops - embedding kernels. Dense copies BF16 rows; quantized variants decode only the
 // selected rows into contiguous BF16 output columns.
@@ -21,6 +23,9 @@ inline constexpr std::int32_t kEmbedGatherQ8Group          = 32;
 inline constexpr std::int32_t kEmbedGatherQ8D              = 2048;
 inline constexpr std::int32_t kEmbedGatherQ8Groups         = kEmbedGatherQ8D / kEmbedGatherQ8Group;
 inline constexpr std::int32_t kEmbedGatherFp8D             = 5120;
+// TERNARY_PQ2_0 inverse-transform route: the K=5120 embed table split into 1024 rotation
+// blocks (one 256-thread CTA per (token, rotation block)).
+inline constexpr std::int32_t kEmbedGatherTernaryBlocks = kEmbedGatherFp8D / detail::kTernaryFwtBlock;
 
 template <int BlocksPerToken, int Threads>
 __launch_bounds__(Threads) __global__
@@ -245,6 +250,65 @@ __launch_bounds__(256) __global__
             out_pairs[word_index * 2 + pair] = __floats2bfloat162_rn(
                 static_cast<float>(q0) * scale, static_cast<float>(q1) * scale);
         }
+    }
+}
+
+// TERNARY_PQ2_0 inverse-transform route (the embed table is stored inverse-rotated). One 256-
+// thread CTA owns one (token, 1024 rotation block): each thread decodes its 4 consecutive
+// trits as (code - 1) * binary16 scale in FP32, fuses the sign flip and the 1/sqrt(1024)
+// normalization with the kernel's left-associative FP32 order (mirroring stage_ternary_fwt_row),
+// runs the Walsh-Hadamard butterfly, and emits BF16. The inverse route is the same transform
+// with the same sign vector: the Hadamard matrix is symmetric, so R^-1 = R.
+__launch_bounds__(256) __global__
+    void embed_gather_ternary_kernel(const std::int32_t* ids, const std::uint8_t* blocks,
+                                     const float* signs, __nv_bfloat16* out) {
+    constexpr int kValuesPerThread = detail::kTernaryFwtBlock / 256;
+    constexpr int kGroupsPerBlock  = detail::kTernaryFwtBlock / kTernaryPq2GroupSize;
+
+    const int token   = static_cast<int>(blockIdx.x) / kEmbedGatherTernaryBlocks;
+    const int k_block = static_cast<int>(blockIdx.x) % kEmbedGatherTernaryBlocks;
+    const int tid     = static_cast<int>(threadIdx.x);
+    const int row     = ids[token];
+
+    // Packed row: 34-byte blocks, 8 groups of 128 trits per 1024 rotation block.
+    const std::uint8_t* group_block = blocks +
+                                      static_cast<std::int64_t>(row) *
+                                          (kEmbedGatherFp8D / kTernaryPq2GroupSize) *
+                                          kTernaryPq2BlockBytes +
+                                      (k_block * kGroupsPerBlock) * kTernaryPq2BlockBytes;
+    const float* sign_block = signs + k_block * detail::kTernaryFwtBlock;
+
+    __shared__ alignas(16) float fwt_row[detail::kTernaryFwtBlock];
+#pragma unroll
+    for (int i = 0; i < kValuesPerThread; ++i) {
+        const int idx   = tid * kValuesPerThread + i;
+        const int group = idx / kTernaryPq2GroupSize;
+        const int lane  = idx % kTernaryPq2GroupSize;
+        const std::uint8_t* block  = group_block + group * kTernaryPq2BlockBytes;
+        const std::uint8_t code_byte = block[2 + lane / 4];
+        // Device-side 2-bit codebook extract: ternary_format.h's ternary_pq2_code is a host
+        // constexpr helper, so the device route inlines the fixed codebook (00:-1 01:0 10:+1
+        // 11:+2, low bits first), matching accumulate_ternary_row.
+        const int code = (code_byte >> (2 * (lane % 4))) & 3;
+        const std::uint16_t scale_word =
+            static_cast<std::uint16_t>(block[0] | (static_cast<std::uint16_t>(block[1]) << 8));
+        // Device-side exact binary16 -> FP32 expansion (ternary_format.h's
+        // ternary_pq2_scale_word_to_float is the host-side equivalent; half->float is exact
+        // for every binary16 value, subnormals included).
+        const float scale = __half2float(__ushort_as_half(scale_word));
+        fwt_row[idx]      = static_cast<float>(code - 1) * scale * sign_block[idx] *
+                        detail::kTernaryFwtScale;
+    }
+    __syncthreads();
+    detail::ternary_fwt_butterfly(fwt_row);
+    __syncthreads();
+
+    auto* output = out + static_cast<std::int64_t>(token) * kEmbedGatherFp8D +
+                   static_cast<std::int64_t>(k_block) * detail::kTernaryFwtBlock;
+#pragma unroll
+    for (int i = 0; i < kValuesPerThread; ++i) {
+        const int idx = tid * kValuesPerThread + i;
+        output[idx]   = __float2bfloat16_rn(fwt_row[idx]);
     }
 }
 

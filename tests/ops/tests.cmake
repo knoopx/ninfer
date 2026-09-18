@@ -136,6 +136,18 @@ ninfer_add_op_test(ninfer_gdn_replay_fold_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_replay_fold.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_ternary_gdn_input_proj_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ternary_gdn_input_proj.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_ternary_attn_input_proj_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ternary_attn_input_proj.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_ternary_embedding_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ternary_embedding.cpp"
+  LIBRARIES ninfer_ops)
+
 include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")

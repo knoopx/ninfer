@@ -28,9 +28,9 @@ namespace ninfer::ops {
 /**
  * Policy-bearing capacity query. Q4/Q8 use A16 under every policy. NVFP4 uses A16 under
  * A16Only/AllowA8 through T=16; AllowA4 accepts every positive T. Row-scaled FP8 accepts all
- * policies, with A8 permitted by AllowA8/AllowA4.
- * A permissive policy covers whichever qualified route the private resolver selects across the
- * requested interval.
+ * policies, with A8 permitted by AllowA8/AllowA4. Ternary PQ2_0 resolves every policy to the A16
+ * routes at every positive T and reports zero transient bytes. A permissive policy covers
+ * whichever qualified route the private resolver selects across the requested interval.
  */
 [[nodiscard]] std::size_t
 linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
@@ -50,6 +50,7 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *   - Q8_G32_FP16 weight [12288,2048], x [2048,T], out [6144,T];
  *   - Q8_G32_FP16 weight [34816,5120], x [5120,T], out [17408,T];
  *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T];
+ *   - TERNARY_PQ2_0 TernaryPq2Block weight [34816,5120], x [5120,T], out [17408,T];
  *   - FP8_E4M3FN_ROW_BF16 RowScale weight [34816,5120], x [5120,T], out [17408,T].
  *   Inputs and output are contiguous BF16. Q4/Q8 scales are FP16, NVFP4 scales are E4M3FN, and
  *   row-scaled FP8 has one BF16 multiplier per gate/up parent row. Gate rows `[0,17408)` precede
@@ -69,9 +70,9 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  *
  * Workspace:
  *   Caller-owned transient storage reported by linear_swiglu_workspace_capacity_bytes(),
- *   scoped to the call. Q8, NVFP4 A16, and row-scaled FP8 A16 require zero bytes; A4/A8 routes use
- *   caller-owned activation storage and may use private projection storage. There is no persistent
- *   state side effect.
+ *   scoped to the call. Q8, NVFP4 A16, row-scaled FP8 A16, and ternary PQ2_0 require zero
+ *   bytes; A4/A8 routes use caller-owned activation storage and may use private projection
+ *   storage. There is no persistent state side effect.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                    WorkspaceArena& ws, cudaStream_t stream);

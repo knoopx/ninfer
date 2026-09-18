@@ -16,6 +16,7 @@ constexpr int kBlock          = 128;
 constexpr int kQ6GroupedBlock = kEmbedGatherQ6Group * kEmbedGatherQ6GroupsPerBlock;
 constexpr int kQ8GroupedBlock = 32;
 constexpr int kQ8RowBlock     = 256;
+constexpr int kTernaryRowBlock = 256;
 
 template <int BlocksPerToken, int Threads>
 void launch_fp8(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
@@ -156,6 +157,18 @@ void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, Tensor& out
         launch_fp8<10, 128>(ids, table, out, stream);
     else
         launch_fp8<5, 128>(ids, table, out, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void embed_gather_ternary_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                                 cudaStream_t stream) {
+    const int grid = ids.ne[0] * kEmbedGatherTernaryBlocks;
+    const auto* blocks = static_cast<const std::uint8_t*>(table.qdata);
+    const auto* signs  = reinterpret_cast<const float*>(table.rotation) +
+                        kTernaryPq2RotationHeaderBytes / sizeof(float);
+    embed_gather_ternary_kernel<<<grid, kTernaryRowBlock, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), blocks, signs,
+        static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

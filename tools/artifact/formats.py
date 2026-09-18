@@ -43,7 +43,23 @@ class Fp8RowFormat:
     name: str
 
 
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat
+@dataclass(frozen=True, slots=True)
+class TernaryPq2Format:
+    """2-bit ternary codes in a Hadamard-rotated basis, one binary16 scale per 128 block.
+
+    The 2-bit codebook is ``{00: -1, 01: 0, 10: +1, 11: +2}`` and each 128-weight
+    group stores as 34 bytes: a little-endian binary16 scale followed by 32 code
+    bytes (2 bits per weight, low bits first). The rotation sign vector rides as a
+    per-tensor auxiliary (see ``tools.artifact.codecs.ternary_pq2``).
+    """
+
+    name: str
+    group_size: int = 128
+
+
+NumericFormat: TypeAlias = (
+    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | TernaryPq2Format
+)
 
 
 BF16 = DirectFormat("bf16", 2)
@@ -56,6 +72,7 @@ Q6_G64_FP16 = QuantFormat("q6_g64_fp16", 6, 64, -32, 31)
 Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
+TERNARY_PQ2_0 = TernaryPq2Format("ternary_pq2_0", 128)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
@@ -64,8 +81,15 @@ QUANT_FORMATS = MappingProxyType(
 )
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType({FP8_E4M3FN_ROW_BF16.name: FP8_E4M3FN_ROW_BF16})
+TERNARY_PQ2_FORMATS = MappingProxyType({TERNARY_PQ2_0.name: TERNARY_PQ2_0})
 NUMERIC_FORMATS = MappingProxyType(
-    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS}
+    {
+        **DIRECT_FORMATS,
+        **QUANT_FORMATS,
+        **NVFP4_FORMATS,
+        **FP8_ROW_FORMATS,
+        **TERNARY_PQ2_FORMATS,
+    }
 )
 
 
@@ -119,6 +143,30 @@ def valid_fp8_row_scale_word(word: int) -> bool:
     return math.isfinite(value)
 
 
+#: Fixed 2-bit codebook for the ternary PQ2_0 scheme, indexed by the 2-bit code word.
+TERNARY_PQ2_CODEBOOK = (-1, 0, 1, 2)
+
+
+def decode_ternary_pq2_word(word: int) -> float:
+    """Decode one exact two-bit ternary PQ2_0 code word through the fixed codebook."""
+
+    if type(word) is not int or not 0 <= word <= 0x3:
+        raise ValueError("ternary PQ2_0 code word must be an integer in [0, 3]")
+    return float(TERNARY_PQ2_CODEBOOK[word])
+
+
+def valid_ternary_pq2_scale_word(word: int) -> bool:
+    """Return whether a binary16 word is a finite scale multiplier (no NaN/infinity)."""
+
+    return type(word) is int and 0 <= word <= 0xFFFF and (word & 0x7C00) != 0x7C00
+
+
+def valid_ternary_pq2_sign_word(word: int) -> bool:
+    """Return whether a binary32 word is exactly +1.0 or -1.0."""
+
+    return word in (0x3F800000, 0xBF800000)
+
+
 def valid_positive_fp32_word(word: int) -> bool:
     """Return whether an IEEE binary32 word represents a finite positive value."""
 
@@ -147,21 +195,28 @@ __all__ = [
     "Q8_G32_FP16",
     "NVFP4",
     "FP8_E4M3FN_ROW_BF16",
+    "TERNARY_PQ2_0",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
     "NVFP4_FORMATS",
     "FP8_ROW_FORMATS",
+    "TERNARY_PQ2_FORMATS",
     "NUMERIC_FORMATS",
     "DirectFormat",
     "QuantFormat",
     "Nvfp4Format",
     "Fp8RowFormat",
+    "TernaryPq2Format",
     "NumericFormat",
     "get_format",
     "decode_e2m1_word",
     "decode_e4m3fn_word",
+    "decode_ternary_pq2_word",
     "valid_fp8_row_scale_word",
     "valid_fp8_weight_word",
     "valid_nvfp4_scale_word",
+    "valid_ternary_pq2_scale_word",
+    "valid_ternary_pq2_sign_word",
+    "TERNARY_PQ2_CODEBOOK",
     "valid_positive_fp32_word",
 ]

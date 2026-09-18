@@ -23,6 +23,7 @@ _DTYPES = {
     "I32": (torch.int32, 4),
     "I64": (torch.int64, 8),
     "I8": (torch.int8, 1),
+    "U32": (torch.int32, 4),
     "U8": (torch.uint8, 1),
     "F8_E4M3": (torch.float8_e4m3fn, 1),
 }

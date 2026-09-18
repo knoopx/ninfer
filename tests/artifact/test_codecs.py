@@ -7,10 +7,12 @@ import torch
 
 from tools.artifact.layouts import (
     block_scale_geometry,
+    ternary_pq2_geometry,
 )
 from tools.artifact.codecs.direct import decode_direct, encode_direct
 from tools.artifact.codecs.nvfp4 import decode_nvfp4_words, encode_nvfp4
 from tools.artifact.codecs.row_split import decode_row_split_codes, encode_row_split
+from tools.artifact.codecs.ternary_pq2 import decode_ternary_pq2_words, encode_ternary_pq2
 
 
 def _signed_word(word: int, bits: int) -> int:
@@ -186,3 +188,56 @@ def test_nvfp4_known_vector_geometry_swizzle_tail_and_round_trip():
     assert torch.equal(decoded_packed, packed)
     assert torch.equal(decoded_scales, scales)
     assert bytes(decoded_divisor.reshape(1).view(torch.uint8).numpy()) == divisor
+
+
+def test_ternary_pq2_known_vector_block_bytes_geometry_and_round_trip():
+    shape = (2, 256)
+    geometry = ternary_pq2_geometry("ternary_pq2_0", shape)
+    assert (
+        geometry.block_bytes,
+        geometry.block_array_bytes,
+        geometry.rotation_offset,
+        geometry.rotation_bytes,
+        geometry.payload_bytes,
+    ) == (34, 136, 256, 16 + 256 * 4, 1296)
+
+    # Worked example: scale 0.5 stores as binary16 0x3800 -> little-endian bytes 00 38.
+    # Codes 00, 01, 10, 01 (low bits first) pack into one 0x64 byte; the remaining code
+    # bytes are 0x55 (four 01 codes: all-zero values).
+    codes = torch.full((2, 64), 0x55, dtype=torch.uint8)
+    codes[0, 0] = 0x64
+    scales = torch.tensor([0.5, 1.0, 1.0, 1.0], dtype=torch.float16).reshape(2, 2)
+    signs = torch.ones(256, dtype=torch.float32)
+    signs[128:] = -1.0
+    payload = encode_ternary_pq2(codes, scales, signs, shape)
+
+    assert len(payload) == 1296
+    assert payload[0:2] == b"\x00\x38"
+    assert payload[2] == 0x64
+    assert payload[3:34] == b"\x55" * 31
+    assert payload[34:36] == b"\x00\x3c"  # second block scale 1.0 -> 0x3C00.
+    assert payload[36:68] == b"\x55" * 32
+    assert payload[136:256] == b"\x00" * 120  # 256-byte alignment gap.
+
+    header = struct.unpack_from("<IBBBBII", payload, 256)
+    assert header == (1024, 0, 0, 0, 0, 0, 0)
+    assert payload[272:276] == struct.pack("<f", 1.0)
+    assert payload[784:788] == struct.pack("<f", -1.0)  # first -1.0 sign at lane 128.
+
+    decoded_codes, decoded_scales, decoded_signs, rotation = decode_ternary_pq2_words(
+        payload, shape
+    )
+    assert torch.equal(decoded_codes, codes)
+    assert torch.equal(decoded_scales, scales)
+    assert torch.equal(decoded_signs, signs)
+    assert (rotation.block_size, rotation.transform, rotation.gdn_v_grouped, rotation.inverse) == (
+        1024,
+        0,
+        False,
+        False,
+    )
+
+    with pytest.raises(ValueError):
+        encode_ternary_pq2(codes, torch.full((2, 2), float("nan"), dtype=torch.float16), signs, shape)
+    with pytest.raises(ValueError):
+        encode_ternary_pq2(codes, scales, torch.full((256,), 2.0, dtype=torch.float32), shape)

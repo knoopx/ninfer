@@ -1,7 +1,9 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_pair.h"
 
+#include "ops/linear/ternary/ternary_format.h"
 #include "ops/linear_pair/q8/q8_pair_plan.h"
+#include "ops/linear_pair/ternary/ternary_pair_plan.h"
 
 #include <array>
 #include <cstddef>
@@ -87,6 +89,42 @@ void require_nonoverlap(const Tensor& x, const Weight& first_weight, const Weigh
     }
 }
 
+// Ternary pair non-overlap: the operands must not alias each other, and the weight payloads
+// (block plane plus rotation auxiliary; the shared parent payload in the row-view case) must
+// not alias the operands. Identical payload pointers (the shared [6144,2048] parent) are the
+// same range and are skipped.
+void require_ternary_nonoverlap(const Tensor& x, const Weight& first_weight,
+                                const Weight& second_weight, const Tensor& first_out,
+                                const Tensor& second_out) {
+    struct Range {
+        const void* pointer;
+        std::uint64_t bytes;
+        const char* label;
+    };
+
+    const std::uint64_t cols = static_cast<std::uint64_t>(x.ne[1]);
+    const std::array<Range, 5> ranges{{
+        {x.data, cols * static_cast<std::uint64_t>(x.ne[0]) * 2u, "x"},
+        {first_out.data, 1024u * cols * 2u, "first output"},
+        {second_out.data, 1024u * cols * 2u, "second output"},
+        {first_weight.payload, first_weight.payload_bytes, "first weight payload"},
+        {second_weight.payload, second_weight.payload_bytes, "second weight payload"},
+    }};
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const auto first_begin = reinterpret_cast<std::uintptr_t>(ranges[i].pointer);
+        const auto first_end   = first_begin + ranges[i].bytes;
+        for (std::size_t j = i + 1; j < ranges.size(); ++j) {
+            if (ranges[i].pointer == ranges[j].pointer) { continue; }
+            const auto second_begin = reinterpret_cast<std::uintptr_t>(ranges[j].pointer);
+            const auto second_end   = second_begin + ranges[j].bytes;
+            if (first_begin < second_end && second_begin < first_end) {
+                throw std::invalid_argument(std::string("linear_pair: ") + ranges[i].label +
+                                            " overlaps " + ranges[j].label);
+            }
+        }
+    }
+}
+
 } // namespace
 
 std::size_t linear_pair_workspace_capacity_bytes(const Weight& first_weight,
@@ -95,6 +133,9 @@ std::size_t linear_pair_workspace_capacity_bytes(const Weight& first_weight,
     if (min_tokens <= 0 || max_tokens < min_tokens ||
         (first_weight.k != 5120 && first_weight.k != 2048)) {
         throw std::invalid_argument("linear_pair: unsupported weight/column geometry");
+    }
+    if (first_weight.qtype == QType::TERNARY_PQ2_0 && second_weight.qtype == QType::TERNARY_PQ2_0) {
+        return detail::ternary_pair_workspace_capacity_bytes(first_weight.k, min_tokens, max_tokens);
     }
     require_weight(first_weight, first_weight.k, "first weight");
     require_weight(second_weight, first_weight.k, "second weight");
@@ -112,6 +153,13 @@ void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& seco
     require_matrix(second_out, 1024, cols, "second output");
     if (first_weight.k != x.ne[0]) {
         throw std::invalid_argument("linear_pair: weight K differs from input");
+    }
+    if (first_weight.qtype == QType::TERNARY_PQ2_0 && second_weight.qtype == QType::TERNARY_PQ2_0) {
+        (void)detail::ternary_pair_workspace_capacity_bytes(first_weight.k, cols, cols);
+        require_ternary_nonoverlap(x, first_weight, second_weight, first_out, second_out);
+        detail::ternary_pair_dispatch(x, first_weight, second_weight, first_out, second_out,
+                                      stream);
+        return;
     }
     (void)linear_pair_workspace_capacity_bytes(first_weight, second_weight, cols, cols);
     require_nonoverlap(x, first_weight, second_weight, first_out, second_out);

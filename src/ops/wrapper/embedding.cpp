@@ -3,6 +3,7 @@
 
 #include "ops/common/math.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/ternary/ternary_format.h"
 #include "ops/launcher/embed_gather.h" // detail::embed_gather_*_launch
 #include "core/weight_view.h"
 
@@ -181,6 +182,22 @@ void require_fp8_metadata(const Weight& table, const Tensor& out) {
     (void)detail::validate_fp8_weight(table, "embedding");
 }
 
+void require_ternary_metadata(const Weight& table, const Tensor& out) {
+    constexpr std::int32_t kVocabulary = 248320;
+    constexpr std::int32_t kHidden     = 5120;
+    if (table.n != kVocabulary || table.k != kHidden || out.ne[0] != kHidden) {
+        throw std::invalid_argument("embedding: unsupported ternary table shape");
+    }
+    (void)detail::validate_ternary_weight_metadata(table, "embedding");
+    // The embed table is stored inverse-rotated: the rotation header inverse flag (byte 6)
+    // must be 1. A non-inverse ternary embed table is rejected.
+    const auto* rotation = static_cast<const std::uint8_t*>(table.rotation);
+    if (rotation[6] != 1) {
+        throw std::invalid_argument(
+            "embedding: TERNARY_PQ2_0 table must be the inverse-transform route");
+    }
+}
+
 bool is_empty_T(const Tensor& ids, const Tensor& out) { return ids.ne[0] == 0 || out.ne[1] == 0; }
 
 void require_non_empty_tensors(const Tensor& ids, const Tensor& out) {
@@ -231,6 +248,12 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
         detail::embed_gather_fp8_launch(ids, table, out, stream);
+        break;
+    case QType::TERNARY_PQ2_0:
+        require_ternary_metadata(table, out);
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::embed_gather_ternary_launch(ids, table, out, stream);
         break;
     default:
         throw std::invalid_argument("embedding: unsupported table qtype");

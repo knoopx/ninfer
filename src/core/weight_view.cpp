@@ -142,14 +142,30 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_bytes_per_row = k / 16;
         out.code_bytes          = out.elements / 2;
         out.scale_offset        = aligned(out.code_bytes, 256);
+    } else if (layout == QuantLayout::TernaryPq2Block) {
+        if (format != QType::TERNARY_PQ2_0 || k % kTernaryPq2GroupSize) {
+            throw std::invalid_argument("TernaryPq2Block requires TERNARY_PQ2_0 and K%128=0");
+        }
+        out.group_size         = kTernaryPq2GroupSize;
+        out.code_bytes_per_row = mul(k / kTernaryPq2GroupSize, kTernaryPq2BlockBytes);
+        out.code_bytes         = mul(n, out.code_bytes_per_row);
+        out.scale_bytes_per_row = 0; // the binary16 scale is embedded in each block
+        out.scale_offset       = 0;
+        out.rotation_offset    = aligned(out.code_bytes, 256);
+        out.rotation_bytes     =
+            kTernaryPq2RotationHeaderBytes + mul(k, kTernaryPq2SignWordBytes);
     } else {
         throw std::invalid_argument("unknown quantized weight layout");
     }
     out.scale_bytes = mul(n, out.scale_bytes_per_row);
-    out.bytes       = add(out.scale_offset, out.scale_bytes);
-    if (format == QType::NVFP4) {
-        out.divisor_offset = out.bytes;
-        out.bytes          = add(out.bytes, 4);
+    if (layout == QuantLayout::TernaryPq2Block) {
+        out.bytes = add(out.rotation_offset, out.rotation_bytes);
+    } else {
+        out.bytes = add(out.scale_offset, out.scale_bytes);
+        if (format == QType::NVFP4) {
+            out.divisor_offset = out.bytes;
+            out.bytes          = add(out.bytes, 4);
+        }
     }
     return out;
 }
@@ -262,10 +278,11 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         throw std::invalid_argument("quantized native Weight requires unchanged parent K");
     }
     const auto planes = weight_row_planes(region);
-    if ((g.layout == QuantLayout::RowScale || g.layout == QuantLayout::BlockScaleK16M128x4) &&
+    if ((g.layout == QuantLayout::RowScale || g.layout == QuantLayout::BlockScaleK16M128x4 ||
+         g.layout == QuantLayout::TernaryPq2Block) &&
         !is_complete_weight(view)) {
         throw std::invalid_argument(
-            "this native Weight input requires a complete FP8/NVFP4 parent");
+            "this native Weight input requires a complete FP8/NVFP4/ternary parent");
     }
     out.padded_shape[1]      = dimension(g.padded_columns);
     out.qdata                = planes.codes;
@@ -289,6 +306,9 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * 2;
     } else if (g.layout == QuantLayout::BlockScaleK16M128x4) {
         out.scale_dtype = DType::FP8_E4M3FN;
+    } else if (g.layout == QuantLayout::TernaryPq2Block) {
+        out.rotation     = static_cast<const std::byte*>(region.parent->data) + g.rotation_offset;
+        out.rotation_bytes = g.rotation_bytes;
     }
     return out;
 }

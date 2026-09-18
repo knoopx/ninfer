@@ -47,6 +47,8 @@ struct WeightGeometry {
     std::uint64_t scale_offset        = 0;
     std::uint64_t scale_bytes         = 0;
     std::uint64_t divisor_offset      = 0;
+    std::uint64_t rotation_offset     = 0;
+    std::uint64_t rotation_bytes      = 0;
 };
 
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,

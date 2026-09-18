@@ -1,6 +1,6 @@
 # NInfer Persistent Tensor Numeric Formats
 
-This reference defines the nine persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. [Container framing](artifact-container.md),
 [physical layouts](storage-layouts.md), weight recipes and runtime-state codecs are defined
@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-NInfer has exactly nine persistent numeric tensor formats in four categories.
+NInfer's persistent numeric tensor formats form a closed registry in four categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -39,6 +39,12 @@ The row-scaled floating-point weight format is:
 |---|---|---|---|
 | `fp8_e4m3fn_row_bf16` | E4M3FN, 8 bits/weight | one multiplier per logical row | BF16 |
 
+The rotated ternary-codebook weight format is:
+
+| Canonical name | Code | Group | Block | Rotation auxiliary |
+|---|---|---:|---|---|
+| `ternary_pq2_0` | 2-bit codebook {−1, 0, +1, +2} | 128 | one binary16 scale + 32 code bytes per 34-byte block | per-tensor 16-byte header + one binary32 sign per input lane |
+
 Each name fixes a code and scale contract. The format registry is implemented in
 [`tools/artifact/formats.py`](../../tools/artifact/formats.py) and
 [`src/artifact/formats.cpp`](../../src/artifact/formats.cpp). Additional formats need an explicit
@@ -53,8 +59,9 @@ The registry keeps the following concerns separate.
 
 A **persistent numeric format** defines the logical words needed to recover a numeric tensor from
 an artifact. The closed registry contains direct scalar formats, grouped signed-integer formats,
-the block-scaled `nvfp4` format, and the row-scaled `fp8_e4m3fn_row_bf16` format. It does not
-identify a tensor's model role, physical byte layout, or supported consumer.
+the block-scaled `nvfp4` format, the row-scaled `fp8_e4m3fn_row_bf16` format, and the rotated
+ternary-codebook `ternary_pq2_0` format. It does not identify a tensor's model role, physical byte
+layout, or supported consumer.
 
 ### 2.2 Direct scalar format
 
@@ -119,9 +126,9 @@ among other things:
 One format may have more than one deliberately supported layout, but every layout must decode to
 exactly the same direct words or logical codes and scales. The currently registered layouts are
 `contiguous_le_v1` for direct words, `row_split_k128_v1` for grouped signed-integer formats, and
-`block_scale_k16_m128x4_v1` for `nvfp4`, and `row_scale_v1` for
-`fp8_e4m3fn_row_bf16`. Their byte order, plane packing, padding, swizzle, divisor placement, and
-alignment rules belong to the layout registry, not to these nine numeric formats.
+`block_scale_k16_m128x4_v1` for `nvfp4`, `row_scale_v1` for `fp8_e4m3fn_row_bf16`, and
+`ternary_pq2_block_v1` for `ternary_pq2_0`. Their byte order, plane packing, padding, swizzle,
+divisor placement, and alignment rules belong to the layout registry, not to these numeric formats.
 
 ### 2.7 Compute profile and kernel support
 
@@ -297,6 +304,34 @@ The format does not define how a floating-point source is assigned a scale or ro
 A recipe either preserves already selected code and scale words exactly or names its
 conversion method. Activation quantization and activation scales are separate compute or runtime-state
 concerns and are not persistent fields of this format.
+
+### 3.5 `ternary_pq2_0`
+
+`ternary_pq2_0` is a rotated ternary-codebook weight representation for a logical rank-two matrix
+`[N,K]` with `K` a multiple of 128. Each 128-weight group stores one little-endian binary16 scale
+and 32 code bytes (two bits per weight, low bits first) in one 34-byte block, laid out row-major
+over `[N, K/128]`. The fixed 2-bit codebook is:
+
+```text
+00 : -1      01 : 0      10 : +1      11 : +2
+```
+
+For code word `c[n,k]` and scale word `s[n,g]` with `g = floor(k / 128)`, the exact represented
+weight is:
+
+```text
+w_hat[n,k] = binary32(codebook(c[n,k]) * exact_binary16_to_binary32(s[n,g]))
+```
+
+Stored scales admit only finite binary16 words; every NaN and both infinities are invalid.
+
+The format carries one per-tensor rotation auxiliary that mirrors the NVFP4 weight-divisor
+mechanism: a 256-aligned trailing region of `16 + 4K` bytes. Its 16-byte little-endian header is a
+`u32` block size fixed at 1024, a `u8` transform id fixed at 0 (the normalized signed Sylvester
+Walsh-Hadamard transform), `u8` gdn_v_grouped and inverse flags, one reserved byte, and two
+reserved `u32` words; it is followed by `K` binary32 signs, each exactly `+1.0` (`0x3F800000`)
+or `-1.0` (`0xBF800000`). The signs index the input lanes of the rotated codebook basis. The
+auxiliary is decoded and validated together with the payload; it is never inferred from context.
 
 ## 4. Grouped signed-integer tensor model
 

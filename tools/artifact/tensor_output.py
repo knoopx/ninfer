@@ -12,17 +12,21 @@ from .codecs.direct import encode_direct
 from .codecs.fp8_row import encode_fp8_row_scaled
 from .codecs.nvfp4 import encode_nvfp4
 from .codecs.row_split import encode_row_split, split_row_planes
+from .codecs.ternary_pq2 import encode_ternary_pq2_blocks
 from .formats import (
     DirectFormat,
     Fp8RowFormat,
     Nvfp4Format,
     QuantFormat,
+    TernaryPq2Format,
     get_format,
 )
 from .layouts import (
+    TERNARY_PQ2_BLOCK_BYTES,
     block_scale_geometry,
     row_scale_geometry,
     row_split_geometry,
+    ternary_pq2_geometry,
 )
 from .schema import TensorObject
 from .writer import ArtifactWriter
@@ -120,6 +124,27 @@ class TensorOutput:
             )
             if self._divisor is None:
                 self.write_bytes(g.weight_divisor_offset, weight_divisor)
+                self._divisor = bytes(weight_divisor)
+            elif self._divisor != weight_divisor:
+                raise ValueError(f"{obj.id}: weight divisor changed between row blocks")
+        elif isinstance(self.format, TernaryPq2Format):
+            if weight_divisor is None:
+                raise ValueError(
+                    f"{obj.id}: ternary PQ2_0 output requires the rotation auxiliary"
+                )
+            g = ternary_pq2_geometry(self.format, obj.shape)
+            local = ternary_pq2_geometry(self.format, (rows, k))
+            block_bytes = encode_ternary_pq2_blocks(codes, scales, (rows, k))
+            self.write_bytes(
+                row_begin * local.groups_per_row * TERNARY_PQ2_BLOCK_BYTES, block_bytes
+            )
+            if self._divisor is None:
+                if len(weight_divisor) != g.rotation_bytes:
+                    raise ValueError(
+                        f"{obj.id}: ternary PQ2_0 rotation auxiliary is "
+                        f"{len(weight_divisor)} bytes, expected {g.rotation_bytes}"
+                    )
+                self.write_bytes(g.rotation_offset, weight_divisor)
                 self._divisor = bytes(weight_divisor)
             elif self._divisor != weight_divisor:
                 raise ValueError(f"{obj.id}: weight divisor changed between row blocks")

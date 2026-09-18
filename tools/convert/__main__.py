@@ -14,6 +14,7 @@ from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from .qwen3_5 import build_model
 from .recipe import Recipe
+from .sources.mlx_ternary import MlxTernarySource
 from .sources.safetensors import SafetensorsSource
 
 
@@ -31,9 +32,14 @@ class SourceInputs(Mapping):
                 raise ValueError(
                     f"selected recipe requires source {name!r}; provide --source {name}=PATH"
                 )
-            self._sources[name] = self._stack.enter_context(
-                SafetensorsSource(self._paths[name])
-            )
+            if name == "mlx_ternary":
+                self._sources[name] = self._stack.enter_context(
+                    MlxTernarySource(self._paths[name])
+                )
+            else:
+                self._sources[name] = self._stack.enter_context(
+                    SafetensorsSource(self._paths[name])
+                )
         return self._sources[name]
 
     def __iter__(self):
@@ -103,7 +109,7 @@ def main(argv=None):
         action="append",
         default=[],
         metavar="NAME=PATH",
-        help="named source such as quantized, dflash or dflash2",
+        help="named source such as quantized, dflash, dflash2 or mlx_ternary",
     )
     parser.add_argument(
         "--components",

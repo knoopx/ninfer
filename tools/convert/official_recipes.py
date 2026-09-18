@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded
+from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_ternary_pq2_0, import_encoded
 
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
@@ -118,6 +118,62 @@ def qwen3_6_35b_a3b(model, recipe, sources):
         _assign(recipe, name, format)
 
 
+def qwen3_8_27b_ternary(model, recipe, sources):
+    if "num_experts" in model.config:
+        raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
+    _optional(model, recipe)
+    mlx = sources["mlx_ternary"]
+    config = model.config
+    d = config["head_dim"]
+    heads = config["num_attention_heads"]
+    kg = config["linear_num_key_heads"] * config["linear_key_head_dim"]
+    vg = config["linear_num_value_heads"] * config["linear_value_head_dim"]
+    query_rows = tuple((head * 2 * d, head * 2 * d + d) for head in range(heads))
+    gate_rows = tuple((head * 2 * d + d, head * 2 * d + 2 * d) for head in range(heads))
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/"):
+            continue
+        if name == "text/token_embedding":
+            recipe.assign(
+                name,
+                format="ternary_pq2_0",
+                method=import_ternary_pq2_0,
+                source=mlx.ternary(name, parameter.shape),
+            )
+            continue
+        if name == "text/output_head":
+            recipe.assign(
+                name,
+                format=Q8,
+                method=grouped_absmax,
+                source=mlx.rebase_head_q8(name, parameter.shape),
+            )
+            continue
+        if not parameter.projection or name.endswith(
+            ("/gdn/a_projection", "/gdn/b_projection")
+        ):
+            recipe.assign(name, source=mlx.direct(name, parameter.shape))
+            continue
+        if name.endswith("/attention/query"):
+            rows = query_rows
+        elif name.endswith("/attention/gate"):
+            rows = gate_rows
+        elif name.endswith("/gdn/query"):
+            rows = ((0, kg),)
+        elif name.endswith("/gdn/key"):
+            rows = ((kg, 2 * kg),)
+        elif name.endswith("/gdn/value"):
+            rows = ((2 * kg, 2 * kg + vg),)
+        else:
+            rows = None
+        recipe.assign(
+            name,
+            format="ternary_pq2_0",
+            method=import_ternary_pq2_0,
+            source=mlx.ternary(name, parameter.shape, rows=rows),
+        )
+
+
 def qwen3_6_27b_nvfp4(model, recipe, sources):
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
@@ -179,5 +235,6 @@ RECIPES = {
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
+    "qwen3_8_27b_ternary": qwen3_8_27b_ternary,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
 }

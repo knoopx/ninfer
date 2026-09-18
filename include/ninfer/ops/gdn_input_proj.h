@@ -47,19 +47,24 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
  * Single-parent GDN projection. Registered parent forms are:
  *
  * - Q8_G32_FP16 RowSplit [12288,2048], with stored row counts [2048,2048,4096,4096];
- * - NVFP4 BlockScaleK16M128x4 [16384,5120], with stored row counts [2048,2048,6144,6144].
+ * - NVFP4 BlockScaleK16M128x4 [16384,5120], with stored row counts [2048,2048,6144,6144];
  * - FP8_E4M3FN_ROW_BF16 RowScale [16384,5120], with stored row counts
- *   [2048,2048,6144,6144].
+ *   [2048,2048,6144,6144];
+ * - TERNARY_PQ2_0 TernaryPq2Block [16384,5120], with stored row counts
+ *   [2048,2048,6144,6144] in q/k/value/z row order.
  *
  * The first three ranges are written contiguously to qkv and the final range is written to z.
  * Q8 uses A16 under every policy. NVFP4 uses A16 under A16Only/AllowA8; AllowA4 permits
  * private activation quantization at every positive T. FP8 accepts all policies; AllowA8/AllowA4
  * selects A16 through T=7 and private activation quantization followed by A8 Tensor Core
- * contraction at every T>=8. Every route writes the two independent final allocations directly.
+ * contraction at every T>=8. TERNARY_PQ2_0 resolves every policy to the A16 routes at zero
+ * transient bytes. Every route writes the two independent final allocations directly.
  * The complete projection is evaluated against the same exact-decode/naive-FP64 oracle;
  * activation quantization and the production reduction profile are private effects covered by the
  * selected criterion. x, both persistent weight planes, qkv, z, and the live workspace must be
  * mutually non-overlapping.
+ * The TERNARY_PQ2_0 kernel consumes the stored row order as-is; the gdn_v_grouped grouped-V order
+ * is honored by the model composition, with no permutation inside the kernels.
  *
  * The policy-bearing form uses caller-owned call-scoped transient storage sized by
  * gdn_input_proj_workspace_capacity_bytes(). A16 requires zero bytes. The convenience overload

@@ -1,6 +1,7 @@
 #include "artifact/materializer.h"
 
 #include "artifact/framing.h"
+#include "artifact/layouts.h"
 #include "artifact/reader.h"
 #include "core/startup.h"
 
@@ -171,6 +172,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             checked_add(out.stats_.retained_host_bytes, storage.host_data.size(), "retained bytes");
         if (std::holds_alternative<TensorObject>(object)) {
             const auto& geometry = reader.geometry(placement.object);
+            validate_ternary_payload(storage.host_data.data(), geometry,
+                                     reader.directory().tensor(placement.object).id);
             const auto divisor =
                 read_divisor(reader, placement.object, geometry, storage.host_data, out.stats_);
             storage.host = WeightParent{geometry, storage.host_data.data(), divisor};
@@ -182,6 +185,11 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         auto& object         = out.objects_.at(placement.object.index);
         if (object.device || !out.arena_ || geometry.bytes != placement.bytes) {
             throw ArtifactError("invalid or duplicate device placement");
+        }
+        if (geometry.format == QType::TERNARY_PQ2_0) {
+            auto ternary_bytes = reader.read_object(placement.object);
+            validate_ternary_payload(ternary_bytes.data(), geometry,
+                                     reader.directory().tensor(placement.object).id);
         }
         auto storage      = out.arena_->alloc_bytes(static_cast<std::size_t>(placement.bytes),
                                                     static_cast<std::size_t>(placement.alignment));

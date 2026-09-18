@@ -6,10 +6,12 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
+#include "ops/attn_input_proj/ternary/ternary_attn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/ternary/ternary_format.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -145,6 +147,26 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         return;
     }
 
+    if (weight.qtype == QType::TERNARY_PQ2_0) {
+        constexpr std::int32_t kHidden = 5120;
+        constexpr std::int32_t kQRows  = 6144;
+        constexpr std::int32_t kKvRows = 1024;
+        constexpr std::int32_t kRows   = 14336;
+        const std::int32_t cols        = x.ne[1];
+        if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(q, kQRows, cols, "q");
+        require_matrix(gate, kQRows, cols, "gate");
+        require_matrix(k, kKvRows, cols, "k");
+        require_matrix(v, kKvRows, cols, "v");
+        (void)detail::validate_ternary_weight_metadata(weight, "ternary attn_input_proj");
+        if (weight.n != kRows || weight.k != kHidden) {
+            throw std::invalid_argument("ternary attn_input_proj: unsupported weight shape");
+        }
+        detail::ternary_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
+        return;
+    }
+
     constexpr std::int32_t kHidden = 2048;
     constexpr std::int32_t kQRows  = 4096;
     constexpr std::int32_t kKvRows = 512;
@@ -189,6 +211,11 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             throw std::invalid_argument("attn_input_proj workspace: unsupported FP8 profile");
         }
         return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+    case QType::TERNARY_PQ2_0:
+        if (parent_rows != 14336 || input_rows != 5120) {
+            throw std::invalid_argument("attn_input_proj workspace: unsupported ternary profile");
+        }
+        return detail::ternary_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     case QType::Q8_G32_FP16:
         if (parent_rows != 9216 || input_rows != 2048) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported Q8 profile");

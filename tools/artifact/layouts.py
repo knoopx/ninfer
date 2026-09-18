@@ -20,11 +20,20 @@ from .formats import (
     Nvfp4Format,
     NumericFormat,
     QuantFormat,
+    TernaryPq2Format,
     get_format,
 )
 
 PLANE_ALIGNMENT = 256
 K_ALIGNMENT = 128
+
+#: One ternary PQ2_0 block: 2-byte binary16 scale + 32 code bytes (2 bits/weight).
+TERNARY_PQ2_BLOCK_BYTES = 34
+#: Fixed Hadamard rotation block size carried by the per-tensor rotation auxiliary.
+TERNARY_PQ2_ROTATION_BLOCK_SIZE = 1024
+#: Per-tensor rotation auxiliary: fixed header followed by one binary32 sign per input lane.
+TERNARY_PQ2_ROTATION_HEADER_BYTES = 16
+TERNARY_PQ2_SIGN_WORD_BYTES = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +86,18 @@ class RowScaleGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class TernaryPq2Geometry:
+    n: int
+    k: int
+    groups_per_row: int
+    block_bytes: int
+    block_array_bytes: int
+    rotation_offset: int
+    rotation_bytes: int
+    payload_bytes: int
+
+
 CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "int32")))
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
@@ -93,6 +114,11 @@ ROW_SCALE_V1 = Layout(
     256,
     frozenset(("fp8_e4m3fn_row_bf16",)),
 )
+TERNARY_PQ2_BLOCK_V1 = Layout(
+    "ternary_pq2_block_v1",
+    256,
+    frozenset(("ternary_pq2_0",)),
+)
 
 LAYOUTS = MappingProxyType(
     {
@@ -102,6 +128,7 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            TERNARY_PQ2_BLOCK_V1,
         )
     }
 )
@@ -246,6 +273,43 @@ def row_scale_geometry(
     )
 
 
+def ternary_pq2_geometry(
+    format: str | TernaryPq2Format, shape: Sequence[int]
+) -> TernaryPq2Geometry:
+    """Geometry for the interleaved 34-byte ternary PQ2_0 block layout.
+
+    The payload is a row-major array of 34-byte blocks (one per 128-weight group),
+    followed by the per-tensor rotation auxiliary (16-byte header + one binary32
+    sign per input lane). The rotation auxiliary mirrors the NVFP4 weight-divisor
+    mechanism: a trailing aligned region described by the geometry.
+    """
+
+    spec = _format(format)
+    if not isinstance(spec, TernaryPq2Format):
+        raise ValueError("ternary_pq2_block_v1 requires ternary PQ2_0")
+    n, k = _shape(shape, rank=2)
+    if k % spec.group_size != 0:
+        raise ValueError(
+            "ternary_pq2_block_v1 requires K divisible by the ternary group size"
+        )
+    groups_per_row = k // spec.group_size
+    block_array_bytes = n * groups_per_row * TERNARY_PQ2_BLOCK_BYTES
+    rotation_offset = align_up(block_array_bytes, PLANE_ALIGNMENT)
+    rotation_bytes = (
+        TERNARY_PQ2_ROTATION_HEADER_BYTES + k * TERNARY_PQ2_SIGN_WORD_BYTES
+    )
+    return TernaryPq2Geometry(
+        n=n,
+        k=k,
+        groups_per_row=groups_per_row,
+        block_bytes=TERNARY_PQ2_BLOCK_BYTES,
+        block_array_bytes=block_array_bytes,
+        rotation_offset=rotation_offset,
+        rotation_bytes=rotation_bytes,
+        payload_bytes=rotation_offset + rotation_bytes,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -276,4 +340,8 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row_scale_v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is TERNARY_PQ2_BLOCK_V1:
+        if not isinstance(numeric_spec, TernaryPq2Format):
+            raise ValueError("ternary_pq2_block_v1 requires ternary PQ2_0")
+        return ternary_pq2_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

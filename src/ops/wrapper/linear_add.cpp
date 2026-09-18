@@ -6,11 +6,13 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/ternary/ternary_format.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/q8/q8_linear_add_plan.h"
+#include "ops/linear_add/ternary/ternary_linear_add_plan.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -137,6 +139,17 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return detail::fp8_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                                min_tokens, max_tokens);
     }
+    if (qtype == QType::TERNARY_PQ2_0) {
+        const bool supported = (output_rows == 5120 && input_rows == 6144) ||
+                               (output_rows == 5120 && input_rows == 17408) ||
+                               (output_rows == 2048 && input_rows == 4096) ||
+                               (output_rows == 2048 && input_rows == 6144);
+        if (!supported) {
+            throw std::invalid_argument("linear_add workspace: unsupported ternary profile");
+        }
+        return detail::ternary_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
+                                                                   min_tokens, max_tokens);
+    }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
 
@@ -240,6 +253,21 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
         detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        return;
+    }
+
+    if (w.qtype == QType::TERNARY_PQ2_0) {
+        (void)detail::validate_ternary_weight_metadata(w, "ternary linear_add");
+        const bool supported_shape = (w.n == 5120 && w.k == 6144) || (w.n == 5120 && w.k == 17408) ||
+                                     (w.n == 2048 && w.k == 4096) || (w.n == 2048 && w.k == 6144);
+        if (!supported_shape) {
+            throw std::invalid_argument("ternary linear_add: unsupported weight shape");
+        }
+        if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
+            throw std::invalid_argument(
+                "linear_add: TERNARY_PQ2_0 requires 16-byte x/residual alignment");
+        }
+        detail::ternary_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
         return;
     }
 

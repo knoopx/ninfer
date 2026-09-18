@@ -52,13 +52,17 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
  *   BF16.
  * - FP8_E4M3FN_ROW_BF16 RowScale `[14336,5120]`, with the same logical row and tensor shapes as
  *   BF16.
+ * - TERNARY_PQ2_0 TernaryPq2Block `[14336,5120]`, with row counts `[6144,1024,6144,1024]`
+ *   (physical order query/key/gate/value, public argument order q, gate, k, v), with the same
+ *   logical row and tensor shapes as BF16.
  *
  * `T` is the positive token extent of the Op contract. All three policies permit the BF16
  * and Q8_G32_FP16 A16 implementations. NVFP4 uses A16 under A16Only/AllowA8; AllowA4 permits the
  * resolver to select either a qualified A16 route or activation quantization to NVFP4 at every
  * positive T. FP8 accepts all policies at every positive T. AllowA8/AllowA4 permit the resolver to
  * choose a qualified A16 route or private activation quantization followed by A8 Tensor Core
- * computation. A16Only preserves the represented BF16 activation at every positive T; tile and
+ * computation. TERNARY_PQ2_0 resolves every policy to the A16 routes at zero transient bytes.
+ * A16Only preserves the represented BF16 activation at every positive T; tile and
  * route cutoffs are private implementation choices, independent of speculative block width.
  *
  * The oracle evaluates every projection independently with naive FP64 accumulation from the

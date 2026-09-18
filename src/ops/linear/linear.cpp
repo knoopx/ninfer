@@ -4,6 +4,7 @@
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
+#include "ops/linear/ternary/ternary_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
@@ -98,6 +99,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP8_E4M3FN_ROW_BF16:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
+    case QType::TERNARY_PQ2_0:
+        detail::ternary_dispatch(x, w, out, policy, workspace, stream);
+        return;
     case QType::FP32:
     case QType::INT32:
         break;
@@ -142,6 +146,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
+    case QType::TERNARY_PQ2_0:
+        return detail::ternary_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
+                                                               min_tokens, max_tokens);
     case QType::FP32:
     case QType::INT32:
         break;

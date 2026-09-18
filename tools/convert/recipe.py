@@ -9,7 +9,13 @@ from math import prod
 from typing import Sequence
 
 from tools.artifact.layouts import encoded_size
-from tools.artifact.formats import DirectFormat, Fp8RowFormat, Nvfp4Format, get_format
+from tools.artifact.formats import (
+    DirectFormat,
+    Fp8RowFormat,
+    Nvfp4Format,
+    TernaryPq2Format,
+    get_format,
+)
 from tools.artifact.schema import ACTIVATION_POLICIES, TensorSpec
 from .methods import (
     AuxiliaryValue,
@@ -21,6 +27,7 @@ from .methods import (
     grouped_absmax,
     fp8_row_maxabs,
     import_encoded,
+    import_ternary_pq2_0,
 )
 from .model import Model
 from .sources.logical import LogicalSource, select_rows
@@ -63,6 +70,8 @@ def default_layout(format: str) -> str:
         return "row_scale_v1"
     if isinstance(kind, Nvfp4Format):
         return "block_scale_k16_m128x4_v1"
+    if isinstance(kind, TernaryPq2Format):
+        return "ternary_pq2_block_v1"
     return "row_split_k128_v1"
 
 
@@ -379,7 +388,13 @@ class Recipe:
                 )
             emit([(name, self.selections[name][0]) for name in names], chosen)
             used.update(names)
-        standard = (cast_direct, grouped_absmax, fp8_row_maxabs, import_encoded)
+        standard = (
+            cast_direct,
+            grouped_absmax,
+            fp8_row_maxabs,
+            import_encoded,
+            import_ternary_pq2_0,
+        )
         for names in self.model.packing_groups:
             if any(
                 name in used or name in self.aliases or name in self.separate_parameters

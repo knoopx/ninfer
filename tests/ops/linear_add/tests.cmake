@@ -27,3 +27,7 @@ ninfer_add_op_test(ninfer_linear_add_nvfp4_test
 ninfer_add_op_test(ninfer_linear_add_fp8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8.cpp"
   LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_linear_add_ternary_a16_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ternary_a16.cpp"
+  LIBRARIES ninfer_ops)
