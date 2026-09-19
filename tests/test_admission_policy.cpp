@@ -79,8 +79,8 @@ int main() {
 
     int failures = 0;
     const std::array<ActiveAdmissionSnapshot, 2> incumbents{
-        ActiveAdmissionSnapshot{.request_id = 1},
-        ActiveAdmissionSnapshot{.request_id = 2},
+        ActiveAdmissionSnapshot{.request_id = 1, .remaining_work_quanta = 5},
+        ActiveAdmissionSnapshot{.request_id = 2, .remaining_work_quanta = 9},
     };
 
     auto protection = ninfer::runtime::make_admission_protection(7, 10, revision(31), incumbents);
@@ -88,6 +88,10 @@ int main() {
         check(protection.donor_count == 2 && protection.donor_ids[0] == 1 &&
                   protection.donor_ids[1] == 2 && protection.resource_revision == revision(31),
               "protection did not freeze every incumbent donor");
+    failures +=
+        check(protection.temporal_credit == 9 &&
+                  ninfer::runtime::protection_frontier_distance(protection, incumbents) == 9,
+              "temporal credit did not mint from the frozen donor frontier");
     failures += check(ninfer::runtime::protection_has_live_donor(protection, incumbents),
                       "live donor was not recognized");
     failures += check(ninfer::runtime::persistent_backfill_is_authorized(protection, 11, incumbents,
@@ -132,7 +136,7 @@ int main() {
     scheduler.observe_fifo_head(10);
     failures += check(scheduler.protect_blocked_head(10, incumbents, revision(40)),
                       "blocked FIFO head did not open a donor epoch");
-    auto stale = scheduler.qualify_backfill(11, 50, incumbents, revision(40));
+    auto stale = scheduler.qualify_backfill(11, 50, incumbents, revision(40), true);
     failures += check(stale && stale->backfill_class() == BackfillClass::Persistent &&
                           scheduler.validate_grant(*stale),
                       "Program-proved borrower did not receive a persistent grant");
@@ -142,7 +146,7 @@ int main() {
                           !scheduler.validate_grant(*stale),
                       "resource revision did not invalidate an uncommitted grant");
 
-    auto first = scheduler.qualify_backfill(11, 50, incumbents, revision(41));
+    auto first = scheduler.qualify_backfill(11, 50, incumbents, revision(41), true);
     failures += check(first && first->protection_epoch() == epoch &&
                           first->resource_revision() == revision(41),
                       "revalidated borrower changed the logical protection epoch");
@@ -160,9 +164,29 @@ int main() {
     };
     failures += check(scheduler.protect_blocked_head(10, active_after_first, revision(42)),
                       "existing persistent borrower prevented revision revalidation");
-    auto second = scheduler.qualify_backfill(12, 1, active_after_first, revision(42));
+    auto second = scheduler.qualify_backfill(12, 1, active_after_first, revision(42), true);
     failures += check(second && scheduler.validate_grant(*second),
                       "second Program-proved borrower was not cumulatively admitted");
+
+    auto temporal = scheduler.qualify_backfill(15, 4, active_after_first, revision(42), false);
+    failures += check(
+        temporal && temporal->backfill_class() == BackfillClass::Temporal &&
+            temporal->protection_epoch() == epoch && scheduler.validate_grant(*temporal),
+        "short queued request did not receive a temporal grant");
+    if (temporal) { scheduler.commit_admission(std::move(*temporal)); }
+    failures += check(!scheduler.qualify_backfill(16, 6, active_after_first, revision(42), false),
+                      "temporal borrower exceeded the consumed temporal credit");
+
+    const std::array<ActiveAdmissionSnapshot, 1> donors_gone{
+        ActiveAdmissionSnapshot{
+            .request_id     = 11,
+            .backfill_epoch = epoch,
+            .backfill_class = BackfillClass::Temporal,
+        },
+    };
+    failures += check(scheduler.drain_protection(donors_gone) &&
+                          !scheduler.qualify_backfill(17, 1, donors_gone, revision(42), false),
+                      "drained protection kept admitting temporal borrowers");
 
     scheduler.on_waiting_removed(10);
     scheduler.observe_fifo_head(14);

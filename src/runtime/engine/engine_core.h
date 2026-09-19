@@ -1770,6 +1770,7 @@ private:
             }
             if (!scheduler_.protect_blocked_head(head->id, active.span(),
                                                  instance_.program->resource_revision())) {
+                (void)scheduler_.drain_protection(active.span());
                 return control_progress ? AdmissionProgress::ControlProgress
                                         : AdmissionProgress::None;
             }
@@ -1835,11 +1836,12 @@ private:
                     *instance_.program, *head->base_plan, *candidate_inspection.choice,
                     std::span<const SequenceHandle>(persistent_borrowers.data(),
                                                     persistent_borrower_count));
-                if (!proof) { continue; }
                 const RequestPlanSummary& candidate_plan = candidate_inspection.choice->summary();
                 auto grant =
                     scheduler_.qualify_backfill(candidate->id, candidate_plan.service_work_quanta,
-                                                active.span(), proof->resource_revision());
+                                                active.span(),
+                                                instance_.program->resource_revision(),
+                                                proof.has_value());
                 if (grant) {
                     return admit_planned_request(candidate, std::move(*candidate_inspection.choice),
                                                  std::move(*grant));

@@ -213,9 +213,10 @@ public:
                 throw std::logic_error("active request has no admission accounting");
             }
             active.requests[active.size++] = ActiveAdmissionSnapshot{
-                .request_id     = request->id,
-                .backfill_epoch = request->backfill_epoch,
-                .backfill_class = request->backfill_class,
+                .request_id            = request->id,
+                .remaining_work_quanta = request->remaining_service_work,
+                .backfill_epoch        = request->backfill_epoch,
+                .backfill_class        = request->backfill_class,
             };
         }
         return active;
@@ -305,19 +306,37 @@ public:
         return protection_has_live_donor(*protection_, active);
     }
 
+    [[nodiscard]] bool drain_protection(std::span<const ActiveAdmissionSnapshot> active) {
+        if (protection_ && protected_head_safe_without_temporal(*protection_, active)) {
+            protection_->phase = ProtectionPhase::Drain;
+        }
+        return protection_ && protection_->phase == ProtectionPhase::Drain;
+    }
+
     [[nodiscard]] std::optional<AdmissionGrant>
     qualify_backfill(std::uint64_t request_id, std::uint64_t service_work_quanta,
                      std::span<const ActiveAdmissionSnapshot> active,
-                     ProgramResourceRevision program_proof_revision) const {
+                     ProgramResourceRevision program_proof_revision,
+                     bool persistent_proven) const {
         if (!fifo_head_id_ || !protection_ || protection_->head_request_id != *fifo_head_id_) {
             throw std::logic_error("backfill qualification has no open protected head");
         }
         if (request_id == 0 || request_id == *fifo_head_id_ || service_work_quanta == 0) {
             throw std::logic_error("backfill candidate has invalid scheduling identity");
         }
-        if (persistent_backfill_is_authorized(*protection_, request_id, active,
-                                              program_proof_revision)) {
+        if (persistent_proven && persistent_backfill_is_authorized(
+                                      *protection_, request_id, active,
+                                      program_proof_revision)) {
             return AdmissionGrant(request_id, BackfillClass::Persistent, protection_->epoch_id,
+                                  program_proof_revision, service_work_quanta);
+        }
+        // A short queued request borrows a lane a current-epoch donor will free soon: its work
+        // must fit the frozen donor frontier and the minted temporal credit.
+        if (protection_->phase == ProtectionPhase::Drain) { return std::nullopt; }
+        const std::uint64_t frontier_distance = protection_frontier_distance(*protection_, active);
+        if (service_work_quanta <= frontier_distance &&
+            service_work_quanta <= protection_->temporal_credit) {
+            return AdmissionGrant(request_id, BackfillClass::Temporal, protection_->epoch_id,
                                   program_proof_revision, service_work_quanta);
         }
         return std::nullopt;
@@ -335,7 +354,8 @@ public:
             grant.request_id_ == *fifo_head_id_) {
             return false;
         }
-        return grant.backfill_class_ == BackfillClass::Persistent;
+        return grant.backfill_class_ == BackfillClass::Persistent ||
+               grant.backfill_class_ == BackfillClass::Temporal;
     }
 
     void commit_admission(AdmissionGrant&& grant) {
@@ -348,6 +368,13 @@ public:
             grant.request_id_          = 0;
             grant.service_work_quanta_ = 0;
             return;
+        }
+        if (grant.backfill_class_ == BackfillClass::Temporal) {
+            if (!protection_ || protection_->epoch_id != grant.protection_epoch_ ||
+                grant.service_work_quanta_ > protection_->temporal_credit) {
+                throw std::logic_error("temporal backfill lost its protected credit");
+            }
+            protection_->temporal_credit -= grant.service_work_quanta_;
         }
         grant.request_id_          = 0;
         grant.service_work_quanta_ = 0;
