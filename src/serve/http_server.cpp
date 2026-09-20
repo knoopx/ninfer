@@ -302,6 +302,23 @@ void HttpServer::record_request_failure(const RequestLogContext& context,
     operational_log_.request_failure(context, failure);
 }
 
+void HttpServer::record_decision_start(const DecisionLogContext& context) {
+    request_jsonl_.write_decision_start(context);
+    operational_log_.decision_start(context);
+}
+
+void HttpServer::record_decision_done(const DecisionLogContext& context,
+                                      const DecisionLogOutcome& outcome) {
+    request_jsonl_.write_decision_done(context, outcome);
+    operational_log_.decision_done(context, outcome);
+}
+
+void HttpServer::record_decision_failure(const DecisionLogContext& context,
+                                         const RequestFailure& failure) {
+    request_jsonl_.write_decision_error(context, failure.machine_message);
+    operational_log_.decision_failure(context, failure);
+}
+
 void HttpServer::record_response_failure(std::uint64_t request_id, const RequestFailure& failure) {
     operational_log_.response_failure(request_id, failure);
 }
@@ -594,6 +611,18 @@ void HttpServer::register_routes() {
     server_.Post("/v1/chat/completions",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
+                 });
+    // Decision-scoring route. Key-gated by the /v1 prefix rule in is_api_path and
+    // SPA-excluded by webui_spa_path (the path[3] == '/' rule), like the other /v1 routes.
+    server_.Post("/v1/decisions",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_decisions(req, res);
+                 });
+    // /v1/systemone is the alias of the decisions route for SDK clients that hardcode that
+    // path: the same handler, payload, and response contract.
+    server_.Post("/v1/systemone",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_decisions(req, res);
                  });
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);

@@ -253,6 +253,48 @@ An optional proposal head supplies an indexed vocabulary subset for draft predic
 converts proposal rows to actual token IDs. Full target verification continues to use the full
 output head. Backend selection, draft width and proposal-head choice are fixed at startup.
 
+## Decision scoring
+
+Decision scoring answers a set of questions over a shared state without generating tokens
+(`output_tokens` is always `0`). The full feature reference (the `POST /v1/decisions` endpoint,
+request/response contract, question types, and binding design choices) is in
+[Decision scoring](../decisions.md). The public types are
+[`include/ninfer/decision.h`](../../include/ninfer/decision.h).
+
+A decision job has one shared state prefix and one branch per question. The model executes the
+prepared branches in one serialized job (no separate model load), as successive **rounds** of
+branches. The branch workspace is allocated per job, sized to one round and bounded only by live
+store availability (StateImage store + KV address space + Main KV execution table) plus device
+memory:
+
+1. **State prefill.** The shared state prefix is prefilled into the Main KV row 0.
+2. **Round fork.** Row 0 forks into one branch row per branch of the round, each with its bounded
+   branch KV tail, binding the decision's own execution row block above the Generation lanes'
+   rows. A round is sized at `min(free Device StateImage slots, free KV addresses, free decision
+   execution rows)`; the fork replicates the GDN state device-to-device, so host StateImage
+   replicas never widen a round. A decision job is serialized against in-flight generation rounds
+   by the engine's execution lock.
+3. **Suffix prefill.** Each round branch's question suffix (the rendered question text plus its
+   criteria) is appended in a suffix prefill over the round's branch rows.
+4. **Readout.** Each round branch's last-position hidden state is gathered into the per-job
+   `decision_readout_hidden` buffer (`[hidden, round]`).
+5. **Projection.** The readout hidden states are projected through the full `output_head` into
+   the per-job `decision_readout_logits` buffer (`[vocab, round]`).
+6. **Candidate gather and softmax.** Each branch's candidate token logits are gathered from the
+   `[vocab, round]` readout, and a temperature-scaled group-pooled softmax
+   (`ops::candidate_slice_softmax`) produces the per-candidate probability slice.
+7. **Round release.** The round's forked rows and StateImage slots are released, and the next
+   round forks the same unmutated row 0, so peak residency stays at one round and a job's branch
+   count is bounded by the job rather than by the plan.
+8. **Answer.** Per question type: `noul` reports `P(true)` with no confidence; `choice` reports
+   the winning key, per-option probabilities, and a normalized Gini confidence; `score` reports
+   the expected 0-based level index, the level legend, per-level probabilities, and a normalized
+   Gini confidence.
+
+The readout and projection buffers are allocated per job (outside the scratch arena) and sized to
+one round, so the suffix prefill's arena reset cannot clobber them; see
+[Decision scoring](../decisions.md).
+
 ## Vision and multimodal positions
 
 The current native processor uses 16×16 spatial patches, pairs of frames, and 2×2 spatial merge.

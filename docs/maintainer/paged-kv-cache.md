@@ -672,6 +672,13 @@ PagedKVBatchLayerView
 和 table row可以彼此不同。Per-row context length、valid columns和positions由 Op 的其他 typed inputs
 提供。
 
+表行容量 \(C\) 在 Generation 下为 `max_concurrency`（每条 active sequence 为自己的 lane 行，并在整个
+请求生命周期内持有它）；开启 decision scoring 时为 `max_concurrency + D + 1`，其中
+\(D=\min(\text{Device StateImage slots},\ \text{private} + \text{shared address rows})\)。Decision 分支
+fork 使用 lane 之外的一段独立 execution rows：caller-owned row 0 位于该段起点并保持为 source，round 内的
+分支绑定到其后的 \(D\) 行，因此 in-flight request 的 lane 行不会与 decision 行冲突，decision round 的
+宽度也不受 Generation batch size 限制。
+
 ### 10.3 Address translation
 
 当前 \(P=64\)：

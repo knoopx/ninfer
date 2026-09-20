@@ -20,6 +20,8 @@ namespace ninfer::models::qwen3_5::detail {
 
 using TensorLayout                              = TensorRegion;
 inline constexpr std::uint32_t kCausalScoreTile = 1024;
+// Per-branch decision candidate capacity; must match the C bound in candidate_slice_softmax.h.
+inline constexpr std::uint32_t kDecisionMaxCandidates = 256;
 
 struct DFlashPersistentLayout {
     std::optional<qwen3_5::PagedKVCacheLayout> full;
@@ -35,6 +37,10 @@ struct DFlashPersistentLayout {
 struct PersistentLayout {
     qwen3_5::DecoderStateLayout decoder;
     qwen3_5::StateImageDeviceLayout state_images;
+    // Decision path re-uses Generation's working set (state slots + main KV page pool); D is
+    // the branch count that fits in those re-used resources (set in persistent_layout).
+    std::uint32_t decision_rows          = 0;
+    std::uint32_t decision_page_capacity = 0;
     std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
     qwen3_5::RoundStateLayout round;
@@ -56,6 +62,12 @@ struct VisionWorkspacePlan {
     std::size_t capacity_bytes         = 0;
 };
 
+// DecisionScoring per-job readout workspace is allocated per decision job (sized to the live
+// branch count N), so the plan carries only the per-row tail page entitlement for branch suffixes.
+struct DecisionScorePlan {
+    std::uint32_t branch_tail_pages = 0; // Per-row tail page entitlement for branch suffixes.
+};
+
 struct WorkspacePlan {
     std::size_t text_prefill     = 0;
     std::size_t ordinary_round   = 0;
@@ -64,6 +76,7 @@ struct WorkspacePlan {
     std::size_t dflash_context   = 0;
     std::size_t dflash_round     = 0;
     std::size_t causal_score     = 0;
+    DecisionScorePlan decision_score;
     std::size_t general_capacity = 0;
     std::optional<VisionWorkspacePlan> vision;
     std::size_t capacity = 0;
@@ -79,9 +92,10 @@ struct SequencePlanningInputs {
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
     models::LoadOptions features;
-    bool use_cuda_graph = true;
-    bool causal_scoring = false;
-    int device          = 0;
+    bool use_cuda_graph               = true;
+    bool causal_scoring                = false;
+    bool decision_scoring              = false;
+    int device                         = 0;
     ContextCacheOptions context_cache;
 };
 
@@ -101,9 +115,10 @@ struct SequencePlanImpl {
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
     models::LoadOptions features;
-    bool use_cuda_graph = true;
-    bool causal_scoring = false;
-    int device          = 0;
+    bool use_cuda_graph               = true;
+    bool causal_scoring                = false;
+    bool decision_scoring              = false;
+    int device                         = 0;
     ContextCacheOptions context_cache;
     PersistentLayout persistent;
     WorkspacePlan workspace;

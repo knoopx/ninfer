@@ -976,7 +976,16 @@ terminal Finish 没有合法 publication capacity 时采用 Discard。
 配置必须满足：
 
 - private continuation capacity 至少覆盖全部 active requests；
-- Device State 总容量为 `max_concurrency + device_state_slots`；
+- Device State 总容量为 `max_concurrency + device_state_slots`，再加上 decision scoring 开启时的 decision
+  reserve（2 个 slot：prefilled row 0 + 一个 branch row）。Reserve 不可被 context cache 或 lane 占用（两者的
+  容量轴不变），因此 chat 流量不会让 decision 请求因容量不足而一直失败；context cache 关闭
+  （`device_state_slots = 0`）的单 lane engine 也仍有 Device replica；
+- 开启 decision scoring 时，KV address 容量额外保留 `D + 1`，Main KV execution table 行数为
+  `max_concurrency + D + 1`，其中 `D = min(Device StateImage slots, private + shared address rows)`：
+  decision 绑定 lane 之外的一段独立 execution rows，因此 in-flight request 的 lane 行不会与 decision 行
+  冲突。Decision job 复用 Generation 的 working set，按 round（`min(free Device StateImage slots, free
+  KV addresses, free decision execution rows)`）fork / prefill / readout / release 分支并保持 peak
+  residency 为一个 round，因此 branch 数不受该容量轴限制；
 - Host State 与 Host KV 独立计费；
 - logical counts、address-space counts 和 storage sizes 可表示；
 - Program 可以兑现最小 active capacity 与 selected backend requirements。

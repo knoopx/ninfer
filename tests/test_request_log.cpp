@@ -681,6 +681,53 @@ int main() {
             !throughput_json.at("context_cache").contains("last_materialization"),
         "context-cache throughput statistics missing or not interval-scoped");
 
+    // Decision requests have their own lifecycle records (the /v1/decisions route has no
+    // generation outcome): the operational renderer reports the request shape and the engine
+    // work, and the JSONL records carry the same fields with the decision protocol name.
+    DecisionLogContext decision_context;
+    decision_context.id              = 77;
+    decision_context.model           = "qwen3.6-27b";
+    decision_context.question_count  = 30;
+    decision_context.candidate_count = 540;
+    const OperationalRecord pretty_decision_start = render_decision_start(decision_context);
+    failures += check(
+        pretty_decision_start.severity == OperationalSeverity::Info &&
+            pretty_decision_start.message.find("req#77 started | decisions | 30 questions") == 0 &&
+            pretty_decision_start.message.find("candidates 540") != std::string::npos,
+        "decision start record mismatch");
+
+    DecisionLogOutcome decision_outcome;
+    decision_outcome.answer_count  = 30;
+    decision_outcome.input_tokens  = 14974;
+    decision_outcome.total_seconds = 1.67;
+    const OperationalRecord pretty_decision_done =
+        render_decision_done(decision_context, decision_outcome);
+    failures += check(
+        pretty_decision_done.severity == OperationalSeverity::Info &&
+            pretty_decision_done.message.find("req#77 done | decisions | 30 answers") == 0 &&
+            pretty_decision_done.message.find("input 14,974") != std::string::npos,
+        "decision done record mismatch");
+
+    const Json decision_start =
+        Json::parse(format_decision_start_json("serve-test", 4000, decision_context));
+    failures += check(decision_start.at("event") == "decision_start" &&
+                          decision_start.at("request").at("protocol") == "decisions" &&
+                          decision_start.at("request").at("question_count") == 30 &&
+                          decision_start.at("request").at("candidate_count") == 540,
+                      "decision start JSON mismatch");
+    const Json decision_done = Json::parse(
+        format_decision_done_json("serve-test", 4001, decision_context, decision_outcome));
+    failures += check(decision_done.at("event") == "decision_done" &&
+                          decision_done.at("result").at("answer_count") == 30 &&
+                          decision_done.at("result").at("input_tokens") == 14974 &&
+                          decision_done.at("result").at("output_tokens") == 0,
+                      "decision done JSON mismatch");
+    const Json decision_error = Json::parse(
+        format_decision_error_json("serve-test", 4002, decision_context, "decision job failed"));
+    failures += check(decision_error.at("event") == "decision_error" &&
+                          decision_error.at("error").at("message") == "decision job failed",
+                      "decision error JSON mismatch");
+
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
         ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +

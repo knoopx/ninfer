@@ -283,7 +283,7 @@ struct PressureCheckpointRecoveryImpact {
 
     [[nodiscard]] friend constexpr bool
     operator==(const PressureCheckpointRecoveryImpact&,
-               const PressureCheckpointRecoveryImpact&) noexcept = default;
+               const PressureCheckpointRecoveryImpact&) noexcept = delete;
 };
 
 struct PressureCheckpointOutcome {

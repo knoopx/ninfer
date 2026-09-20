@@ -101,6 +101,14 @@ PagedKVCacheView PagedKVCache::execution_view(const KVExecutionRowLease& row) co
     return PagedKVCacheView(*this, execution_tables_.row(row.handle()));
 }
 
+PagedKVCacheView PagedKVCache::execution_view(const KVExecutionTablePool& tables,
+                                              const KVExecutionRowLease& row) const {
+    if (!row.belongs_to(tables)) {
+        throw std::invalid_argument("Paged KV execution row belongs to another table pool");
+    }
+    return PagedKVCacheView(*this, tables.row(row.handle()));
+}
+
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
     if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
     const std::size_t stride        = layer_storage_.planes_per_layer();

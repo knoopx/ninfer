@@ -88,6 +88,9 @@ private:
     [[nodiscard]] bool webui_spa_path(const std::string& path) const;
     [[nodiscard]] bool is_api_path(const std::string& path) const;
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
+    // Decision-scoring route: POST /v1/decisions (alias POST /v1/systemone); key-gated by
+    // the /v1 rule in is_api_path; SPA-excluded by webui_spa_path.
+    void handle_decisions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_responses(const httplib::Request& req, httplib::Response& res);
@@ -128,6 +131,10 @@ private:
     void record_request_rejected(const RequestRejectionLogContext& context);
     void record_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void record_request_failure(const RequestLogContext& context, const RequestFailure& failure);
+    void record_decision_start(const DecisionLogContext& context);
+    void record_decision_done(const DecisionLogContext& context, const DecisionLogOutcome& outcome);
+    void record_decision_failure(const DecisionLogContext& context,
+                                 const RequestFailure& failure);
     void record_response_failure(std::uint64_t request_id, const RequestFailure& failure);
     void record_throughput(const ThroughputReport& report);
     void run_stats_reporter();

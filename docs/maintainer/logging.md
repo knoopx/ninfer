@@ -156,6 +156,20 @@ machine terminal: `request_done` immediately after `GenerationService::run()` re
 transport happen after that transaction; their failures are operational `response` records and do
 not create a second request JSONL terminal.
 
+A parsed `POST /v1/decisions` request is a Serve request with its own lifecycle, because the route
+has no generation request, outcome, or sampling semantics: `decision_start` is emitted once the
+resident model is resolved and before the job runs, and exactly one `decision_done` or
+`decision_error` terminal follows it. A failure before the lifecycle opened (no resident model, a
+router failure, no decision service) emits the same single `decision_error` terminal without a
+start. The records report the request shape (question count, candidate count, media count, the
+raw-logits diagnostic) and the engine work (answers, prefilled input tokens, total seconds); a
+body that fails to parse stays a response-only 422, exactly like the generation routes.
+
+A decision job prefills the shared state once plus every branch suffix, and those tokens enter the
+same runtime stats as a generation prefill. A decision-only interval therefore produces the normal
+periodic throughput record (prefill rate and tokens, no decode) instead of staying silent, and each
+decision request carries its own input-token count in its terminal record.
+
 Tool-call parameter normalization remains a successful request outcome. Empty-argument omissions
 and schema mismatches are machine-only counters. If a complete tool marker must be returned to text
 because its structure or declared identity cannot be represented, Serve emits one warning carrying
@@ -167,8 +181,9 @@ explicit emergency cases above remain direct outputs because they are different 
 ## 7. Verification policy
 
 Logging tests protect NInfer-owned observable semantics, not private object shape. The request-log
-test covers the consumed JSONL schema, representative request/throughput pretty records, Serve
-failure severity, and exclusion of arbitrary client error text. The pretty-logging test covers the
-observable Service and Tool prefixes. The corpus consumer test protects its exact schema-version
-agreement with Serve. Startup progress coordination is verified through terminal and redirected
-paths when that code changes; registry, mutex, getter, and constructor tests are not retained.
+test covers the consumed JSONL schema, representative request/decision/throughput pretty records,
+Serve failure severity, and exclusion of arbitrary client error text. The pretty-logging test
+covers the observable Service and Tool prefixes. The corpus consumer test protects its exact
+schema-version agreement with Serve. Startup progress coordination is verified through terminal
+and redirected paths when that code changes; registry, mutex, getter, and constructor tests are not
+retained.

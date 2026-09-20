@@ -40,6 +40,9 @@ struct RuntimeTypes {
     using AbortResult                = qwen3_5::AbortResult;
     using ReleaseResult              = qwen3_5::ReleaseResult;
     using Program                    = qwen3_5::Program;
+    using DecisionPrepared           = ninfer::DecisionPrepared;
+    using DecisionResult             = ninfer::DecisionResult;
+    using DecisionAdmissionCandidate = qwen3_5::DecisionAdmissionCandidate;
 };
 
 } // namespace ninfer::models::qwen3_5

@@ -88,6 +88,8 @@ a capability omitted at load.
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `POST /v1/decisions` | Decision scoring over a state + questions, on the loaded model |
+| `POST /v1/systemone` | Alias of `POST /v1/decisions` (identical handler and contract) |
 | `POST /models/load` | llama.cpp compatibility: load/swap the resident model |
 | `POST /models/unload` | llama.cpp compatibility: force the no-resident state |
 | `GET /models/sse` | llama.cpp compatibility: live model-status SSE feed |
@@ -773,6 +775,105 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
+
+## Decision scoring (POST /v1/decisions)
+
+```bash
+curl http://127.0.0.1:8080/v1/decisions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "state": "The player holds a pair of aces and the pot is contested.",
+    "questions": {
+      "continue": {
+        "type": "noul",
+        "instructions": "Should the player continue?"
+      },
+      "action": {
+        "type": "choice",
+        "instructions": "Which action?",
+        "criteria": {"raise": "Raise the bet", "fold": "Fold the hand"}
+      },
+      "strength": {
+        "type": "score",
+        "instructions": "Rate the hand strength.",
+        "criteria": ["weak", "medium", "strong"]
+      }
+    }
+  }'
+```
+
+Request shape: the context is exactly one of `state` or `messages` (a JSON-null `state` or
+`messages` is not a supplied context; supplying neither is a 422). `state` is text-only — a
+string is used verbatim and a JSON object/array is JSON-dumped UTF-8. `messages` is a chat
+history: a non-empty array of `{role, content}` turns, where `role` is one of `system`,
+`developer`, `user`, or `assistant` and `content` is a string (a single text turn) or an array
+of parts, each part an object with a `type` of `text` (`{type, text}`) or `image_url`
+(`{type, image_url}`); `image_url` is an HTTP(S) URL or a base64 data URI, given as a string
+or an object `{url, detail?}` where `detail` is omitted or `"auto"`. `questions` is a map from
+question id to `{type, instructions, criteria}`, where `type` is `noul`, `choice`, or `score`,
+`instructions` is optional (default null, any JSON value), and the `criteria` rules follow the
+type. `options` is an optional diagnostics object: the only supported key is `raw_logits`
+(a boolean, default false); an unknown option field is a 422 (the field is named). When
+`raw_logits` is true, each answer carries a `raw_logits` map (option to pre-softmax readout
+logit) parallel to `probabilities`. The
+request's optional `model` field (a string) is accepted and ignored: the route runs
+on the model the router has loaded (the resident); with nothing loaded it answers 503
+`model_not_ready`. The response's `model` field echoes the loaded model id.
+
+An `image_url` part requires the model's `"vision": true` serve-config field; a media request
+against a model without vision is a 400 with code `vision_disabled`.
+
+- `noul`: optional map, keys restricted to `true`/`false` (any-JSON values);
+- `choice`: map of 1-255 entries from key to description (any-JSON values), at most the
+  artifact's compiled label-table size (<=255) entries, key order preserved;
+- `score`: ordered array of 2-50 level descriptions (any-JSON values).
+
+Unknown fields are a 422 (the offending field is named), including any field in a question
+object other than `type`, `instructions`, and `criteria`, any field in a
+message object other than `role` and `content`, and any `options` key other than `raw_logits`.
+
+The response shape is `{model, answers{<id>: {type, ...}}, usage{input_tokens, output_tokens: 0}}`
+with per-type answer fields:
+
+- `noul`: the `noul` probability (P(true)) and no confidence field;
+- `choice`: the winning `choice`, per-option `probabilities`, and `confidence`;
+- `score`: `score` as the expected 0-based level index, a `legend` mapping level indices to their
+  descriptions, per-level `probabilities`, and `confidence`.
+
+When the request set `options.raw_logits`, each answer also carries a `raw_logits` map (option
+to pre-softmax readout logit) parallel to `probabilities`.
+
+`usage.output_tokens` is always `0`: decision scoring generates no tokens. Errors: 401 for a
+missing/invalid API key, 422 for body validation (the offending field is named), and 503 for a
+model that is not loaded (or whose load failed), or for a decision job the loaded engine cannot
+start (its shared working set cannot hold row 0 plus one branch row). Limits: choice questions
+take 1-255 options (capped at the artifact's compiled label-table size, <=255; out of range is a
+422) and score levels are 2-50.
+
+The route runs on the model's loaded engine (no separate model load): the decision branch
+workspace is allocated per job, sized to one round of branches, and the plan reserves a decision
+region (two Device StateImage slots for row 0 plus one branch row, `D + 1` KV addresses, and
+`D + 1` Main KV execution-table rows above the Generation lanes' rows), so chat traffic can
+neither starve a decision job of capacity nor collide with its execution rows. A decision job is
+serialized against in-flight generation rounds by the engine's execution lock. A question set
+larger than one round is processed as successive fork / prefill / readout / release rounds, not
+rejected: a round holds `min(free Device StateImage slots, free KV addresses, free decision
+execution rows)` branches. Admission requires room for the shared row 0 plus one branch row, and
+names the exact free counts when it fails, because with the reserved region in place a shortfall
+means Generation traffic overran its configured axes. Every parsed decision request also appears in the operational
+log and, when request logging is enabled, in the request JSONL: one `decision_start` before the
+job runs and exactly one `decision_done` or `decision_error` terminal after it, carrying the
+question and candidate counts, the answers, and the prefilled input tokens. A decision job's
+prefilled tokens count toward the periodic throughput record. The full feature reference
+(endpoint, contract, execution path, and binding design choices) is in
+[Decision scoring](decisions.md); the model's execution path is in
+[Decision scoring in the model reference](maintainer/qwen3_5-model.md#decision-scoring).
+
+v1 semantics: each option is scored in isolation (a slice softmax over each question's candidate
+set). Option-set interaction is limited to the shared slice denominator, so changing the option set
+rescales the surviving options' probabilities; probabilities and confidence are uncalibrated slice
+statistics (confidence = normalized Gini).
+
 
 ## llama.cpp / llama-ui compatibility
 

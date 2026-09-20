@@ -1072,6 +1072,17 @@ public:
                                        staged_tail_release);
     }
 
+    // Decision-scoring batch fork: one inactive source address becomes N active branch rows.
+    // Full prefix pages are aliased as reader references with the writer left on the source row,
+    // and each destination takes its own tail pages (prepare_prefix_fork per-page logic, batched).
+    // Destination i binds execution row row_base + i + 1, so row_base stays with the source's
+    // caller (the decision path passes the base of its own row block, above the Generation
+    // lanes' rows, so a decision never collides with an in-flight request's row).
+    void prepare_branch_fork_batch(KVAddressSpaceHandle source_handle,
+                                   const std::vector<KVAddressSpaceHandle>& destinations,
+                                   std::uint32_t frontier, std::uint32_t entitlement,
+                                   std::uint32_t row_base, cudaStream_t stream = nullptr);
+
     [[nodiscard]] DeviceKVPageHandle
     prefix_fork_tail_source(const KVPrefixForkReservation& fork) const {
         require_prefix_fork(fork);
