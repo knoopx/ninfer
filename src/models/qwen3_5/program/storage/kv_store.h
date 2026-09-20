@@ -925,8 +925,17 @@ public:
         if (required > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("KV activation reservation overflow");
         }
-        pages_->physical_pool().resize_reservation(reservation,
-                                                   static_cast<std::uint32_t>(required));
+        try {
+            pages_->physical_pool().resize_reservation(reservation,
+                                                       static_cast<std::uint32_t>(required));
+        } catch (const std::bad_alloc&) {
+            const auto& pool = pages_->physical_pool();
+            throw std::runtime_error(
+                "KV activation page reservation failed (required=" + std::to_string(required) +
+                " available=" + std::to_string(pool.available_pages()) + " reserved=" +
+                std::to_string(pool.reserved_pages()) + " capacity=" +
+                std::to_string(pool.capacity_pages()) + ")");
+        }
         KVExecutionRowLease row = tables_->acquire(execution_row);
         return KVActivationReservation(*this, handle, entitlement, activation_frontier,
                                        std::move(reservation), std::move(row));
@@ -1071,6 +1080,15 @@ public:
                                        std::move(reservation), std::move(row), tail_destination,
                                        staged_tail_release);
     }
+
+    // Decision-scoring batch fork: one inactive source address becomes N active branch rows.
+    // Full prefix pages are aliased as reader references with the writer left on the source row,
+    // and each destination takes its own tail pages (prepare_prefix_fork per-page logic, batched).
+    // Destination i binds execution row i + 1; row 0 stays with the source's caller.
+    void prepare_branch_fork_batch(KVAddressSpaceHandle source_handle,
+                                   const std::vector<KVAddressSpaceHandle>& destinations,
+                                   std::uint32_t frontier, std::uint32_t entitlement,
+                                   cudaStream_t stream = nullptr);
 
     [[nodiscard]] DeviceKVPageHandle
     prefix_fork_tail_source(const KVPrefixForkReservation& fork) const {

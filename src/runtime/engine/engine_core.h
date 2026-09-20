@@ -4,6 +4,7 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
+#include "ninfer/decision.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
@@ -231,6 +232,35 @@ public:
         request_admission_check();
         queue_cv_.notify_one();
         return Submission(*this, std::move(request));
+    }
+
+    // The decisions route runs on this loaded engine: the call serializes against in-flight
+    // generation rounds (the worker holds execution_mutex_ per execution round), so a decision
+    // job executes atomically between rounds and never shares program state with a round. The
+    // Program owns the decision state/KV reservation for the job's lifetime; the job is
+    // independent of the ResourceManager request admission policy.
+    [[nodiscard]] DecisionResult decide(DecisionPrepared prepared, float temperature) {
+        std::scoped_lock lock(execution_mutex_);
+        CancellationFlagView cancellation{};
+        auto candidate = instance_.program->inspect_decision_admission(std::move(prepared));
+        if (!candidate) {
+            // A capacity-blocked decision is a normal admission result, not an internal failure:
+            // map it to the shared 503 (Unavailable) so the route reports retry-able, not 500.
+            throw RequestError(RequestErrorKind::Unavailable,
+                               "decision admission blocked (state/KV capacity)");
+        }
+        const auto reserved =
+            instance_.program->start_decision_transaction(std::move(*candidate), cancellation);
+        if (reserved != ContextTransactionReserveStatus::Reserved) {
+            throw RequestError(RequestErrorKind::Unavailable,
+                               "decision admission blocked (state/KV capacity)");
+        }
+        try {
+            return instance_.program->progress_decision_transaction(temperature, cancellation);
+        } catch (...) {
+            instance_.program->finalize_decision_transaction();
+            throw;
+        }
     }
 
     [[nodiscard]] MemorySummary memory_summary() const {

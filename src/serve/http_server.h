@@ -88,6 +88,9 @@ private:
     [[nodiscard]] bool webui_spa_path(const std::string& path) const;
     [[nodiscard]] bool is_api_path(const std::string& path) const;
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
+    // Decision-scoring route: POST /v1/decisions (key-gated by the /v1 rule in
+    // is_api_path; SPA-excluded by webui_spa_path).
+    void handle_decisions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_responses(const httplib::Request& req, httplib::Response& res);

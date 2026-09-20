@@ -4,6 +4,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/frontend/chat_template.h"
+#include "models/qwen3_5/frontend/decision_labels.h"
 #include "models/qwen3_5/frontend/media_cache.h"
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
@@ -29,6 +30,18 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+namespace ninfer {
+
+// DecisionPrepared (the public media-state carrier, ninfer/decision.h) owns the model's
+// PreparedPromptData; its special members need the complete type, so they are defined here
+// (the header only declares them). Defined in model_runtime so every consumer links them.
+DecisionPrepared::DecisionPrepared()                              = default;
+DecisionPrepared::DecisionPrepared(DecisionPrepared&&)            = default;
+DecisionPrepared& DecisionPrepared::operator=(DecisionPrepared&&) = default;
+DecisionPrepared::~DecisionPrepared()                             = default;
+
+} // namespace ninfer
 
 namespace ninfer::models::qwen3_5 {
 namespace {
@@ -545,6 +558,105 @@ PreparedContextCache prepare_context_cache(
     return out;
 }
 
+constexpr std::string_view kDecisionSystemPrompt =
+    "Evaluate the state using the question and labeled options that follow. "
+    "Return only the option code. Do not explain or reason aloud.";
+
+std::string_view decision_type_name(DecisionQuestionType type) {
+    switch (type) {
+    case DecisionQuestionType::Noul: return "noul";
+    case DecisionQuestionType::Choice: return "choice";
+    case DecisionQuestionType::Score: return "score";
+    }
+    return "unknown";
+}
+
+std::size_t decision_option_count(const DecisionQuestion& question) {
+    switch (question.type) {
+    case DecisionQuestionType::Noul: return 2;
+    case DecisionQuestionType::Choice:
+    case DecisionQuestionType::Score: return question.criteria.size();
+    }
+    return 0;
+}
+
+std::string decision_option_key(const DecisionQuestion& question, std::size_t index) {
+    return question.criteria[index];
+}
+
+std::string build_decision_question_suffix(const DecisionQuestion& question,
+                                           const DecisionLabelTable& table) {
+    // Question suffix: every option carries the three keys code/option/description,
+    // description is the raw criteria value (JSON null allowed), and instructions is the raw
+    // JSON value (JSON null when the request omitted it). ensure_ascii=False semantics: the
+    // dump below keeps UTF-8 verbatim and uses the compact ", "/": " separators.
+    nlohmann::ordered_json options = nlohmann::ordered_json::array();
+    const std::size_t count = decision_option_count(question);
+    for (std::size_t i = 0; i < count; ++i) {
+        nlohmann::ordered_json option;
+        option["code"]   = table.codes[i];
+        option["option"] = decision_option_key(question, i);
+        option["description"] = nlohmann::ordered_json::parse(question.criteria_values_json[i]);
+        options.push_back(std::move(option));
+    }
+    nlohmann::ordered_json body;
+    body["type"]         = decision_type_name(question.type);
+    body["instructions"] = nlohmann::ordered_json::parse(question.instructions_json);
+    body["options"]      = options;
+    return "Question: " + body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) +
+           "\nAnswer:";
+}
+
+// Shared per-question branch builder: suffix tokens + candidate answer tokens + the per-branch
+// one-token guard. When state_text and state_ids are supplied (the text-only path), the suffix
+// must be a structural prefix of the state prompt; the media path passes nulls and skips the
+// check (the media-expanded prefix is authoritative).
+DecisionBranch build_decision_branch(const DecisionQuestion& question,
+                                     const DecisionLabelTable& table, const fi::Tokenizer& tokenizer,
+                                     const std::string* state_text,
+                                     const std::vector<TokenId>* state_ids) {
+    if (question.criteria.size() != question.criteria_values_json.size()) {
+        throw std::invalid_argument(
+            "decision question criteria and criteria values must be parallel");
+    }
+    const std::size_t option_count = decision_option_count(question);
+    if (option_count > table.max_options()) {
+        throw std::invalid_argument("decision question needs " + std::to_string(option_count) +
+                                    " options; the tokenizer supplies at most " +
+                                    std::to_string(table.max_options()));
+    }
+    const std::string suffix_text = build_decision_question_suffix(question, table);
+    std::vector<TokenId> suffix_ids = tokenizer.encode(suffix_text);
+    if (state_text != nullptr && state_ids != nullptr) {
+        const std::vector<TokenId> full_ids = tokenizer.encode(*state_text + suffix_text);
+        if (full_ids.size() != state_ids->size() + suffix_ids.size() ||
+            !std::equal(state_ids->begin(), state_ids->end(), full_ids.begin()) ||
+            !std::equal(suffix_ids.begin(), suffix_ids.end(), full_ids.begin() + state_ids->size())) {
+            throw std::invalid_argument(
+                "decision question suffix is not a structural prefix of the state prompt");
+        }
+    }
+    // Per-branch guard: each option code must encode as exactly one new token appended at this
+    // branch's "Answer:" boundary; that token is the candidate.
+    DecisionBranch branch;
+    branch.type          = question.type;
+    branch.suffix_tokens = std::move(suffix_ids);
+    for (std::size_t i = 0; i < option_count; ++i) {
+        const std::vector<TokenId> appended =
+            tokenizer.encode(suffix_text + " " + table.codes[i]);
+        if (appended.size() != branch.suffix_tokens.size() + 1 ||
+            !std::equal(branch.suffix_tokens.begin(), branch.suffix_tokens.end(), appended.begin())) {
+            throw std::invalid_argument("tokenizer must encode internal code " +
+                                        table.codes[i] +
+                                        " as one token at the answer boundary");
+        }
+        branch.candidate_ids.push_back(appended.back());
+        branch.candidate_groups.push_back(static_cast<std::int32_t>(i));
+        branch.options.push_back(decision_option_key(question, i));
+    }
+    return branch;
+}
+
 } // namespace
 
 ModelSamplingDefaults default_sampling(Architecture architecture) {
@@ -593,6 +705,14 @@ public:
             throw std::invalid_argument(
                 "Frontend requires the parsed model tokenizer and public token domain");
         }
+        // The decision route must coexist with the loaded model: a decision-table failure
+        // degrades ONLY /v1/decisions (the serve layer logs the disabled route). The ctor
+        // never throws because of the decision table.
+        try {
+            decision_labels = compile_decision_label_table(*tokenizer);
+        } catch (const std::exception&) {
+            decision_labels = DecisionLabelTable{};
+        }
         sampling = default_sampling(options.architecture);
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
@@ -626,6 +746,7 @@ public:
 
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
+    DecisionLabelTable decision_labels;
     fi::ProcessorOptions processor;
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
@@ -898,6 +1019,131 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
 std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
     return impl_->tokenizer->encode(text);
+}
+
+DecisionPrepared Frontend::prepare_decision(std::string state_text,
+                                            std::vector<DecisionQuestion> questions) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    if (impl_->decision_labels.max_options() == 0) {
+        throw std::invalid_argument("decision label table unavailable");
+    }
+    fi::ChatRenderOptions options;
+    options.add_generation_prompt = true;
+    options.enable_thinking       = false;
+
+    fi::ChatMessage system;
+    system.role  = ChatRole::System;
+    system.parts.push_back(fi::ChatPart::text_part(std::string(kDecisionSystemPrompt)));
+    fi::ChatMessage user;
+    user.role  = ChatRole::User;
+    user.parts.push_back(fi::ChatPart::text_part(std::move(state_text)));
+    const std::vector<fi::ChatMessage> state_messages{std::move(system), std::move(user)};
+
+    const fi::RenderedChat state_rendered = impl_->chat_template.render(state_messages, options);
+    const std::vector<TokenId> state_ids  = impl_->tokenizer->encode(state_rendered.text);
+    if (state_ids.empty()) {
+        throw std::invalid_argument("decision state prompt tokenized to zero tokens");
+    }
+
+    DecisionPrepared prepared;
+    prepared.state_tokens = state_ids;
+    prepared.branches.reserve(questions.size());
+
+    const DecisionLabelTable& table = impl_->decision_labels;
+    for (const DecisionQuestion& question : questions) {
+        prepared.branches.push_back(build_decision_branch(
+            question, table, *impl_->tokenizer, &state_rendered.text, &state_ids));
+    }
+    return prepared;
+}
+
+DecisionPrepared Frontend::prepare_decision(PromptInput input,
+                                            std::vector<DecisionQuestion> questions) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    if (impl_->decision_labels.max_options() == 0) {
+        throw std::invalid_argument("decision label table unavailable");
+    }
+    fi::ChatRenderOptions options;
+    options.add_generation_prompt = true;
+    options.enable_thinking       = false;
+
+    // Prepend the decision system prompt as a System message to the chat context.
+    std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
+    fi::ChatMessage system;
+    system.role  = ChatRole::System;
+    system.parts.push_back(fi::ChatPart::text_part(std::string(kDecisionSystemPrompt)));
+    messages.insert(messages.begin(), std::move(system));
+
+    const bool has_media =
+        std::any_of(messages.begin(), messages.end(),
+                    [](const fi::ChatMessage& message) { return message.has_media(); });
+    if (has_media && !impl_->vision_enabled) {
+        throw std::invalid_argument("Vision is disabled for this Engine");
+    }
+
+    DecisionPrepared prepared;
+    prepared.branches.reserve(questions.size());
+    const DecisionLabelTable& table = impl_->decision_labels;
+
+    const std::string* state_text          = nullptr;
+    const std::vector<TokenId>* state_ids  = nullptr;
+    if (has_media) {
+        // Media-expanded prefix: the Vision tokens are authoritative, so the structural text
+        // prefix check is skipped (state_text / state_ids stay null).
+        fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
+                                impl_->media_cache);
+        fi::ProcessedInput processed;
+        try {
+            processed =
+                processor.process(std::move(messages), options, PreparationControl{},
+                                  impl_->max_context);
+        } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
+        auto data = std::make_unique<PreparedPromptData>();
+        data->token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
+        data->starts_in_reasoning = processed.starts_in_reasoning;
+        data->token_types         = std::move(processed.token_types);
+        data->positions           = std::move(processed.positions);
+        data->rope_delta          = processed.rope_delta;
+        data->media_payloads      = std::move(processed.media_payloads);
+        data->vision_items.reserve(processed.vision_items.size());
+        for (fi::VisionItem& item : processed.vision_items) {
+            data->vision_items.push_back(convert_vision_item(std::move(item)));
+        }
+        data->prepare.media_items              = processed.stats.media_items;
+        data->prepare.media_bytes              = processed.stats.media_bytes;
+        data->prepare.raw_patches              = processed.stats.raw_patches;
+        data->prepare.vision_tokens            = processed.stats.vision_tokens;
+        data->prepare.attention_pairs          = processed.stats.attention_pairs;
+        data->prepare.patch_bytes              = processed.stats.patch_bytes;
+        data->prepare.media_cache_hits         = processed.stats.media_cache_hits;
+        data->prepare.media_cache_misses       = processed.stats.media_cache_misses;
+        data->prepare.media_singleflight_waits = processed.stats.media_singleflight_waits;
+        data->prepare.built_patch_bytes        = processed.stats.built_patch_bytes;
+        data->prepare.reused_patch_bytes       = processed.stats.reused_patch_bytes;
+        data->prepare.media_preprocess_seconds = processed.stats.media_preprocess_seconds;
+        data->prepare.media_preprocess_work_seconds =
+            processed.stats.media_preprocess_work_seconds;
+        prepared.state_media = std::move(data);
+    } else {
+        const fi::RenderedChat rendered = impl_->chat_template.render(messages, options);
+        const std::vector<TokenId> state_ids_local = impl_->tokenizer->encode(rendered.text);
+        if (state_ids_local.empty()) {
+            throw std::invalid_argument("decision state prompt tokenized to zero tokens");
+        }
+        prepared.state_tokens = state_ids_local;
+        state_text            = &rendered.text;
+        state_ids             = &state_ids_local;
+    }
+
+    for (const DecisionQuestion& question : questions) {
+        prepared.branches.push_back(
+            build_decision_branch(question, table, *impl_->tokenizer, state_text, state_ids));
+    }
+    return prepared;
+}
+
+const DecisionLabelTable& Frontend::decision_label_table() const {
+    return impl_->decision_labels;
 }
 
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,

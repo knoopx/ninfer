@@ -49,7 +49,7 @@ std::uint64_t parse_u64(const char* text, const char* label) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " --config <file.json> [--host H] [--port N] [--api-key KEY] "
-           "[--model-id ID] [--max-concurrency N] "
+           "[--model-id ID] [--max-concurrency N] [--max-decision-branches N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--log-stats-interval-ms N] [--device N] "
            "[--context-cost-presets FILE] "
@@ -70,8 +70,10 @@ std::string serve_usage_text(const char* argv0) {
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       per-model engine params (max-context, kv-capacity, kv-dtype, spec, draft-tokens,\n"
-           "       prefill-chunk, lm-head-draft, vision, default-max-tokens) are set in the model\n"
-           "       config JSON (ModelConfig fields), not via CLI flags\n"
+           "       prefill-chunk, lm-head-draft, vision, default-max-tokens, max-decision-branches)\n"
+           "       are set in the model config JSON (ModelConfig fields), not via CLI flags\n"
+           "       --max-decision-branches sizes the decision branch workspace (default 16);\n"
+           "       the decisions route rejects a question set wider than the branch capacity\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       --media-cache-mib defaults to 1024; 0 disables retained media reuse\n"
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
@@ -139,6 +141,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
+        } else if (arg == "--max-decision-branches") {
+            const int branches =
+                parse_nonnegative_int(require_value("--max-decision-branches"),
+                                      "max-decision-branches");
+            if (branches == 0) {
+                throw std::invalid_argument("--max-decision-branches must be positive");
+            }
+            options.max_decision_branches = static_cast<std::uint32_t>(branches);
         } else if (arg == "--max-pending-requests") {
             options.max_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--max-pending-requests"), "max-pending-requests"));

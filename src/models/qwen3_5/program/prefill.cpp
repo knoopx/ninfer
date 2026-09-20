@@ -12,13 +12,17 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -61,7 +65,15 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
 PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
                                       std::uint32_t nominal_length,
                                       std::optional<std::uint32_t> split_frontier,
-                                      bool finalize_at_end) {
+                                      bool finalize_at_end, std::uint32_t chunk_begin) {
+    // The KV base (state.text_kv_base) is the absolute position of ids[0] in the resident cache;
+    // chunk_begin is the index into the span where this chunk starts. They coincide for the
+    // ordinary full-prompt path (chunk_begin defaults to the KV base) but diverge for the
+    // decision suffix prefill, which passes only the suffix span (chunk_begin = 0) after a
+    // resident state prefix (KV base = state length).
+    const std::uint32_t begin =
+        (chunk_begin == std::numeric_limits<std::uint32_t>::max()) ? state.text_kv_base
+                                                                   : chunk_begin;
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
@@ -74,10 +86,68 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
-        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
-                                  sink);
+        return card.prefill_chunk(prompt, begin, nominal_length, finalize_at_end, sink);
     }
-    return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
+    return card.prefill_chunk(prompt, begin, nominal_length, finalize_at_end);
+}
+
+PrefillChunkResult prefill_decision_batch(PrefillContext& state, std::span<const TokenId> state_tokens,
+                                          std::span<const TokenId> tokens,
+                                          std::uint32_t width,
+                                          std::span<const std::uint32_t> valid_lengths,
+                                          std::span<const qwen3_5::PagedKVCacheView> kv_rows,
+                                          std::span<const std::int32_t> state_source_slots,
+                                          std::span<const std::int32_t> state_destination_slots,
+                                          std::uint32_t prefix_length, Tensor* last_hidden) {
+    const std::size_t rows = valid_lengths.size();
+    if (rows == 0 || width == 0 || kv_rows.size() != rows || state_source_slots.size() != rows ||
+        state_destination_slots.size() != rows ||
+        tokens.size() != rows * static_cast<std::size_t>(width)) {
+        throw std::invalid_argument("decision batch prefill has an inconsistent row shape");
+    }
+    if (state_tokens.size() != prefix_length) {
+        throw std::invalid_argument("decision batch state tokens do not match the prefix length");
+    }
+    if (last_hidden != nullptr && (last_hidden->data == nullptr ||
+                                   last_hidden->dtype != DType::BF16 || last_hidden->ne[0] <= 0 ||
+                                   last_hidden->ne[1] != rows)) {
+        throw std::invalid_argument("decision batch last_hidden must be a BF16 [hidden, N]");
+    }
+
+    // Each row's prompt is the shared state prefix followed by that row's suffix. The state prefix
+    // is already resident in the per-row KV (shared prefill + fork), so the suffix prefill
+    // continues from KV base == prefix_length. The suffix span is passed on its own with
+    // chunk_begin == 0: prefill_text_chunk decouples the KV base (row_state.text_kv_base) from the
+    // chunk index into the span, so no full [state][suffix] prompt needs to be materialized.
+    const std::uint32_t window = state.execution.prefill_chunk;
+    for (std::size_t row = 0; row < rows; ++row) {
+        const std::uint32_t count = valid_lengths[row];
+        if (count == 0) { continue; }
+        PrefillContext row_state = state;
+        row_state.text_kv = kv_rows[row];
+        row_state.state_source_slot = state_source_slots[row];
+        row_state.state_destination_slot = state_destination_slots[row];
+        row_state.text_kv_base = prefix_length;
+        const std::span<const TokenId> suffix(tokens.data() + row * width, count);
+        const PrefillChunkResult result =
+            prefill_text_chunk(row_state, suffix, count, std::nullopt, false, 0);
+        if (result.processed_tokens != count || result.finalized) {
+            throw std::logic_error("decision batch prefill made invalid progress");
+        }
+        // The row's last real suffix position is the last position of the processed suffix; the
+        // hidden window holds the last `window` positions, so gather column min(count, window)-1.
+        if (last_hidden != nullptr) {
+            const std::uint32_t gather = std::min(count, window) - 1;
+            const Tensor source =
+                state.execution.prefill_hidden.slice(1, static_cast<std::int32_t>(gather), 1);
+            const Tensor destination =
+                last_hidden->slice(1, static_cast<std::int32_t>(row), 1);
+            CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
+                                       cudaMemcpyDeviceToDevice,
+                                       state.execution.device.stream));
+        }
+    }
+    return PrefillChunkResult{.processed_tokens = 0, .finalized = true};
 }
 
 PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,

@@ -703,9 +703,40 @@ private:
 
     [[nodiscard]] std::optional<StateImageHandle> allocate(StateImageRole role,
                                                            bool with_device) noexcept {
-        if (free_object_count_ == 0 || role == StateImageRole::Free ||
-            (with_device && free_device_count_ == 0)) {
+        if (free_object_count_ == 0 || role == StateImageRole::Free) {
             return std::nullopt;
+        }
+        if (with_device && free_device_count_ == 0) {
+            // Evict device replicas of Both-resident checkpoints whose host-side
+            // snapshot is intact. The resource manager can re-materialize the device
+            // copy via HostToDevice when it next reuses the prefix. This mirrors the
+            // generation-path pressure pipeline: reclaim stale device state on demand.
+            // Device-only checkpoints (no host_slot, no references, no pins) are dead
+            // and freed entirely.
+            for (auto& object : objects_) {
+                if (object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||
+                    object.source_pins != 0 || object.destination_pinned ||
+                    has_pending_replica(object)) {
+                    continue;
+                }
+                if (object.host_slot) {
+                    // Both-resident: drop device copy, keep host.
+                    return_device_slot(*object.device_slot);
+                    object.device_slot.reset();
+                } else if (object.checkpoint_references == 0) {
+                    // Device-only, unreferenced: free entirely.
+                    auto index = static_cast<std::uint32_t>(&object - objects_.data());
+                    return_device_slot(*object.device_slot);
+                    object = Object{};
+                    free_objects_[free_object_count_++] = index;
+                } else {
+                    // Device-only with references: cannot evict.
+                    continue;
+                }
+            }
+            if (free_device_count_ == 0) {
+                return std::nullopt;
+            }
         }
         const std::uint32_t index = free_objects_[--free_object_count_];
         Object& object            = objects_[index];

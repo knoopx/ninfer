@@ -255,6 +255,36 @@ std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t 
     return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
 }
 
+DecisionResult Program::decision_score(DecisionPrepared prepared, float temperature) {
+    return impl_->decision_score(std::move(prepared), temperature);
+}
+
+std::optional<DecisionAdmissionCandidate> Program::inspect_decision_admission(
+    DecisionPrepared prepared) {
+    auto impl = impl_->inspect_decision_admission(std::move(prepared));
+    if (impl == nullptr) { return std::nullopt; }
+    return DecisionAdmissionCandidate(std::move(impl));
+}
+
+runtime::ContextTransactionReserveStatus
+Program::start_decision_transaction(DecisionAdmissionCandidate&& candidate,
+                                     runtime::CancellationFlagView cancellation) {
+    return impl_->start_decision_transaction(std::move(*candidate.impl_), cancellation);
+}
+
+DecisionResult Program::progress_decision_transaction(float temperature,
+                                                       runtime::CancellationFlagView cancellation) {
+    return impl_->progress_decision_transaction(temperature, cancellation);
+}
+
+void Program::finalize_decision_transaction() noexcept {
+    impl_->finalize_decision_transaction();
+}
+
+bool Program::has_decision_transaction() const noexcept {
+    return impl_->has_decision_transaction();
+}
+
 std::optional<AdmissionCandidate> Program::inspect_admission(
     const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
     const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
@@ -527,6 +557,26 @@ const runtime::IdentityMaterializationAssessment&
 AdmissionCandidate::identity_assessment() const noexcept {
     static const runtime::IdentityMaterializationAssessment empty;
     return impl_ != nullptr ? impl_->identity_assessment : empty;
+}
+
+DecisionAdmissionCandidate::DecisionAdmissionCandidate(
+    std::unique_ptr<detail::DecisionAdmissionCandidateImpl> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+DecisionAdmissionCandidate::DecisionAdmissionCandidate(DecisionAdmissionCandidate&&) noexcept
+    = default;
+
+DecisionAdmissionCandidate&
+DecisionAdmissionCandidate::operator=(DecisionAdmissionCandidate&&) noexcept = default;
+
+DecisionAdmissionCandidate::~DecisionAdmissionCandidate() = default;
+
+std::uint32_t DecisionAdmissionCandidate::branch_count() const noexcept {
+    return impl_ != nullptr ? impl_->branch_count : 0;
+}
+
+runtime::ProgramResourceRevision DecisionAdmissionCandidate::resource_revision() const noexcept {
+    return impl_ != nullptr ? impl_->revision : runtime::ProgramResourceRevision{};
 }
 
 } // namespace ninfer::models::qwen3_5

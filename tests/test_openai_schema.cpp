@@ -71,20 +71,8 @@ OpenAIChatRequest parse_model(Json body) {
     return parse_chat_completion_request(body, limits(), webui_model());
 }
 
-// A template capability set that supports the reasoning efforts the webui dialect reaches: the
-// chat template's reasoning-effort surface (low/medium/xhigh), not the client's `high` alias.
-ninfer::PromptCapabilities effort_capabilities() {
-    ninfer::PromptCapabilities capabilities;
-    capabilities.enable_thinking = true;
-    capabilities.reasoning_effort.low              = true;
-    capabilities.reasoning_effort.medium           = true;
-    capabilities.reasoning_effort.xhigh            = true;
-    capabilities.reasoning_effort.default_effort   = ninfer::ReasoningEffort::XHigh;
-    return capabilities;
-}
-
 ResolvedPromptSemantics effort_semantics(const GenerationRequest& request) {
-    return resolve_prompt_semantics(request, ServeOptions{}, effort_capabilities());
+    return resolve_prompt_semantics(request, ServeOptions{});
 }
 
 ninfer::PromptInput effort_prompt(const GenerationRequest& request) {
@@ -1079,13 +1067,16 @@ int test_llama_webui_dialect() {
                         .code == "conflicting_template_option",
                       "reasoning effort conflicting with enable_thinking is a 400");
 
-    // reasoning_effort=high is rejected by the template capability (the chat template's surface).
+    // reasoning_effort=high is accepted and reaches the prompt with thinking enabled.
     Json high = base;
     high["reasoning_effort"] = "high";
     const OpenAIChatRequest high_request = parse_model(high);
-    failures += check(api_error([&] { (void)effort_semantics(high_request.generation); })
-                        .code == "reasoning_effort_not_supported",
-                      "reasoning_effort=high is rejected by the template capability");
+    failures += check(high_request.generation.reasoning_effort == RequestedReasoningEffort::High,
+                      "reasoning_effort=high is parsed");
+    const ninfer::PromptInput high_prompt = effort_prompt(high_request.generation);
+    failures += check(high_prompt.options.enable_thinking &&
+                          high_prompt.options.reasoning_effort == ninfer::ReasoningEffort::High,
+                      "high effort reaches the prompt with thinking enabled");
 
     // A full webui-shaped body is accepted end to end.
     Json full = base;

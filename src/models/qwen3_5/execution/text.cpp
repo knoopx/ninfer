@@ -1135,8 +1135,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     const std::uint32_t base = text_kv_base_;
 
     if (text_prefill != nullptr) {
-        if (multimodal != nullptr || base != text_prefill->begin ||
-            text_prefill->token_ids.size() < static_cast<std::size_t>(base) + ids.size()) {
+        if (multimodal != nullptr ||
+            text_prefill->token_ids.size() < text_prefill->begin + ids.size()) {
             throw std::invalid_argument("text prefill chunk does not match its full prompt");
         }
     }
@@ -1399,7 +1399,10 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
                                               std::uint32_t nominal_length, bool finalize_at_end) {
     if (begin >= full_ids.size() || nominal_length == 0 ||
         nominal_length > full_ids.size() - begin) {
-        throw std::invalid_argument("text prefill chunk is outside the prompt");
+        throw std::invalid_argument("text prefill chunk is outside the prompt: begin=" +
+                                    std::to_string(begin) + " size=" +
+                                    std::to_string(full_ids.size()) + " nominal=" +
+                                    std::to_string(nominal_length));
     }
     const TextPrefill text_prefill{full_ids, begin};
     NullTap tap;
@@ -1412,7 +1415,10 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
                                               DFlashFeatureSink& sink) {
     if (begin >= full_ids.size() || nominal_length == 0 ||
         nominal_length > full_ids.size() - begin) {
-        throw std::invalid_argument("text prefill chunk is outside the prompt");
+        throw std::invalid_argument("text prefill chunk is outside the prompt: begin=" +
+                                    std::to_string(begin) + " size=" +
+                                    std::to_string(full_ids.size()) + " nominal=" +
+                                    std::to_string(nominal_length));
     }
     const TextPrefill text_prefill{full_ids, begin};
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,

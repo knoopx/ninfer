@@ -3,7 +3,9 @@
 // Product-side adapter from one protocol-neutral generation request to the public Engine. Wire
 // adapters normalize before this layer and render IDs, usage, and response events after it.
 
+#include "ninfer/decision.h"
 #include "ninfer/engine.h"
+#include "serve/decisions.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
@@ -133,6 +135,11 @@ public:
     // Consumes prepared.generation. A PreparedRequest is single-use.
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
                           std::function<bool()> is_cancelled = {});
+
+    // Decision-scoring route: one decision batch over the model's loaded (Generation-purpose)
+    // engine; the Generation core serializes the decision job against in-flight generation
+    // rounds.
+    [[nodiscard]] DecisionResult decide(const DecisionsRequest& request, float temperature = 1.0f) const;
 
     void warmup();
 

@@ -38,6 +38,7 @@ enum class KvCacheStorage : std::uint8_t {
 enum class EnginePurpose : std::uint8_t {
     Generation,
     CausalScoring,
+    DecisionScoring,
 };
 
 enum class KvCapacityMode : std::uint8_t {
@@ -159,6 +160,9 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Decision branch-batch capacity: the decisions route (and Engine::decision_score) runs on
+    // the model's loaded engine; nonzero and resource-bounded (no fixed ceiling), all purposes.
+    std::uint32_t max_decision_branches = 16;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

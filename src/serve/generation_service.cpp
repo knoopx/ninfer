@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <iterator>
 #include <mutex>
 #include <stdexcept>
@@ -239,6 +240,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.max_context              = options_.max_context;
     engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.max_concurrency          = options_.max_concurrency;
+    engine_options.max_decision_branches    = options_.max_decision_branches;
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
@@ -251,7 +253,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
-    engine_options.startup_observer         = std::move(startup_observer);
+    engine_options.startup_observer         = startup_observer;
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
@@ -452,6 +454,61 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.tool_calls      = std::move(result.tool_calls);
     outcome.tool_call_parse = result.tool_call_parse;
     return outcome;
+}
+
+DecisionResult GenerationService::decide(const DecisionsRequest& request, float temperature) const {
+    // Vision gating first: a media decisions request requires the model's vision capability.
+    if (request.has_media() && !options_.enable_vision) {
+        const std::invalid_argument error("Vision is disabled for this server");
+        throw_invalid_input(error, "vision_disabled");
+    }
+    // The decisions route runs on the model's loaded engine (no separate model load): the
+    // Generation core serializes the decision job against in-flight generation rounds.
+    DecisionPrepared prepared;
+    try {
+        if (request.messages.empty()) {
+            prepared = engine_->prepare_decision(request.state_text, request.questions);
+        } else {
+            // Messages path: resolve media bytes and build the PromptInput (chat context with
+            // image/video parts) via the shared translation + acquisition machinery.
+            const Clock::time_point deadline =
+                Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
+            std::size_t remaining_media_bytes =
+                std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
+            const std::function<bool()> is_cancelled = [] { return false; };
+            GenerationRequest context;
+            context.messages = request.messages;
+            ninfer::PromptInput input = to_prompt_input(
+                context, ResolvedPromptSemantics{}, [&](const ContentPart& part) {
+                    return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
+                });
+            prepared = engine_->prepare_decision(std::move(input), request.questions);
+        }
+    } catch (const ninfer::RequestError& exception) {
+        // Same mapping as the generation route (context length -> 400 context_length_exceeded,
+        // admission -> 429/503, ...). RequestError is a std::invalid_argument, so it must be
+        // caught BEFORE the invalid_argument arm below.
+        throw ApiException(request_error_to_api_error(exception));
+    } catch (const std::invalid_argument& exception) {
+        ApiError error;
+        error.status  = 422;
+        error.type    = "invalid_request_error";
+        error.param   = "questions";
+        error.message = exception.what();
+        throw ApiException(std::move(error));
+    }
+    try {
+        return engine_->decision_score(std::move(prepared), temperature);
+    } catch (const ninfer::RequestError& exception) {
+        // An admission-blocked decision is a normal 503 (Unavailable), not an internal failure.
+        throw ApiException(request_error_to_api_error(exception));
+    } catch (const std::exception& exception) {
+        ApiError error;
+        error.status  = 500;
+        error.type    = "internal_error";
+        error.message = exception.what();
+        throw ApiException(std::move(error));
+    }
 }
 
 void GenerationService::warmup() {

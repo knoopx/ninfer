@@ -77,6 +77,12 @@ public:
     prepare(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
             ninfer::GenerationObservationOptions observation,
             std::function<bool()> is_cancelled, ContextCacheHints context_cache) const = 0;
+    // Decision-scoring seam (server-only /v1/decisions path): returns the backend's
+    // GenerationService (which runs decisions on the model's loaded engine), or nullptr when the
+    // backend offers no decision route (test fakes, future backends). Kept off the SSE virtual
+    // surface on purpose: the /v1/decisions handler resolves the service here and calls
+    // GenerationService::decide directly.
+    [[nodiscard]] virtual const GenerationService* decision_service() const { return nullptr; }
     [[nodiscard]] virtual int
     count_prompt_tokens(const GenerationRequest& req, std::function<bool()> is_cancelled) const = 0;
     virtual GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
@@ -112,6 +118,7 @@ public:
     count_prompt_tokens(const GenerationRequest& req, std::function<bool()> is_cancelled) const override;
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
                           std::function<bool()> is_cancelled) override;
+    [[nodiscard]] const GenerationService* decision_service() const override;
     [[nodiscard]] ninfer::LoadSummary load_summary() const override;
     void warmup() override;
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const override;

@@ -55,6 +55,14 @@ set_tests_properties(
   ninfer_qwen3_5_score_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+ninfer_add_test(ninfer_qwen3_5_decision_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_decision.cpp"
+  LIBRARIES ninfer_engine)
+
+set_tests_properties(
+  ninfer_qwen3_5_decision_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_qwen3_5_vision_workspace_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_workspace.cpp"
   LIBRARIES ninfer_model_runtime ninfer_engine)

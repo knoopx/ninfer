@@ -96,6 +96,10 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
+The `POST /v1/decisions` route runs decision scoring on each model's loaded engine (no separate
+model load); see the [Decision scoring section](docs/serving.md#decision-scoring-post-v1decisions)
+of the serving guide.
+
 Run a one-shot CLI request with a 32,768-token allocation:
 
 ```bash
@@ -228,6 +232,9 @@ The official artifacts provide the following capabilities, with optional compone
 - MTP speculative decoding with draft windows from one to five;
 - BF16, INT8, FP8, NVFP4, and K8V4 KV storage;
 - offline causal-perplexity scoring;
+- offline decision scoring (serving-only, POST /v1/decisions) with per-option isolated v1
+  semantics; the route runs on the model's loaded engine (no separate model load); choice
+  questions are capped at the artifact's compiled label-table size (<=255, above it is a 422);
 - private and shared exact-prefix reuse with Device/Host State and KV retention;
 - model-aware sampling defaults and explicit sampler overrides;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming,

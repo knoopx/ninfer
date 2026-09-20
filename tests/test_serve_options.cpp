@@ -57,6 +57,8 @@ int main() {
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           defaults.kv_capacity.explicit_tokens == defaults.max_context,
                       "default KV capacity does not follow max context");
+    failures += check(defaults.max_decision_branches == 16,
+                      "decision branch workspace default mismatch");
     failures += check(defaults.context_cache.host_state_slots == ninfer::kDefaultHostStateSlots &&
                           defaults.context_cache.host_kv_capacity_bytes ==
                               ninfer::kDefaultHostKvCapacityBytes,
@@ -99,6 +101,16 @@ int main() {
         (void)parse({"ninfer-serve", "model.ninfer", "--default-thinking-budget", "0"});
     } catch (const std::invalid_argument&) { zero_thinking_budget_rejected = true; }
     failures += check(zero_thinking_budget_rejected, "zero --default-thinking-budget was accepted");
+
+    const ServeOptions decision_branches =
+        parse({"ninfer-serve", "model.ninfer", "--max-decision-branches", "64"});
+    failures += check(decision_branches.max_decision_branches == 64,
+                      "--max-decision-branches did not preserve its positive value");
+    bool zero_decision_branches_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--max-decision-branches", "0"});
+    } catch (const std::invalid_argument&) { zero_decision_branches_rejected = true; }
+    failures += check(zero_decision_branches_rejected, "zero --max-decision-branches was accepted");
 
     bool empty_model_id_rejected = false;
     try {
@@ -247,6 +259,9 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
+    failures += check(serve_usage_text("ninfer-serve").find("--max-decision-branches") !=
+                          std::string::npos,
+                      "serve help omits --max-decision-branches");
     failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
                       "serve help omits context-cache capacities");
     failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=

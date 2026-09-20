@@ -603,6 +603,9 @@ void OperationalLog::model_preset(const EngineModelBackend& backend, const Model
     if (model.overrides.kv_cache.has_value()) { overrides.push_back("kvDtype"); }
     if (model.overrides.speculative.has_value()) { overrides.push_back("spec"); }
     if (model.overrides.prefill_chunk.has_value()) { overrides.push_back("prefillChunk"); }
+    if (model.overrides.max_decision_branches.has_value()) {
+        overrides.push_back("maxDecisionBranches");
+    }
     if (model.overrides.enable_vision.has_value()) { overrides.push_back("vision"); }
     std::ostringstream ov_out;
     for (std::size_t i = 0; i < overrides.size(); ++i) {
@@ -622,6 +625,7 @@ void OperationalLog::model_preset(const EngineModelBackend& backend, const Model
              << " | kv " << kv_capacity << ' ' << kv_cache_name(engine.kv_cache)
              << " | spec " << spec_out.str()
              << " | prefill-chunk " << product::format_pretty_count(engine.prefill_chunk)
+             << " | decision-branches " << product::format_pretty_count(engine.max_decision_branches)
              << " | vision " << (engine.enable_vision ? "on" : "off");
 
     combined << " | " << mem_out.str()

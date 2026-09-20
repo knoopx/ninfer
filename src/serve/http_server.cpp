@@ -595,6 +595,12 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
+    // Decision-scoring route. Key-gated by the /v1 prefix rule in is_api_path and
+    // SPA-excluded by webui_spa_path (the path[3] == '/' rule), like the other /v1 routes.
+    server_.Post("/v1/decisions",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_decisions(req, res);
+                 });
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);
     });

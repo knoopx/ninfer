@@ -104,9 +104,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if (!plan.context_cache.device_state_slots) {
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
     }
-    const std::int32_t state_image_slots = checked_i32(
-        static_cast<std::uint64_t>(plan.max_concurrency) + *plan.context_cache.device_state_slots,
-        "Qwen3.5 StateImage slot count exceeds int32");
+    // Decision scoring owns one prefilled row plus one forked row per planned branch.
+    const std::int32_t state_image_slots = plan.decision_scoring
+        ? checked_i32(static_cast<std::uint64_t>(plan.decision_branches) + 1ULL,
+                      "Qwen3.5 decision StateImage slot count exceeds int32")
+        : checked_i32(
+              static_cast<std::uint64_t>(plan.max_concurrency) +
+                  *plan.context_cache.device_state_slots,
+              "Qwen3.5 StateImage slot count exceeds int32");
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
@@ -131,7 +136,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .attention_head_dim        = dimension(config.attention->head_dim),
                      .kv_storage                = plan.kv_storage,
                      .enable_mtp                = plan.features.mtp(),
-                     .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
+                     .kv_table_rows             = plan.decision_scoring
+                        ? checked_i32(
+                              static_cast<std::uint64_t>(plan.decision_branches) + 1ULL,
+                              "Qwen3.5 decision KV table row count exceeds int32")
+                        : static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
                  });
@@ -247,6 +256,15 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             add_tensor(builder, DType::BF16,
                        {dimension(config.hidden_size), static_cast<std::int32_t>(kCausalScoreTile)},
                        "causal score hidden staging");
+    }
+    if (plan.decision_scoring) {
+        const auto branches = static_cast<std::int32_t>(plan.decision_branches);
+        out.decision_readout_hidden =
+            add_tensor(builder, DType::BF16, {dimension(config.hidden_size), branches},
+                       "decision readout hidden (last-position gather)");
+        out.decision_readout_logits =
+            add_tensor(builder, DType::BF16, {dimension(config.vocab_size), branches},
+                       "decision readout logits");
     }
     qwen3_5::complete_round_state_layout(builder, out.round);
     if (!plan.causal_scoring) {
@@ -458,6 +476,47 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         linear_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
         out.causal_score = finish(causal_score);
+    }
+
+    if (plan.decision_scoring) {
+        if (plan.decision_branches == 0) {
+            throw std::invalid_argument("decision scoring requires at least one branch");
+        }
+        const auto branches =
+            checked_i32(plan.decision_branches, "decision branch count exceeds int32");
+        const auto candidate_columns = checked_i32(
+            static_cast<std::uint64_t>(plan.decision_branches) * kDecisionMaxCandidates,
+            "decision candidate columns exceed int32");
+        WorkspaceLayoutBuilder decision_score;
+        matrix(decision_score, DType::BF16, dimension(config.vocab_size), branches);
+        matrix(decision_score, DType::BF16, dimension(config.hidden_size), branches);
+        matrix(decision_score, DType::I32, 1, candidate_columns);
+        matrix(decision_score, DType::I32, 1, candidate_columns);
+        matrix(decision_score, DType::FP32, 1, candidate_columns);
+        matrix(decision_score, DType::FP32, 1, candidate_columns);
+        linear_scratch(decision_score, parameters.text.output_head, 1, branches);
+        out.decision_score.readout_logits =
+            std::size_t(dimension(config.vocab_size)) * plan.decision_branches;
+        out.decision_score.readout_hidden =
+            std::size_t(dimension(config.hidden_size)) * plan.decision_branches;
+        out.decision_score.candidate_ids = candidate_columns;
+        out.decision_score.candidate_groups = candidate_columns;
+        out.decision_score.slice_logprobs = candidate_columns;
+        out.decision_score.probabilities  = candidate_columns;
+        out.decision_score.host_slice_logprobs = candidate_columns;
+        out.decision_score.host_probabilities  = candidate_columns;
+        out.decision_score.output_head_bytes   =
+            ops::linear_workspace_capacity_bytes(parameters.text.output_head.weight.qtype,
+                                                 parameters.text.output_head.weight.n,
+                                                 parameters.text.output_head.weight.k,
+                                                 parameters.text.output_head.policy, 1, branches);
+        // Branch suffixes are bounded (a question plus its options); cap the per-branch tail so
+        // a Generation engine does not plan a full-capacity KV tail for every branch. A prepared
+        // branch suffix longer than the entitlement is rejected upstream (422).
+        out.decision_score.branch_kv_rows  = plan.decision_branches;
+        out.decision_score.branch_tail_pages =
+            std::min(page_count(plan.capacity), static_cast<std::uint32_t>(128));
+        out.decision_score.bytes            = finish(decision_score);
     }
 
     if (!plan.causal_scoring) {
@@ -714,7 +773,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     out.general_capacity =
         std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
-                  out.dflash_context, out.dflash_round, out.causal_score});
+                  out.dflash_context, out.dflash_round, out.causal_score,
+                  out.decision_score.bytes});
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(
@@ -825,6 +885,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
+    impl->decision_scoring    = inputs.decision_scoring;
+    impl->decision_branches   = inputs.decision_branches;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
     impl->kv_storage          = inputs.kv_storage;
@@ -896,6 +958,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .features            = models::load_options(options),
         .use_cuda_graph      = options.use_cuda_graph,
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
+        .decision_scoring    = true, // planned for every purpose: the decisions route runs on
+                                     // the model's loaded engine
+        .decision_branches   = options.max_decision_branches,
         .device              = options.device,
         .context_cache       = options.context_cache,
     };

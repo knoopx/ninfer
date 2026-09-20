@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ninfer/decision.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
@@ -113,6 +114,8 @@ struct SequencePlannerImpl;
 
 struct AdmissionCandidateImpl;
 
+struct DecisionAdmissionCandidateImpl;
+
 struct CapturePressureCandidateImpl;
 
 struct RequestBasePlanImpl;
@@ -135,6 +138,8 @@ class CapturePressurePlanningSession;
 class CapturePressurePlan;
 
 class CapturePressureCandidate;
+
+class DecisionAdmissionCandidate;
 
 // Concrete Qwen execution and resource contracts; model instances supply their own data.
 // target selection remains outside this layer and happens once in the closed Engine registry.
@@ -314,6 +319,34 @@ private:
 
     friend class Program;
     friend class PressurePlanningSession;
+};
+
+// A sealed Program-owned decision admission: the validated inputs and the computed per-branch KV
+// entitlement, sealed against Program::resource_revision().  ResourceManager may retain it and
+// inspect branch_count and the revision, but not the entitlement arithmetic or the reservation.
+// start_decision_transaction opens the state/KV reservation; progress_decision_transaction
+// executes and releases it.
+
+class DecisionAdmissionCandidate {
+public:
+    DecisionAdmissionCandidate(DecisionAdmissionCandidate&&) noexcept;
+    DecisionAdmissionCandidate& operator=(DecisionAdmissionCandidate&&) noexcept;
+    ~DecisionAdmissionCandidate();
+
+    DecisionAdmissionCandidate(const DecisionAdmissionCandidate&)            = delete;
+    DecisionAdmissionCandidate& operator=(const DecisionAdmissionCandidate&) = delete;
+
+    [[nodiscard]] std::uint32_t branch_count() const noexcept;
+
+    [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
+
+private:
+    explicit DecisionAdmissionCandidate(
+        std::unique_ptr<detail::DecisionAdmissionCandidateImpl> impl) noexcept;
+
+    std::unique_ptr<detail::DecisionAdmissionCandidateImpl> impl_;
+
+    friend class Program;
 };
 
 // A Program-minted proof that one FIFO borrower cannot consume the maximum physical entitlement
@@ -850,6 +883,19 @@ public:
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
                                                   std::uint32_t first_target);
+    [[nodiscard]] DecisionResult decision_score(DecisionPrepared prepared, float temperature);
+    // Decision transaction: inspect_decision_admission validates the job and seals the physical
+    // plan; start_decision_transaction opens the state/KV reservation; progress_decision_transaction
+    // executes and releases it; finalize/has mirror the context-transaction cleanup contract.
+    [[nodiscard]] std::optional<DecisionAdmissionCandidate>
+    inspect_decision_admission(DecisionPrepared prepared);
+    [[nodiscard]] runtime::ContextTransactionReserveStatus
+    start_decision_transaction(DecisionAdmissionCandidate&& candidate,
+                               runtime::CancellationFlagView cancellation);
+    [[nodiscard]] DecisionResult
+    progress_decision_transaction(float temperature, runtime::CancellationFlagView cancellation);
+    void finalize_decision_transaction() noexcept;
+    [[nodiscard]] bool has_decision_transaction() const noexcept;
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,

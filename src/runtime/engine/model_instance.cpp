@@ -83,8 +83,25 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         options.use_cuda_graph       = false;
         options.context_cache        = ContextCacheOptions{.enabled = false};
         break;
+    case EnginePurpose::DecisionScoring:
+        options.max_concurrency      = 1;
+        options.max_pending_requests = 1;
+        options.prefill_chunk        = 1024;
+        options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
+        options.speculative          = {};
+        options.enable_vision        = false;
+        options.use_cuda_graph       = false;
+        options.context_cache        = ContextCacheOptions{.enabled = false};
+        break;
     default:
         throw std::invalid_argument("Engine purpose is invalid");
+    }
+    // The decision branch workspace is planned for every purpose (the decisions route runs on
+    // the model's loaded engine), so the branch capacity is validated here, not per purpose.
+    // Branch capacity is resource-bounded: planning sizes the branch workspace to the requested
+    // count and the device KV/state capacity bounds it; there is no fixed ceiling.
+    if (options.max_decision_branches == 0) {
+        throw std::invalid_argument("Engine max_decision_branches must be nonzero");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");

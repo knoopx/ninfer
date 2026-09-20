@@ -111,7 +111,8 @@ int main() {
                 "draftTokens": 4,
                 "lmHeadDraft": true,
                 "prefillChunk": 4096,
-                "vision": true
+                "vision": true,
+                "maxDecisionBranches": 64
             },
             "ov/string-kv": {
                 "artifact": "out/string.ninfer",
@@ -142,6 +143,9 @@ int main() {
                       "prefillChunk override not parsed");
     failures += check(auto_kv.overrides.enable_vision.has_value() && *auto_kv.overrides.enable_vision,
                       "vision override not parsed");
+    failures += check(auto_kv.overrides.max_decision_branches.has_value() &&
+                          *auto_kv.overrides.max_decision_branches == 64,
+                      "maxDecisionBranches override not parsed");
     // A numeric string kvCapacity (the Nix config emits it as a string) parses to explicit tokens.
     failures += check(string_kv.overrides.kv_capacity.has_value() &&
                           string_kv.overrides.kv_capacity->mode == ninfer::KvCapacityMode::Explicit &&
@@ -149,7 +153,8 @@ int main() {
                       "numeric-string kvCapacity did not parse to explicit tokens");
     // Absent fields stay nullopt (the engine falls back to the registered model defaults).
     failures += check(!string_kv.overrides.max_context && !string_kv.overrides.kv_cache &&
-                          !string_kv.overrides.speculative && !string_kv.overrides.enable_vision,
+                          !string_kv.overrides.speculative && !string_kv.overrides.enable_vision &&
+                          !string_kv.overrides.max_decision_branches,
                       "absent override fields are unexpectedly set");
 
     // --- per-model engine param validation (grounded in the engine's validate_target_options) ---
@@ -211,6 +216,17 @@ int main() {
     const std::string draft_no_spec =
         reject_message(R"({"models":{"s/nospec":{"artifact":"out/s.ninfer","draftTokens":3}}})");
     failures += check(!draft_no_spec.empty(), "draftTokens without a spec backend was accepted");
+
+    // maxDecisionBranches == 0 is rejected (the engine requires a nonzero branch count).
+    const std::string branches_zero =
+        reject_message(R"({"models":{"b/zero":{"artifact":"out/b.ninfer","maxDecisionBranches":0}}})");
+    failures += check(!branches_zero.empty(), "maxDecisionBranches == 0 was accepted");
+    failures += check(branches_zero.find("maxDecisionBranches") != std::string::npos,
+                      "maxDecisionBranches rejection message does not mention maxDecisionBranches");
+    // A positive maxDecisionBranches is accepted.
+    const std::string branches_ok =
+        reject_message(R"({"models":{"b/ok":{"artifact":"out/b.ninfer","maxDecisionBranches":64}}})");
+    failures += check(branches_ok.empty(), "valid maxDecisionBranches was rejected");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

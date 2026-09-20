@@ -281,9 +281,11 @@ struct PressureCheckpointRecoveryImpact {
     std::span<const CheckpointRecoveryAlternativeWork> target_recovery_work;
     bool survives = true;
 
+    // The span borrows from a planning scratch generation; elementwise equality is not defined
+    // for it, so comparison is deliberately unavailable.
     [[nodiscard]] friend constexpr bool
     operator==(const PressureCheckpointRecoveryImpact&,
-               const PressureCheckpointRecoveryImpact&) noexcept = default;
+               const PressureCheckpointRecoveryImpact&) noexcept = delete;
 };
 
 struct PressureCheckpointOutcome {

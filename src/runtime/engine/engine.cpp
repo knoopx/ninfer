@@ -6,6 +6,7 @@
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
+#include "runtime/engine/decision_score_core.h"
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/model_instance.h"
 
@@ -18,6 +19,7 @@
 #include <variant>
 
 namespace ninfer {
+
 namespace {
 
 DeviceContext initialize_device(const EngineOptions& options) {
@@ -148,8 +150,9 @@ class Engine::Impl {
 public:
     using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
     using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
-    using Core =
-        std::variant<std::monostate, std::unique_ptr<GenerationCore>, std::unique_ptr<ScoringCore>>;
+    using DecisionCore   = runtime::DecisionScoreCore<runtime::ModelInstance>;
+    using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
+                              std::unique_ptr<ScoringCore>, std::unique_ptr<DecisionCore>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(std::move(engine_options))),
@@ -164,6 +167,8 @@ public:
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         if (options.purpose == EnginePurpose::CausalScoring) {
             core = std::make_unique<ScoringCore>(*active, device);
+        } else if (options.purpose == EnginePurpose::DecisionScoring) {
+            core = std::make_unique<DecisionCore>(*active, device);
         } else {
             core = std::make_unique<GenerationCore>(*active, device, options,
                                                     std::move(constructed.context_cost));
@@ -239,6 +244,19 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     return impl_->active->frontend.tokenize_text(text);
 }
 
+DecisionPrepared Engine::prepare_decision(std::string state_text,
+                                          std::vector<DecisionQuestion> questions) const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->active->frontend.prepare_decision(std::move(state_text), std::move(questions));
+}
+
+DecisionPrepared Engine::prepare_decision(PromptInput input,
+                                          std::vector<DecisionQuestion> questions) const {
+    nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->active->frontend.prepare_decision(std::move(input), std::move(questions));
+}
+
 std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
     nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
                                   static_cast<std::uint64_t>(tokens.size()));
@@ -266,6 +284,36 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
         impl_->core);
     if (result.size() != expected) {
         throw std::logic_error("target Program returned an invalid causal score count");
+    }
+    return result;
+}
+
+DecisionResult Engine::decision_score(DecisionPrepared prepared, float temperature) {
+    // Reuses the scoring category: no Decision-specific nvtx Name exists.
+    nvtx::ScopedRange decision_range(nvtx::Name::Score, nvtx::Category::Scoring,
+                                     static_cast<std::uint64_t>(prepared.branches.size()));
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (temperature <= 0.0f) { temperature = 1.0f; }
+    if (temperature > 100.0f) {
+        throw std::invalid_argument("decision_score temperature must be in (0,100]");
+    }
+    const std::size_t expected_answers = prepared.branches.size();
+    // Runs on the model's loaded engine: every core exposes decide() (the Generation core
+    // serializes it against in-flight generation rounds; the sync cores take the job slot).
+    DecisionResult result              = std::visit(
+        [&](auto& core) -> DecisionResult {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::DecisionCore>> ||
+                         std::is_same_v<CoreState, std::unique_ptr<Impl::GenerationCore>> ||
+                         std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                return core->decide(std::move(prepared), temperature);
+            } else {
+                throw std::logic_error("Engine decision scoring core is unavailable");
+            }
+        },
+        impl_->core);
+    if (result.answers.size() != expected_answers) {
+        throw std::logic_error("target Program returned an invalid decision answer count");
     }
     return result;
 }
@@ -338,6 +386,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
                 throw std::logic_error("Engine core is unavailable");
             } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                throw std::logic_error("Engine generation core is unavailable");
+            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::DecisionCore>>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
                 auto submission = core->submit(std::move(prompt.impl_->value), prompt_summary,

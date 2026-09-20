@@ -14,19 +14,15 @@
 #include <stdexcept>
 #include <thread>
 #include <utility>
-#include <vector>
 
 namespace ninfer::runtime {
 
-// Single-owner execution core for offline causal scoring. It deliberately has no request queue,
-// Scheduler, ResourceManager, continuation catalog, or batching policy.
+// Single-owner execution core for offline decision scoring. It deliberately has no request
+// queue, Scheduler, ResourceManager, continuation catalog, or batching policy.
 template <class Instance>
-class CausalScoreCore {
+class DecisionScoreCore {
 public:
-    using ModelContract  = typename Instance::ModelContract;
-    using PreparedPrompt = typename ModelContract::PreparedPrompt;
-
-    CausalScoreCore(Instance& instance, DeviceContext& device)
+    DecisionScoreCore(Instance& instance, DeviceContext& device)
         : instance_(instance), device_(device) {
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
@@ -48,7 +44,7 @@ public:
         }
     }
 
-    ~CausalScoreCore() noexcept {
+    ~DecisionScoreCore() noexcept {
         {
             std::lock_guard lock(queue_mutex_);
             stopping_ = true;
@@ -57,34 +53,26 @@ public:
         if (worker_.joinable()) { worker_.join(); }
     }
 
-    CausalScoreCore(const CausalScoreCore&)            = delete;
-    CausalScoreCore& operator=(const CausalScoreCore&) = delete;
+    DecisionScoreCore(const DecisionScoreCore&)            = delete;
+    DecisionScoreCore& operator=(const DecisionScoreCore&) = delete;
 
-    [[nodiscard]] std::vector<float> score(PreparedPrompt prompt, std::uint32_t first_target) {
+    [[nodiscard]] DecisionResult decide(DecisionPrepared prepared, float temperature) {
         // One synchronous public call owns the sole job slot until its result is delivered.
         std::scoped_lock call_lock(call_mutex_);
-        auto job                               = std::make_unique<Job>();
-        job->prompt                            = std::move(prompt);
-        job->first_target                      = first_target;
-        std::future<std::vector<float>> result = job->promise.get_future();
+        auto job                           = std::make_unique<Job>();
+        job->prepared                      = std::move(prepared);
+        job->temperature                   = temperature;
+        std::future<DecisionResult> result = job->promise.get_future();
         {
             std::lock_guard queue_lock(queue_mutex_);
-            if (stopping_) { throw std::runtime_error("causal scoring engine is stopping"); }
+            if (stopping_) { throw std::runtime_error("decision scoring engine is stopping"); }
             if (job_ != nullptr) {
-                throw std::logic_error("causal scoring core already has an in-flight job");
+                throw std::logic_error("decision scoring core already has an in-flight job");
             }
             job_ = std::move(job);
         }
         queue_cv_.notify_one();
         return result.get();
-    }
-
-    [[nodiscard]] DecisionResult decide(DecisionPrepared prepared, float temperature) {
-        // Runs on the loaded model: the call serializes against any in-flight scoring job via
-        // the execution lock (the same lock memory_summary/reset_memory_peaks take), so a
-        // decision job and a scoring job never own the program state at once.
-        std::scoped_lock lock(execution_mutex_);
-        return instance_.program->decision_score(std::move(prepared), temperature);
     }
 
     [[nodiscard]] MemorySummary memory_summary() const {
@@ -120,9 +108,9 @@ public:
 
 private:
     struct Job {
-        PreparedPrompt prompt;
-        std::uint32_t first_target = 0;
-        std::promise<std::vector<float>> promise;
+        DecisionPrepared prepared;
+        float temperature = 1.0f;
+        std::promise<DecisionResult> promise;
     };
 
     void worker_loop() noexcept {
@@ -138,11 +126,11 @@ private:
                 job = std::move(job_);
             }
             try {
-                std::vector<float> result;
+                DecisionResult result;
                 {
                     std::scoped_lock lock(execution_mutex_);
-                    result =
-                        instance_.program->causal_score(std::move(job->prompt), job->first_target);
+                    result = instance_.program->decision_score(std::move(job->prepared),
+                                                               job->temperature);
                 }
                 job->promise.set_value(std::move(result));
             } catch (...) {

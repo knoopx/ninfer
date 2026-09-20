@@ -43,6 +43,7 @@ struct EngineOverrides {
     std::optional<KvCacheStorage> kv_cache;
     std::optional<SpeculativeOptions> speculative;
     std::optional<std::uint32_t> prefill_chunk;
+    std::optional<std::uint32_t> max_decision_branches;
     std::optional<bool> enable_vision;
 };
 

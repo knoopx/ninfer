@@ -1785,6 +1785,18 @@ FakeProgram::begin_pressure_planning(std::span<const FakeAdmissionCandidate* con
                                        private_owner_ids, shared_owners, shared_owner_ids);
 }
 
+// Minimal decision-scoring contract types so the ResourceManager's decision member templates
+// resolve; the test exercises no decision path, so these stay inert.
+struct FakeDecisionPrepared {
+};
+
+struct FakeDecisionResult {
+};
+
+struct FakeDecisionAdmissionCandidate {
+    [[nodiscard]] std::uint32_t resource_revision() const { return 0; }
+};
+
 struct FakeModelContract {
     using Program                    = FakeProgram;
     using PreparedPrompt             = FakePreparedPrompt;
@@ -1811,6 +1823,9 @@ struct FakeModelContract {
     using CommitResult               = FakeCommitResult;
     using DiscardResult              = FakeDiscardResult;
     using CacheSessionKey            = FakeCacheSessionKey;
+    using DecisionPrepared           = FakeDecisionPrepared;
+    using DecisionResult             = FakeDecisionResult;
+    using DecisionAdmissionCandidate = FakeDecisionAdmissionCandidate;
 };
 
 using FakeManager = ninfer::runtime::ResourceManager<FakeModelContract>;

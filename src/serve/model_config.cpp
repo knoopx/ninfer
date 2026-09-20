@@ -124,6 +124,15 @@ Config parse_impl(const std::string& text) {
             if (value.contains("vision")) {
                 model.overrides.enable_vision = value.at("vision").get<bool>();
             }
+            if (value.contains("maxDecisionBranches")) {
+                const auto branches = value.at("maxDecisionBranches").get<std::uint32_t>();
+                if (branches == 0) {
+                    throw std::invalid_argument(
+                        "config: model '" + model_id +
+                        "' maxDecisionBranches must be positive");
+                }
+                model.overrides.max_decision_branches = branches;
+            }
             // --- per-model validation (grounded in the engine's validate_target_options) ---
             // kvCapacity (explicit, not "auto") must be at least maxContext. Ground: qwen3_6
             // layouts_impl.h validate_target_options ("kv_capacity must be at least max_context");

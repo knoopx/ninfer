@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
+#include "ninfer/decision.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -15,6 +16,7 @@
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
+#include "models/qwen3_5/program/transactions/decision_branches.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -256,12 +258,31 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
 
 struct CapturePressureCandidateImpl : ResourceCandidateState {};
 
+// One decision job's validated inputs, computed physical plan, and (once started) its open
+// state/KV reservation. The candidate is sealed: ResourceManager sees only branch_count and
+// the program revision, never the entitlement arithmetic or the reservation handles.
+struct DecisionAdmissionCandidateImpl {
+    ninfer::DecisionPrepared prepared;
+    std::uint32_t branch_count = 0;
+    std::uint32_t state_length = 0;
+    std::uint32_t entitlement  = 0; // per-branch KV page entitlement
+    std::uint32_t input_tokens = 0;
+    runtime::ProgramResourceRevision revision;
+    // Physical reservation opened by start_decision_transaction; owned until progress/finalize.
+    std::optional<StateImageHandle> state;
+    std::optional<KVAddressSpaceHandle> address;
+    DecisionBranchReservation reservation;
+    bool reservation_open = false;
+    bool transaction_open = false;
+};
+
 } // namespace ninfer::models::qwen3_5::detail
 
 namespace ninfer::models::qwen3_5::detail {
 
 using AdmissionCandidateImpl       = qwen3_5::detail::AdmissionCandidateImpl;
 using CapturePressureCandidateImpl = qwen3_5::detail::CapturePressureCandidateImpl;
+using DecisionAdmissionCandidateImpl = qwen3_5::detail::DecisionAdmissionCandidateImpl;
 using ResourceCandidateState       = qwen3_5::detail::ResourceCandidateState;
 using RequestBasePlanImpl          = qwen3_5::detail::RequestBasePlanImpl;
 using CapturePressureCandidate     = qwen3_5::CapturePressureCandidate;
@@ -464,6 +485,16 @@ public:
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&& prompt,
                                                   std::uint32_t first_target);
+    [[nodiscard]] DecisionResult decision_score(DecisionPrepared prepared, float temperature);
+    [[nodiscard]] std::unique_ptr<DecisionAdmissionCandidateImpl>
+    inspect_decision_admission(DecisionPrepared prepared);
+    [[nodiscard]] runtime::ContextTransactionReserveStatus
+    start_decision_transaction(DecisionAdmissionCandidateImpl&& candidate,
+                               runtime::CancellationFlagView cancellation);
+    [[nodiscard]] DecisionResult progress_decision_transaction(float temperature,
+                                                               runtime::CancellationFlagView cancellation);
+    void finalize_decision_transaction() noexcept;
+    [[nodiscard]] bool has_decision_transaction() const noexcept;
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
@@ -574,6 +605,7 @@ public:
     const bool vision_enabled;
     const bool use_cuda_graph;
     const bool causal_scoring;
+    const bool decision_scoring;
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     // Free Device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
@@ -602,6 +634,8 @@ public:
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
+    std::optional<Tensor> decision_readout_hidden;
+    std::optional<Tensor> decision_readout_logits;
     Tensor sampling_config;
     Tensor token_counts;
 
@@ -619,6 +653,8 @@ public:
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
+    std::optional<PinnedHostBuffer> decision_readout_logits_host;
+    std::optional<PinnedHostBuffer> decision_probabilities_host;
     TokenId* host_tokens = nullptr;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_5::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
@@ -885,6 +921,10 @@ private:
     using ContextTransaction =
         std::variant<std::monostate, MaterializationTransaction, ActiveCaptureTransaction>;
     ContextTransaction context_transaction_;
+
+    // The open decision job (inspect -> start -> progress -> finalize). Mutually exclusive with a
+    // context transaction: a decision owns the program's state/KV for its whole one-shot lifetime.
+    std::optional<DecisionAdmissionCandidateImpl> decision_candidate_;
 
     [[nodiscard]] MaterializationResult
     progress_materialization_transaction(runtime::CancellationFlagView cancellation);

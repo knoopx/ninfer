@@ -1,19 +1,27 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/program/transactions/decision_branches.h"
+#include "models/qwen3_5/program/decision_readout.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "core/startup.h"
 #include "core/device.h"
+#include "ninfer/decision.h"
+#include "ninfer/ops/candidate_slice_softmax.h"
 #include "ninfer/ops/target_logprobs.h"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -46,6 +54,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
+      decision_scoring(plan.decision_scoring),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
@@ -57,6 +66,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
                                                     kCausalScoreTile * sizeof(float))
                                               : std::nullopt),
+      decision_readout_logits_host(
+          plan.decision_scoring
+              ? std::make_optional<PinnedHostBuffer>(
+                    workspace_plan.decision_score.readout_logits * 2)
+              : std::nullopt),
+      decision_probabilities_host(
+          plan.decision_scoring
+              ? std::make_optional<PinnedHostBuffer>(
+                    workspace_plan.decision_score.host_probabilities * sizeof(float))
+              : std::nullopt),
       ordinary_host(
           !plan.causal_scoring && plan.speculative_backend == SpeculativeBackend::None
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::OrdinaryDecodeIngress) +
@@ -81,6 +100,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         workspace_plan.vision.has_value() != vision_enabled ||
         causal_scoring != plan.persistent.score_hidden.has_value() ||
         causal_scoring != (workspace_plan.causal_score != 0) ||
+        plan.decision_scoring != (workspace_plan.decision_score.bytes != 0) ||
         (workspace_plan.vision &&
          workspace_plan.vision->general_capacity_bytes != workspace_plan.general_capacity)) {
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
@@ -236,6 +256,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);
+    }
+    if (plan.persistent.decision_readout_hidden) {
+        decision_readout_hidden = plan.persistent.decision_readout_hidden->bind(backing);
+    }
+    if (plan.persistent.decision_readout_logits) {
+        decision_readout_logits = plan.persistent.decision_readout_logits->bind(backing);
     }
     if (plan.persistent.token_counts) {
         token_counts = plan.persistent.token_counts->bind(backing);
@@ -474,6 +500,481 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         } catch (...) {}
         throw;
     }
+}
+
+std::unique_ptr<DecisionAdmissionCandidateImpl>
+ProgramImpl::inspect_decision_admission(DecisionPrepared prepared) {
+    if (!decision_readout_logits_host || !decision_probabilities_host ||
+        !decision_readout_hidden || !decision_readout_logits ||
+        workspace_plan.decision_score.bytes == 0) {
+        return nullptr;
+    }
+    // The decision path is self-contained (temp state + Main KV row 0 + branch fork + batched
+    // suffix prefill + readout) and is serialized by the Generation core against in-flight
+    // generation rounds, so it runs on the model's loaded (Generation-purpose) Program.
+    if (prepared.branches.empty()) {
+        throw std::invalid_argument("decision scoring requires at least one branch");
+    }
+    const std::uint32_t branch_count = static_cast<std::uint32_t>(prepared.branches.size());
+    if (branch_count > workspace_plan.decision_score.branch_kv_rows) {
+        throw std::invalid_argument("decision branches exceed the planned branch KV rows");
+    }
+    const std::uint32_t state_length = prepared.has_media()
+                                           ? static_cast<std::uint32_t>(
+                                                 prepared.state_media->token_ids.size())
+                                           : static_cast<std::uint32_t>(
+                                                 prepared.state_tokens.size());
+    if (state_length == 0 || state_length > capacity) {
+        throw std::invalid_argument("decision state token count must be in [1,capacity]");
+    }
+    const std::uint32_t vocabulary = dimension(parameters.model.resources().public_token_count);
+    std::uint32_t input_tokens = state_length;
+    std::uint32_t max_suffix_length = 0;
+    for (const DecisionBranch& branch : prepared.branches) {
+        if (branch.suffix_tokens.empty()) {
+            throw std::invalid_argument("decision branch suffix must not be empty");
+        }
+        max_suffix_length =
+            std::max(max_suffix_length, static_cast<std::uint32_t>(branch.suffix_tokens.size()));
+        if (static_cast<std::uint64_t>(state_length) + branch.suffix_tokens.size() > capacity) {
+            throw std::invalid_argument("decision branch exceeds the sequence capacity");
+        }
+        input_tokens += static_cast<std::uint32_t>(branch.suffix_tokens.size());
+        if (branch.candidate_ids.empty() || branch.candidate_ids.size() > kDecisionMaxCandidates) {
+            throw std::invalid_argument("decision branch candidate count must be in [1,256]");
+        }
+        if (branch.candidate_groups.size() != branch.candidate_ids.size() ||
+            branch.options.size() != branch.candidate_ids.size()) {
+            throw std::invalid_argument("decision branch fields must be parallel");
+        }
+        for (const TokenId candidate : branch.candidate_ids) {
+            if (candidate < 0 || static_cast<std::uint32_t>(candidate) >= vocabulary) {
+                throw std::invalid_argument("decision candidate token id is out of range");
+            }
+        }
+        for (const std::int32_t group : branch.candidate_groups) {
+            if (group != -1 &&
+                (group < 0 || group >= static_cast<std::int32_t>(branch.candidate_ids.size()))) {
+                throw std::invalid_argument("decision candidate group is out of range");
+            }
+        }
+        if (branch.type == DecisionQuestionType::Noul && branch.candidate_ids.size() != 2) {
+            throw std::invalid_argument("noul branch requires the fixed candidate pair");
+        }
+    }
+
+    const std::uint32_t state_pages = kv_pages_for_frontier(state_length);
+    // Size the per-branch KV page entitlement to the actual state + suffix pages, not the planned
+    // cap: a short-suffix decision must not reserve a full tail page group per branch, which
+    // exhausts the device page pool when several branches fork at once.
+    const std::uint32_t branch_entitlement =
+        std::min(workspace_plan.decision_score.branch_tail_pages,
+                 state_pages + kv_pages_for_frontier(max_suffix_length));
+    const std::uint32_t entitlement = branch_entitlement;
+    if (state_pages == 0 || state_pages > entitlement) {
+        throw std::invalid_argument("decision state pages exceed the branch KV tail entitlement");
+    }
+
+    // Soft feasibility check: a decision reserves branch_count state rows and branch_count KV
+    // addresses (one continuation per branch, plus the caller-owned prefilled row 0). The KV page
+    // demand (branch_count * entitlement) is enforced per-address by create_active, not by the
+    // address count, so infeasibility is a normal admission result, reported without reserving.
+    if (state_store->capacity() - state_store->occupied() < branch_count ||
+        text_kv_addresses->capacity() - text_kv_addresses->occupied() < branch_count) {
+        return nullptr;
+    }
+
+    auto candidate = std::make_unique<DecisionAdmissionCandidateImpl>();
+    candidate->prepared     = std::move(prepared);
+    candidate->branch_count = branch_count;
+    candidate->state_length = state_length;
+    candidate->entitlement  = entitlement;
+    candidate->input_tokens = input_tokens;
+    candidate->revision     = resource_revision();
+    return candidate;
+}
+
+runtime::ContextTransactionReserveStatus
+ProgramImpl::start_decision_transaction(DecisionAdmissionCandidateImpl&& candidate,
+                                        runtime::CancellationFlagView cancellation) {
+    if (decision_candidate_.has_value()) {
+        throw std::logic_error("decision transaction already open");
+    }
+    if (cancellation.requested()) { return runtime::ContextTransactionReserveStatus::Aborted; }
+    try {
+        candidate.state = state_store->reserve_reset(device.stream);
+        if (!candidate.state) {
+            return runtime::ContextTransactionReserveStatus::Aborted;
+        }
+        candidate.address = text_kv_addresses->create_active(candidate.entitlement, 0);
+        if (!candidate.address) {
+            (void)state_store->release(*candidate.state);
+            candidate.state.reset();
+            return runtime::ContextTransactionReserveStatus::Aborted;
+        }
+        if (text_kv_addresses->bound_row(*candidate.address) != 0) {
+            throw std::logic_error("decision transaction did not bind the unique Main KV row");
+        }
+        candidate.transaction_open = true;
+        decision_candidate_ = std::move(candidate);
+        return runtime::ContextTransactionReserveStatus::Reserved;
+    } catch (...) {
+        if (candidate.state) { (void)state_store->release(*candidate.state); }
+        if (candidate.address) {
+            if (text_kv_addresses->active(*candidate.address)) {
+                text_kv_addresses->deactivate(*candidate.address);
+            }
+            (void)text_kv_addresses->release(*candidate.address);
+        }
+        throw;
+    }
+}
+
+DecisionResult ProgramImpl::progress_decision_transaction(float temperature,
+                                                          runtime::CancellationFlagView cancellation) {
+    (void)cancellation;
+    DecisionAdmissionCandidateImpl& candidate = *decision_candidate_;
+    const DecisionPrepared& prepared          = candidate.prepared;
+    const std::uint32_t state_length          = candidate.state_length;
+    const std::uint32_t branch_count          = candidate.branch_count;
+    const std::uint32_t entitlement           = candidate.entitlement;
+    const std::uint32_t branch_entitlement    = candidate.entitlement;
+    // Release forked rows/states first, then the caller-owned prefilled row 0 / state 0
+    // (deactivated by open_branches), mirroring the causal_score cleanup.
+    const auto cleanup = [&] {
+        if (candidate.reservation_open) {
+            release_branches(*this, std::move(candidate.reservation));
+            candidate.reservation_open = false;
+        }
+        if (candidate.address) {
+            if (text_kv_addresses->active(*candidate.address)) {
+                text_kv_addresses->deactivate(*candidate.address);
+            }
+            (void)text_kv_addresses->release(*candidate.address);
+            candidate.address.reset();
+        }
+        if (candidate.state) {
+            (void)state_store->release(*candidate.state);
+            candidate.state.reset();
+        }
+    };
+
+    DecisionResult result;
+    result.input_tokens = candidate.input_tokens;
+    try {
+        text_kv_addresses->ensure_mapped_to_tokens(*candidate.address, state_length,
+                                                   device.stream);
+
+        // Shared state prefill on row 0 (the causal_score chunk loop without score staging).
+        const std::int32_t state_slot = state_store->physical_slot(*candidate.state);
+        std::uint32_t cursor = 0;
+        qwen3_5::PreparedPromptData* media = prepared.state_media.get();
+        if (media != nullptr) {
+            if (!workspace_plan.vision) {
+                throw std::logic_error("decision media prefill has no vision workspace plan");
+            }
+            VisionPrefillPlan vision_plan;
+            vision_plan.control_plan = std::make_shared<const qwen3_5::VisionControlPlan>(
+                qwen3_5::plan_vision_control(*media, *parameters.model.config().vision));
+            vision_plan.uses.reserve(vision_plan.control_plan->items.size());
+            for (std::size_t index = 0; index < vision_plan.control_plan->items.size(); ++index) {
+                const qwen3_5::VisionItemControlPlan& item =
+                    vision_plan.control_plan->items[index];
+                vision_plan.uses.push_back(VisionUseSpan{
+                    .begin               = item.token_begin,
+                    .end                 = item.token_end,
+                    .prepared_item_index = static_cast<std::uint32_t>(index),
+                });
+                vision_plan.max_merged_count =
+                    std::max(vision_plan.max_merged_count, item.merged_count);
+            }
+            vision_plan.control = std::make_shared<const qwen3_5::VisionControl>(
+                qwen3_5::build_vision_control(*media, *vision_plan.control_plan, 0));
+            auto vision = std::make_unique<execution::VisionPrefillSession>(
+                device, parameters,
+                DeviceSpan{workspace_storage.base(), workspace_storage.capacity()},
+                *workspace_plan.vision, *media, vision_plan, vision_handoff_peak_bytes);
+            while (cursor < state_length) {
+                const std::uint32_t nominal = std::min(prefill_chunk, state_length - cursor);
+                execution::PrefillContext schedule_state{
+                    {device, parameters, work, state_images->linear(), nullptr, io,
+                     prefill_hidden, prefill_chunk, proposal_head},
+                    decoder->text_kv.execution_view(
+                        text_kv_addresses->execution_row(*candidate.address)),
+                    {},
+                    decoder->text_kv,
+                    nullptr,
+                    nullptr,
+                    cursor,
+                    nullptr,
+                    nullptr,
+                    state_slot,
+                    state_slot,
+                    0,
+                    nullptr};
+                mark_workspace_usage(workspace_plan.vision->capacity_bytes);
+                const auto chunk = execution::prefill_multimodal_chunk(
+                    schedule_state, *media, *vision, nominal, std::nullopt,
+                    cursor + nominal == state_length);
+                vision->release_encoded_media_payloads();
+                if (chunk.processed_tokens == 0 || chunk.processed_tokens > nominal) {
+                    throw std::logic_error("decision score state Prefill made invalid progress");
+                }
+                cursor += chunk.processed_tokens;
+                text_kv_addresses->commit_frontier(*candidate.address, cursor);
+            }
+        } else {
+            while (cursor < state_length) {
+                const std::uint32_t nominal = std::min(prefill_chunk, state_length - cursor);
+                execution::PrefillContext schedule_state{
+                    {device, parameters, work, state_images->linear(), nullptr, io,
+                     prefill_hidden, prefill_chunk, proposal_head},
+                    decoder->text_kv.execution_view(
+                        text_kv_addresses->execution_row(*candidate.address)),
+                    {},
+                    decoder->text_kv,
+                    nullptr,
+                    nullptr,
+                    cursor,
+                    nullptr,
+                    nullptr,
+                    state_slot,
+                    state_slot,
+                    0,
+                    nullptr};
+                mark_workspace_usage(workspace_plan.text_prefill);
+                const execution::PrefillChunkResult chunk =
+                    execution::prefill_text_chunk(schedule_state,
+                                                  std::span<const TokenId>(prepared.state_tokens),
+                                                  nominal, std::nullopt, false);
+                if (chunk.finalized || chunk.processed_tokens == 0 ||
+                    chunk.processed_tokens > nominal) {
+                    throw std::logic_error("decision score state Prefill made invalid progress");
+                }
+                cursor += chunk.processed_tokens;
+                text_kv_addresses->commit_frontier(*candidate.address, cursor);
+            }
+        }
+
+        // Fork the prefilled row/state into the branch rows; row 0 stays with this route.
+        candidate.reservation =
+            open_branches(*this, *candidate.address, *candidate.state, branch_count, state_length,
+                          branch_entitlement, device.stream);
+        candidate.reservation_open = true;
+
+        // open_branches deactivated row 0 so the fork can pin and copy the source pages; re-acquire
+        // it (with its tail entitlement) so the branch-0 suffix appends on the shared row.
+        if (branch_count > 1) {
+            text_kv_addresses->activate(*candidate.address, entitlement, 0);
+        }
+
+        // Right-padded suffix matrix plus per-row execution views and GDN state slots.
+        const std::size_t rows = prepared.branches.size();
+        std::uint32_t width = 0;
+        for (const DecisionBranch& branch : prepared.branches) {
+            width = std::max(width, static_cast<std::uint32_t>(branch.suffix_tokens.size()));
+        }
+        std::vector<TokenId> suffix_tokens(rows * width);
+        std::vector<std::uint32_t> valid_lengths(rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            const auto& suffix = prepared.branches[row].suffix_tokens;
+            std::copy(suffix.begin(), suffix.end(), suffix_tokens.begin() + row * width);
+            valid_lengths[row] = static_cast<std::uint32_t>(suffix.size());
+        }
+        std::vector<qwen3_5::PagedKVCacheView> kv_rows(rows);
+        std::vector<std::int32_t> state_source_slots(rows);
+        std::vector<std::int32_t> state_destination_slots(rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            kv_rows[row] = decoder->text_kv.execution_view(
+                text_kv_addresses->execution_row(candidate.reservation.kv_rows[row]));
+            state_source_slots[row] =
+                state_store->physical_slot(candidate.reservation.states[row]);
+            state_destination_slots[row] = state_source_slots[row];
+        }
+
+        work.reset();
+        mark_workspace_usage(workspace_plan.decision_score.bytes);
+        // The readout buffers live in the persistent layout, not the scratch arena: the branch
+        // suffix prefill resets the arena to offset 0 for its chunk intermediates, which would
+        // clobber readout tensors allocated here (the last-position gather runs after each
+        // branch's prefill, so a clobbered readout_hidden feeds the projection). The persistent
+        // readout buffers are planned for the maximum branch capacity; slice to the active rows.
+        const Tensor readout_hidden_slice =
+            decision_readout_hidden->slice(1, 0, static_cast<std::int32_t>(rows));
+        const Tensor readout_logits_slice =
+            decision_readout_logits->slice(1, 0, static_cast<std::int32_t>(rows));
+        Tensor readout_hidden = readout_hidden_slice;
+        Tensor readout_logits = readout_logits_slice;
+        execution::PrefillContext batch_state{
+            {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
+             prefill_chunk, proposal_head},
+            kv_rows.front(),
+            {},
+            decoder->text_kv,
+            nullptr,
+            nullptr,
+            0,
+            nullptr,
+            nullptr,
+            0,
+            0,
+            0,
+            nullptr};
+        const std::span<const TokenId> state_span =
+            media != nullptr ? std::span<const TokenId>(media->token_ids)
+                             : std::span<const TokenId>(prepared.state_tokens);
+        (void)execution::prefill_decision_batch(
+            batch_state, state_span,
+            std::span<const TokenId>(suffix_tokens), width,
+            std::span<const std::uint32_t>(valid_lengths),
+            std::span<const qwen3_5::PagedKVCacheView>(kv_rows),
+            std::span<const std::int32_t>(state_source_slots),
+            std::span<const std::int32_t>(state_destination_slots), state_length,
+            &readout_hidden);
+        execution::project(readout_hidden, parameters.text.output_head, readout_logits, work,
+                           device.stream);
+        // The projection is BF16 and no gather-cast op exists, so pull the readout rows and
+        // build each row's FP32 candidate slice on the host before the op call.
+        CUDA_CHECK(cudaMemcpyAsync(decision_readout_logits_host->data(), readout_logits.data,
+                                   readout_logits.bytes(), cudaMemcpyDeviceToHost, device.stream));
+        device.synchronize();
+        const auto* readout =
+            static_cast<const std::uint16_t*>(decision_readout_logits_host->data());
+        const auto normalized_gini = [](const float* probs, std::size_t count) {
+            if (count == 1) { return 1.0f; }
+            double squares = 0.0;
+            for (std::size_t column = 0; column < count; ++column) {
+                squares += static_cast<double>(probs[column]) * probs[column];
+            }
+            const double gini =
+                (static_cast<double>(count) * squares - 1.0) / static_cast<double>(count - 1);
+            return static_cast<float>(std::clamp(gini, 0.0, 1.0));
+        };
+
+        const std::size_t vocab_size =
+            static_cast<std::size_t>(dimension(parameters.model.config().text.vocab_size));
+        result.answers.reserve(rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            const DecisionBranch& branch = prepared.branches[row];
+            const std::size_t candidates = branch.candidate_ids.size();
+            // readout is the [vocab_size, rows] BF16 projection with vocab (ne[0]) fastest, so a
+            // candidate's logit sits at row * vocab_size + its vocab id — the same gather
+            // target_logprobs performs; the candidate index is NOT a vocab position (see
+            // decision_readout.h).
+            const std::vector<float> slice = gather_decision_candidate_logits(readout, vocab_size,
+                                                                              row, branch.candidate_ids);
+            // One op call per row (N=1, C = that row's candidate count): candidate counts differ
+            // per question type, so no padding may enter any softmax row.
+            work.reset();
+            Tensor slice_logits =
+                work.alloc(DType::FP32, {1, static_cast<std::int32_t>(candidates)});
+            Tensor candidate_ids =
+                work.alloc(DType::I32, {1, static_cast<std::int32_t>(candidates)});
+            Tensor candidate_groups =
+                work.alloc(DType::I32, {1, static_cast<std::int32_t>(candidates)});
+            Tensor probabilities =
+                work.alloc(DType::FP32, {1, static_cast<std::int32_t>(candidates)});
+            CUDA_CHECK(cudaMemcpyAsync(candidate_ids.data, branch.candidate_ids.data(),
+                                       candidates * sizeof(TokenId), cudaMemcpyHostToDevice,
+                                       device.stream));
+            CUDA_CHECK(cudaMemcpyAsync(candidate_groups.data, branch.candidate_groups.data(),
+                                       candidates * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                       device.stream));
+            CUDA_CHECK(cudaMemcpyAsync(slice_logits.data, slice.data(),
+                                       candidates * sizeof(float), cudaMemcpyHostToDevice,
+                                       device.stream));
+            ops::candidate_slice_softmax(slice_logits, candidate_ids, candidate_groups, temperature,
+                                         probabilities, device.stream);
+            CUDA_CHECK(cudaMemcpyAsync(decision_probabilities_host->data(), probabilities.data,
+                                       probabilities.bytes(), cudaMemcpyDeviceToHost,
+                                       device.stream));
+            device.synchronize();
+            const float* probs =
+                static_cast<const float*>(decision_probabilities_host->data());
+
+            DecisionAnswer answer;
+            answer.type      = branch.type;
+            answer.options   = branch.options;
+            answer.probabilities.assign(probs, probs + candidates);
+            answer.raw_logits = slice; // pre-softmax readout logits (the options.raw_logits diagnostic)
+            if (branch.type == DecisionQuestionType::Noul) {
+                answer.noul           = probs[1];
+                answer.winning_option = (probs[1] >= probs[0]) ? "true" : "false";
+            } else if (branch.type == DecisionQuestionType::Choice) {
+                std::size_t winner = 0;
+                for (std::size_t column = 1; column < candidates; ++column) {
+                    if (probs[column] > probs[winner]) { winner = column; }
+                }
+                answer.winning_option = branch.options[winner];
+                answer.confidence     = normalized_gini(probs, candidates);
+            } else {
+                float expected = 0.0f;
+                for (std::size_t column = 0; column < candidates; ++column) {
+                    expected += static_cast<float>(column) * probs[column];
+                }
+                answer.score      = expected;
+                answer.confidence = normalized_gini(probs, candidates);
+            }
+            result.answers.push_back(std::move(answer));
+        }
+        cleanup();
+        decision_candidate_.reset();
+        return result;
+    } catch (...) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        work.reset();
+        try {
+            cleanup();
+        } catch (...) {}
+        throw;
+    }
+}
+
+void ProgramImpl::finalize_decision_transaction() noexcept {
+    if (!decision_candidate_) {
+        return;
+    }
+    DecisionAdmissionCandidateImpl& candidate = *decision_candidate_;
+    if (candidate.reservation_open) {
+        try {
+            release_branches(*this, std::move(candidate.reservation));
+            candidate.reservation_open = false;
+        } catch (...) {}
+    }
+    if (candidate.address) {
+        try {
+            if (text_kv_addresses->active(*candidate.address)) {
+                text_kv_addresses->deactivate(*candidate.address);
+            }
+            (void)text_kv_addresses->release(*candidate.address);
+        } catch (...) {}
+        candidate.address.reset();
+    }
+    if (candidate.state) {
+        try {
+            (void)state_store->release(*candidate.state);
+        } catch (...) {}
+        candidate.state.reset();
+    }
+    decision_candidate_.reset();
+}
+
+bool ProgramImpl::has_decision_transaction() const noexcept {
+    return decision_candidate_ && decision_candidate_->transaction_open;
+}
+
+DecisionResult ProgramImpl::decision_score(DecisionPrepared prepared, float temperature) {
+    auto candidate = inspect_decision_admission(std::move(prepared));
+    if (!candidate) {
+        throw std::runtime_error("decision admission infeasible (state/KV capacity)");
+    }
+    if (start_decision_transaction(std::move(*candidate), runtime::CancellationFlagView{}) !=
+        runtime::ContextTransactionReserveStatus::Reserved) {
+        throw std::runtime_error("decision reservation aborted");
+    }
+    return progress_decision_transaction(temperature, runtime::CancellationFlagView{});
 }
 
 void ProgramImpl::start_context_transfer_timer(runtime::ContextResourceClass resource) {

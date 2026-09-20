@@ -253,6 +253,38 @@ An optional proposal head supplies an indexed vocabulary subset for draft predic
 converts proposal rows to actual token IDs. Full target verification continues to use the full
 output head. Backend selection, draft width and proposal-head choice are fixed at startup.
 
+## Decision scoring
+
+Decision scoring answers a set of questions over a shared state without generating tokens
+(`output_tokens` is always `0`). The full feature reference (the `POST /v1/decisions` endpoint,
+request/response contract, question types, and binding design choices) is in
+[Decision scoring](../decisions.md). The public types are
+[`include/ninfer/decision.h`](../../include/ninfer/decision.h).
+
+A decision job has one shared state prefix and one branch per question. The model executes the
+prepared branches in one serialized job (no separate model load):
+
+1. **State prefill.** The shared state prefix is prefilled into the Main KV row 0.
+2. **Branch fork.** Row 0 forks into one branch row per question, each with its bounded branch KV
+   tail; a decision job is serialized against in-flight generation rounds by the engine's
+   execution lock.
+3. **Suffix prefill.** Each branch's question suffix (the rendered question text plus its
+   criteria) is appended in a batched suffix prefill over the branch rows.
+4. **Readout.** Each branch's last-position hidden state is gathered into the persistent
+   `decision_readout_hidden` buffer (`[hidden, branches]`).
+5. **Projection.** The readout hidden states are projected through the full `output_head` into
+   the persistent `decision_readout_logits` buffer (`[vocab, branches]`).
+6. **Candidate gather and softmax.** Each branch's candidate token logits are gathered from the
+   `[vocab, branches]` readout, and a temperature-scaled group-pooled softmax
+   (`ops::candidate_slice_softmax`) produces the per-candidate probability slice.
+7. **Answer.** Per question type: `noul` reports `P(true)` with no confidence; `choice` reports
+   the winning key, per-option probabilities, and a normalized Gini confidence; `score` reports
+   the expected 0-based level index, the level legend, per-level probabilities, and a normalized
+   Gini confidence.
+
+The readout and projection buffers live in the persistent layout (not the scratch arena), so the
+batched suffix prefill's arena reset cannot clobber them; see [Decision scoring](../decisions.md).
+
 ## Vision and multimodal positions
 
 The current native processor uses 16×16 spatial patches, pairs of frames, and 2×2 spatial merge.

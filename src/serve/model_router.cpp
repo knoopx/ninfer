@@ -29,6 +29,7 @@ EngineModelBackend::EngineModelBackend(const ModelConfig& model, ServeOptions ba
     if (model.overrides.kv_cache)            per_model.kv_cache             = *model.overrides.kv_cache;
     if (model.overrides.speculative)         per_model.speculative          = *model.overrides.speculative;
     if (model.overrides.prefill_chunk)       per_model.prefill_chunk        = *model.overrides.prefill_chunk;
+    if (model.overrides.max_decision_branches) per_model.max_decision_branches = *model.overrides.max_decision_branches;
     if (model.overrides.enable_vision)       per_model.enable_vision        = *model.overrides.enable_vision;
     service_ = std::make_unique<GenerationService>(per_model, std::move(observer));
 }
@@ -53,6 +54,7 @@ GenerationOutcome EngineModelBackend::run(PreparedRequest& prepared, const Strea
                                           std::function<bool()> is_cancelled) {
     return service_->run(prepared, sink, std::move(is_cancelled));
 }
+const GenerationService* EngineModelBackend::decision_service() const { return service_.get(); }
 
 ninfer::LoadSummary EngineModelBackend::load_summary() const { return service_->load_summary(); }
 void EngineModelBackend::warmup() { service_->warmup(); }
