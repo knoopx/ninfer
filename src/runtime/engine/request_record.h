@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/nvtx.h"
+#include "ninfer/decision.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/engine/generation_budget.h"
@@ -11,6 +12,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -108,6 +110,22 @@ enum class EngineRequestState : std::uint8_t {
     DecodeReady,
     ControlReady,
     ModelFinished,
+};
+
+// Completion carrier for a queued decision job: exactly one of result or error is set. The
+// worker fulfills the job's promise exactly once on the entry's terminal path.
+struct DecisionCompletion {
+    std::optional<ninfer::DecisionResult> result;
+    std::exception_ptr error;
+};
+
+// A queued decision job payload. prepared is move-only (its out-of-line destructor ends the
+// destruction chain, so it is safe as a member); done delivers the job's completion to the
+// blocking decide() caller.
+struct DecisionJob {
+    ninfer::DecisionPrepared prepared;
+    float temperature = 1.0f;
+    std::promise<DecisionCompletion> done;
 };
 
 template <class ModelContract>
@@ -228,6 +246,9 @@ struct RequestRecord {
     std::vector<StreamEvent> events;
     GenerationResult result;
     std::exception_ptr error;
+    // Set for queued decision jobs, empty for generation requests: every generation path is
+    // untouched by a null optional.
+    std::optional<DecisionJob> decision;
     bool response_done     = false;
     bool consumer_released = false;
     bool capacity_released = false;

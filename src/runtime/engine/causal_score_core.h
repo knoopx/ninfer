@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "ninfer/decision.h"
 #include "ninfer/types.h"
 #include "runtime/engine/kv_capacity.h"
 
@@ -11,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -76,6 +78,22 @@ public:
         }
         queue_cv_.notify_one();
         return result.get();
+    }
+
+    [[nodiscard]] DecisionResult decide(DecisionPrepared prepared, float temperature) {
+        // Runs on the loaded model: the call serializes against any in-flight scoring job via
+        // the execution lock (the same lock memory_summary/reset_memory_peaks take), so a
+        // decision job and a scoring job never own the program state at once.
+        std::scoped_lock lock(execution_mutex_);
+        try {
+            return instance_.program->decision_score(std::move(prepared), temperature);
+        } catch (const RequestError&) {
+            throw;
+        } catch (const std::exception& error) {
+            instance_.program->finalize_decision_transaction();
+            throw RequestError(RequestErrorKind::Unavailable,
+                               std::string("decision job failed: ") + error.what());
+        }
     }
 
     [[nodiscard]] MemorySummary memory_summary() const {

@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
+#include "ninfer/decision.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -16,6 +17,7 @@
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "core/host_context_arena.h"
+#include "models/qwen3_5/program/transactions/decision_branches.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
@@ -70,6 +72,24 @@ struct RequestBasePlanImpl {
     [[nodiscard]] bool accepts_capture(std::uint32_t frontier) const noexcept;
     [[nodiscard]] CaptureGroup capture_group(std::uint32_t frontier) const;
 };
+
+// One decision job's validated inputs, computed physical plan, and (once started) its open
+// state/KV reservation. The candidate is sealed: ResourceManager sees only branch_count and
+// the program revision, never the entitlement arithmetic or the reservation handles.
+struct DecisionAdmissionCandidateImpl {
+    ninfer::DecisionPrepared prepared;
+    std::uint32_t branch_count = 0;
+    std::uint32_t state_length = 0;
+    std::uint32_t entitlement  = 0; // per-branch KV page entitlement
+    std::uint32_t input_tokens = 0;
+    // Physical reservation opened by start_decision_transaction; owned until progress/finalize.
+    std::optional<StateImageHandle> state;
+    std::optional<KVAddressSpaceHandle> address;
+    DecisionBranchReservation reservation;
+    bool reservation_open = false;
+    bool transaction_open = false;
+};
+
 enum class PendingKind : std::uint8_t { None, Begin, Ordinary, Speculative };
 
 struct PendingCandidate {
@@ -322,6 +342,16 @@ public:
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle>,
                                       std::span<const runtime::RoundBudget>,
                                       runtime::ExecutionTiming*, runtime::TokenMaskProvider*);
+    [[nodiscard]] DecisionResult decision_score(DecisionPrepared prepared, float temperature);
+    [[nodiscard]] std::unique_ptr<DecisionAdmissionCandidateImpl>
+    inspect_decision_admission(DecisionPrepared prepared);
+    [[nodiscard]] bool start_decision_transaction(DecisionAdmissionCandidateImpl&& candidate,
+                                                  runtime::CancellationFlagView cancellation);
+    [[nodiscard]] DecisionResult progress_decision_transaction(float temperature,
+                                                               runtime::CancellationFlagView cancellation);
+    void finalize_decision_transaction() noexcept;
+    [[nodiscard]] bool has_decision_transaction() const noexcept;
+    [[nodiscard]] std::uint32_t decision_max_branches() const;
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t,
                          std::span<const std::optional<std::uint32_t>>, runtime::ExecutionTiming*);
@@ -349,8 +379,12 @@ public:
     const bool vision_enabled;
     const bool use_cuda_graph;
     const bool causal_scoring;
+    const bool decision_scoring;
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
+    // First Main KV execution row of the decision path's own row block, above the Generation
+    // lanes' rows; 0 when decision scoring is disabled. Assigned once from the planned table.
+    std::uint32_t decision_row_base_ = 0;
     const WorkspacePlan workspace_plan;
 
     DeviceArena persistent;
@@ -482,6 +516,10 @@ public:
     std::optional<ContextTransaction> context_transaction_;
     CudaCompletionEvent context_source_ready_;
     CudaCompletionEvent context_completion_;
+    // The open decision job (inspect -> start -> progress -> finalize). Mutually exclusive with a
+    // context transaction: a decision owns the program's state/KV for its whole one-shot lifetime.
+    std::optional<DecisionAdmissionCandidateImpl> decision_candidate_;
+
     std::array<CudaEventTimer, 3> context_transfer_timers_;
     CudaEventTimer prefill_gpu_timer_;
 

@@ -63,6 +63,31 @@ struct RequestRejectionLogContext {
     ApiError error;
 };
 
+// A parsed decision-scoring request (`POST /v1/decisions`). It has no generation fields: the
+// route runs on the resident model with one shared state and one branch per question, carries no
+// sampling or output-token semantics, and answers every question in one job. The counts are
+// known once the request body and its prepared branches exist, so the lifecycle has no separate
+// rejection shape.
+struct DecisionLogContext {
+    std::uint64_t id             = 0;
+    std::string protocol         = "decisions";
+    std::string model;
+    std::size_t question_count   = 0;
+    std::size_t candidate_count  = 0;
+    std::size_t media_item_count = 0;
+    bool raw_logits              = false;
+    double prepare_seconds       = 0.0;
+};
+
+// One completed decision job: the prompt tokens it prefilled (the shared state once plus every
+// branch suffix) and the answers it returned. output_tokens is always 0 — decision scoring
+// generates no tokens.
+struct DecisionLogOutcome {
+    std::uint32_t input_tokens = 0;
+    std::size_t answer_count   = 0;
+    double total_seconds       = 0.0;
+};
+
 enum class RequestFailurePhase : std::uint8_t {
     Prepare,
     Generation,

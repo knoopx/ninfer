@@ -105,13 +105,50 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if (!plan.context_cache.device_state_slots) {
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
     }
+    const std::uint32_t logical_pages = page_count(plan.capacity);
+    const std::uint32_t decision_page_capacity =
+        std::min(logical_pages, static_cast<std::uint32_t>(128));
+    const std::uint32_t physical_pages = plan.main_page_groups;
+    // The decision path runs on Generation's working set, but Generation traffic can commit every
+    // free capacity axis: the context cache holds a KV address and a Device StateImage slot per
+    // retained continuation, so once chat traffic fills the cache every decision request fails its
+    // capacity admission until a restart (a chat evicts a cache entry when it needs room; a
+    // decision job is not a cache client). Reserve a decision region before the Generation axes so
+    // a decision job always has room for its prefilled row 0 plus one branch row, and so a
+    // disabled context cache (device_state_slots = 0) still leaves a single-lane engine something
+    // to fork into. The cache and the lanes cannot claim the reserve, because their own capacities
+    // stay the configured axes; the runtime still uses any larger live free capacity
+    // opportunistically.
+    constexpr std::uint32_t kDecisionStateReserve = 2; // row 0 + one branch row
+    const std::uint32_t configured_device_state_slots =
+        static_cast<std::uint32_t>(plan.max_concurrency) +
+        static_cast<std::uint32_t>(*plan.context_cache.device_state_slots);
+    const std::uint32_t planned_device_state_slots =
+        configured_device_state_slots +
+        (plan.decision_scoring ? kDecisionStateReserve : 0U);
     const std::int32_t state_image_slots = checked_i32(
-        static_cast<std::uint64_t>(plan.max_concurrency) + *plan.context_cache.device_state_slots,
-        "Qwen3.5 StateImage slot count exceeds int32");
+        planned_device_state_slots, "Qwen3.5 StateImage slot count exceeds int32");
+    // D is the decision branch capacity: a constant bounded by the planned state-image slots and
+    // the Generation KV address rows (both fixed at planning time); the main page pool is always
+    // large enough (it is the varied term). The decision path forks in rounds bounded by the live
+    // free state rows, KV addresses and execution-table rows, so D only has to be useful, not
+    // minimal.
+    std::uint32_t decision_rows = 0;
+    if (plan.decision_scoring) {
+        decision_rows = std::max(
+            1U, std::min(static_cast<std::uint32_t>(state_image_slots),
+                         configured_device_state_slots));
+    }
+    // The decision path binds its own execution rows above the Generation lanes' rows (see
+    // ProgramImpl::decision_row_base_), so the table must hold the lanes' rows and the decision's
+    // row 0 plus D branch rows. Planning it at max_concurrency alone would both cap a decision at
+    // the Generation batch size and let an in-flight request's row collide with a decision row.
+    const std::int32_t execution_table_rows = checked_i32(
+        static_cast<std::uint64_t>(plan.max_concurrency) +
+            (plan.decision_scoring ? decision_rows + 1U : 0U),
+        "Qwen3.5 KV execution-table row count exceeds int32");
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
-    const std::uint32_t logical_pages  = page_count(plan.capacity);
-    const std::uint32_t physical_pages = plan.main_page_groups;
     const std::uint64_t mtp_extra_pages =
         plan.features.mtp()
             ? static_cast<std::uint64_t>(plan.max_concurrency) *
@@ -132,7 +169,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .attention_head_dim        = dimension(config.attention->head_dim),
                      .kv_storage                = plan.kv_storage,
                      .enable_mtp                = plan.features.mtp(),
-                     .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
+                     .kv_table_rows             = execution_table_rows,
                      .text_physical_page_groups = physical_pages,
                      .mtp_physical_page_groups  = mtp_physical_pages,
                  });
@@ -163,6 +200,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         }
     }
     out.state_images = qwen3_5::plan_state_image_device_pool(builder, state_image_spec);
+    if (plan.decision_scoring) {
+        out.decision_rows          = decision_rows;
+        out.decision_page_capacity = decision_page_capacity;
+    }
     if (plan.speculative_backend != SpeculativeBackend::None) {
         out.replay_records = plan_gdn_replay_records(
             builder,
@@ -466,6 +507,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         linear_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
         out.causal_score = finish(causal_score);
+    }
+
+    if (plan.decision_scoring) {
+        // The per-job readout workspace (readout buffers, projection scratch, host mirrors) is
+        // allocated per decision job sized to the live branch count N, so the plan carries no
+        // fixed branch-capacity workspace. Only the per-row tail page entitlement is planned:
+        // branch suffixes are bounded (a question plus its options), so a Generation engine does
+        // not plan a full-capacity KV tail for every branch. A prepared branch suffix longer than
+        // the entitlement is rejected upstream (422).
+        out.decision_score.branch_tail_pages =
+            std::min(page_count(plan.capacity), static_cast<std::uint32_t>(128));
     }
 
     if (!plan.causal_scoring) {
@@ -834,6 +886,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->features             = inputs.features;
     impl->use_cuda_graph       = inputs.use_cuda_graph;
     impl->causal_scoring       = inputs.causal_scoring;
+    impl->decision_scoring    = inputs.decision_scoring;
     impl->device               = inputs.device;
     impl->multiprocessor_count = inputs.multiprocessor_count;
     impl->context_cache        = inputs.context_cache;
@@ -914,6 +967,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .features             = models::load_options(options),
         .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
+        .decision_scoring    = true, // planned for every purpose: the decisions route runs on
+                                     // the model's loaded engine
         .device               = options.device,
         .multiprocessor_count = device.multiprocessor_count(),
         .context_cache        = options.context_cache,

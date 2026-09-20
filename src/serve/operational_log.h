@@ -41,6 +41,11 @@ render_tool_call_fallback(const RequestLogContext& context, const GenerationOutc
 [[nodiscard]] OperationalRecord render_response_failure(std::uint64_t request_id,
                                                         const RequestFailure& failure);
 [[nodiscard]] OperationalRecord render_throughput(const ThroughputReport& report);
+[[nodiscard]] OperationalRecord render_decision_start(const DecisionLogContext& context);
+[[nodiscard]] OperationalRecord render_decision_done(const DecisionLogContext& context,
+                                                     const DecisionLogOutcome& outcome);
+[[nodiscard]] OperationalRecord render_decision_failure(const DecisionLogContext& context,
+                                                        const RequestFailure& failure);
 
 class OperationalLog {
 public:
@@ -50,6 +55,9 @@ public:
     void request_rejected(const RequestRejectionLogContext& context) const;
     void request_done(const RequestLogContext& context, const GenerationOutcome& outcome) const;
     void request_failure(const RequestLogContext& context, const RequestFailure& failure) const;
+    void decision_start(const DecisionLogContext& context) const;
+    void decision_done(const DecisionLogContext& context, const DecisionLogOutcome& outcome) const;
+    void decision_failure(const DecisionLogContext& context, const RequestFailure& failure) const;
     void response_failure(std::uint64_t request_id, const RequestFailure& failure) const;
     void throughput(const ThroughputReport& report) const;
     void http_failure(std::string_view endpoint, const RequestFailure& failure,

@@ -1,4 +1,5 @@
 #pragma once
+#include "ninfer/decision.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
@@ -49,6 +50,12 @@ struct PrefixShortlistKey {
     std::uint32_t identity_tag                                              = 0;
     friend bool operator==(PrefixShortlistKey, PrefixShortlistKey) noexcept = default;
 };
+
+namespace detail {
+struct DecisionAdmissionCandidateImpl;
+} // namespace detail
+
+class DecisionAdmissionCandidate;
 
 class SequencePlan {
 public:
@@ -116,6 +123,32 @@ private:
     std::shared_ptr<detail::RequestBasePlanImpl> impl_;
 
     friend class detail::ProgramImpl;
+};
+
+// A sealed Program-owned decision admission: the validated inputs and the computed per-branch KV
+// entitlement.  ResourceManager may retain it and inspect branch_count, but not the entitlement
+// arithmetic or the reservation.
+// start_decision_transaction opens the state/KV reservation; progress_decision_transaction
+// executes and releases it.
+
+class DecisionAdmissionCandidate {
+public:
+    DecisionAdmissionCandidate(DecisionAdmissionCandidate&&) noexcept;
+    DecisionAdmissionCandidate& operator=(DecisionAdmissionCandidate&&) noexcept;
+    ~DecisionAdmissionCandidate();
+
+    DecisionAdmissionCandidate(const DecisionAdmissionCandidate&)            = delete;
+    DecisionAdmissionCandidate& operator=(const DecisionAdmissionCandidate&) = delete;
+
+    [[nodiscard]] std::uint32_t branch_count() const noexcept;
+
+private:
+    explicit DecisionAdmissionCandidate(
+        std::unique_ptr<detail::DecisionAdmissionCandidateImpl> impl) noexcept;
+
+    std::unique_ptr<detail::DecisionAdmissionCandidateImpl> impl_;
+
+    friend class Program;
 };
 
 class SequenceHandle {
@@ -461,6 +494,19 @@ public:
     [[nodiscard]] bool start_pause(SequenceHandle sequence, bool save_snapshot,
                                    runtime::ExecutionTiming* timing = nullptr);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
+    [[nodiscard]] DecisionResult decision_score(DecisionPrepared prepared, float temperature);
+    // Decision transaction: inspect_decision_admission validates the job and seals the physical
+    // plan; start_decision_transaction opens the state/KV reservation; progress_decision_transaction
+    // executes and releases it; finalize/has mirror the context-transaction cleanup contract.
+    [[nodiscard]] std::optional<DecisionAdmissionCandidate>
+    inspect_decision_admission(DecisionPrepared prepared);
+    [[nodiscard]] bool start_decision_transaction(DecisionAdmissionCandidate&& candidate,
+                                                  runtime::CancellationFlagView cancellation);
+    [[nodiscard]] DecisionResult
+    progress_decision_transaction(float temperature, runtime::CancellationFlagView cancellation);
+    void finalize_decision_transaction() noexcept;
+    [[nodiscard]] bool has_decision_transaction() const noexcept;
+    [[nodiscard]] std::uint32_t decision_max_branches() const;
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.

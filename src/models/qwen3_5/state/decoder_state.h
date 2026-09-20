@@ -80,6 +80,11 @@ public:
 
     [[nodiscard]] PagedKVCacheView execution_view(const KVExecutionRowLease& row) const;
 
+    // View of an execution row owned by an external table pool: the dedicated decision KV
+    // store binds its rows to this cache's physical page pool.
+    [[nodiscard]] PagedKVCacheView execution_view(const KVExecutionTablePool& tables,
+                                                  const KVExecutionRowLease& row) const;
+
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
 private:

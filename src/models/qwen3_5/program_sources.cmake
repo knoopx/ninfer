@@ -9,6 +9,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/prefix_identity.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/round_buffers.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vision_control.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/transactions/decision_branches.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/graphs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefill.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/decode.cpp"

@@ -254,6 +254,39 @@ bool Program::recovery_pending(SequenceHandle sequence) const noexcept {
     return impl_->recovery_pending(sequence);
 }
 
+DecisionResult Program::decision_score(DecisionPrepared prepared, float temperature) {
+    return impl_->decision_score(std::move(prepared), temperature);
+}
+
+std::optional<DecisionAdmissionCandidate> Program::inspect_decision_admission(
+    DecisionPrepared prepared) {
+    auto impl = impl_->inspect_decision_admission(std::move(prepared));
+    if (impl == nullptr) { return std::nullopt; }
+    return DecisionAdmissionCandidate(std::move(impl));
+}
+
+[[nodiscard]] bool Program::start_decision_transaction(DecisionAdmissionCandidate&& candidate,
+                                                       runtime::CancellationFlagView cancellation) {
+    return impl_->start_decision_transaction(std::move(*candidate.impl_), cancellation);
+}
+
+DecisionResult Program::progress_decision_transaction(float temperature,
+                                                       runtime::CancellationFlagView cancellation) {
+    return impl_->progress_decision_transaction(temperature, cancellation);
+}
+
+void Program::finalize_decision_transaction() noexcept {
+    impl_->finalize_decision_transaction();
+}
+
+bool Program::has_decision_transaction() const noexcept {
+    return impl_->has_decision_transaction();
+}
+
+std::uint32_t Program::decision_max_branches() const {
+    return impl_->decision_max_branches();
+}
+
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
 
 PrefillProgress Program::advance_prefill(SequenceHandle h, runtime::ExecutionTiming* t,
@@ -317,6 +350,25 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
         std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device, startup_observer);
     plan.impl_.reset();
     return std::unique_ptr<Program>(new Program(std::move(impl)));
+}
+
+} // namespace ninfer::models::qwen3_5
+namespace ninfer::models::qwen3_5 {
+
+DecisionAdmissionCandidate::DecisionAdmissionCandidate(
+    std::unique_ptr<detail::DecisionAdmissionCandidateImpl> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+DecisionAdmissionCandidate::DecisionAdmissionCandidate(DecisionAdmissionCandidate&&) noexcept
+    = default;
+
+DecisionAdmissionCandidate&
+DecisionAdmissionCandidate::operator=(DecisionAdmissionCandidate&&) noexcept = default;
+
+DecisionAdmissionCandidate::~DecisionAdmissionCandidate() = default;
+
+std::uint32_t DecisionAdmissionCandidate::branch_count() const noexcept {
+    return impl_ != nullptr ? impl_->branch_count : 0;
 }
 
 } // namespace ninfer::models::qwen3_5

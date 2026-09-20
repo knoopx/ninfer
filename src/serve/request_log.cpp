@@ -251,6 +251,18 @@ Json request_json(const RequestLogContext& context) {
                 {"sampling", sampler_json(context.sampling)}};
 }
 
+// A decision request carries no generation fields (no model selection, sampling, or output-token
+// semantics); its identity is the shared state plus the question and candidate counts.
+Json decision_request_json(const DecisionLogContext& context) {
+    return Json{{"request_id", context.id},
+                {"protocol", context.protocol},
+                {"model", context.model},
+                {"question_count", context.question_count},
+                {"candidate_count", context.candidate_count},
+                {"media_item_count", context.media_item_count},
+                {"raw_logits", context.raw_logits}};
+}
+
 Json preparation_json(const RequestLogContext& context) {
     const PromptPreparationStats& stats = context.preparation;
     return Json{{"total", stats.seconds},
@@ -680,6 +692,39 @@ std::string format_request_error_json(const std::string& server_instance_id,
     return record.dump();
 }
 
+std::string format_decision_start_json(const std::string& server_instance_id,
+                                       std::uint64_t timestamp,
+                                       const DecisionLogContext& context) {
+    Json record                   = event_base(server_instance_id, timestamp, "decision_start");
+    record["request"]             = decision_request_json(context);
+    record["preparation_seconds"] = context.prepare_seconds;
+    return record.dump();
+}
+
+std::string format_decision_done_json(const std::string& server_instance_id,
+                                      std::uint64_t timestamp,
+                                      const DecisionLogContext& context,
+                                      const DecisionLogOutcome& outcome) {
+    Json record               = event_base(server_instance_id, timestamp, "decision_done");
+    record["request"]         = decision_request_json(context);
+    record["result"]          = Json{{"answer_count", outcome.answer_count},
+                                     {"input_tokens", outcome.input_tokens},
+                                     {"output_tokens", 0}};
+    record["timings_seconds"] = Json{{"prepare", context.prepare_seconds},
+                                     {"total", outcome.total_seconds}};
+    return record.dump();
+}
+
+std::string format_decision_error_json(const std::string& server_instance_id,
+                                       std::uint64_t timestamp,
+                                       const DecisionLogContext& context,
+                                       const std::string& message) {
+    Json record       = event_base(server_instance_id, timestamp, "decision_error");
+    record["request"] = decision_request_json(context);
+    record["error"]   = Json{{"message", message}};
+    return record.dump();
+}
+
 std::string format_throughput_json(const std::string& server_instance_id, std::uint64_t timestamp,
                                    const ThroughputReport& report) {
     Json record                          = event_base(server_instance_id, timestamp, "throughput");
@@ -932,6 +977,23 @@ void JsonlRequestLog::write_request_error(const RequestLogContext& context,
                                           const std::string& message) {
     if (!enabled()) { return; }
     append(format_request_error_json(server_instance_id_, unix_time_ms(), context, message));
+}
+
+void JsonlRequestLog::write_decision_start(const DecisionLogContext& context) {
+    if (!enabled()) { return; }
+    append(format_decision_start_json(server_instance_id_, unix_time_ms(), context));
+}
+
+void JsonlRequestLog::write_decision_done(const DecisionLogContext& context,
+                                          const DecisionLogOutcome& outcome) {
+    if (!enabled()) { return; }
+    append(format_decision_done_json(server_instance_id_, unix_time_ms(), context, outcome));
+}
+
+void JsonlRequestLog::write_decision_error(const DecisionLogContext& context,
+                                           const std::string& message) {
+    if (!enabled()) { return; }
+    append(format_decision_error_json(server_instance_id_, unix_time_ms(), context, message));
 }
 
 void JsonlRequestLog::write_throughput(const ThroughputReport& report) {
