@@ -111,6 +111,7 @@ const char* protocol_name(std::string_view protocol) noexcept {
     if (protocol == "anthropic_messages") { return "anthropic"; }
     if (protocol == "openai_responses_input_tokens") { return "openai-input-tokens"; }
     if (protocol == "anthropic_count_tokens") { return "anthropic-count-tokens"; }
+    if (protocol == "decisions") { return "decisions"; }
     return "http";
 }
 
@@ -381,6 +382,55 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }
 
+OperationalRecord render_decision_start(const DecisionLogContext& context) {
+    std::ostringstream out;
+    out << "req#" << context.id << " started | " << protocol_name(context.protocol) << " | "
+        << product::format_pretty_count(context.question_count)
+        << (context.question_count == 1 ? " question" : " questions");
+    if (context.candidate_count != 0) {
+        append_counted_clause(out, "candidates", context.candidate_count);
+    }
+    if (context.media_item_count != 0) {
+        append_counted_clause(out, "media", context.media_item_count);
+        if (context.prepare_seconds > 0.0) {
+            out << ", prepared " << product::format_pretty_duration(context.prepare_seconds);
+        }
+    }
+    if (context.raw_logits) { append_clause(out, "raw logits"); }
+    return {.severity = OperationalSeverity::Info, .message = out.str()};
+}
+
+OperationalRecord render_decision_done(const DecisionLogContext& context,
+                                       const DecisionLogOutcome& outcome) {
+    std::ostringstream out;
+    out << "req#" << context.id << " done | " << protocol_name(context.protocol) << " | "
+        << product::format_pretty_count(outcome.answer_count)
+        << (outcome.answer_count == 1 ? " answer" : " answers") << " | questions "
+        << product::format_pretty_count(context.question_count) << " | input "
+        << product::format_pretty_count(outcome.input_tokens) << " | total "
+        << product::format_pretty_duration(outcome.total_seconds);
+    if (outcome.input_tokens != 0 && outcome.total_seconds > 0.0) {
+        out << " | prefill "
+            << product::format_pretty_rate(
+                   static_cast<double>(outcome.input_tokens) / outcome.total_seconds, "tok");
+    }
+    return {.severity = OperationalSeverity::Info, .message = out.str()};
+}
+
+OperationalRecord render_decision_failure(const DecisionLogContext& context,
+                                          const RequestFailure& failure) {
+    const char* status = failure.classification == RequestFailureClass::ClientInput ? "rejected"
+                                                                                   : "failed";
+    std::ostringstream out;
+    out << "req#" << context.id << ' ' << status << " | " << protocol_name(context.protocol);
+    append_failure_fields(out, failure);
+    append_counted_clause(out, "questions", context.question_count);
+    if (context.candidate_count != 0) {
+        append_counted_clause(out, "candidates", context.candidate_count);
+    }
+    return {.severity = failure_severity(failure.classification), .message = out.str()};
+}
+
 OperationalLog::OperationalLog(std::shared_ptr<spdlog::logger> logger)
     : logger_(std::move(logger)) {}
 
@@ -417,6 +467,20 @@ void OperationalLog::request_done(const RequestLogContext& context,
 void OperationalLog::request_failure(const RequestLogContext& context,
                                      const RequestFailure& failure) const {
     write(render_request_failure(context, failure));
+}
+
+void OperationalLog::decision_start(const DecisionLogContext& context) const {
+    write(render_decision_start(context));
+}
+
+void OperationalLog::decision_done(const DecisionLogContext& context,
+                                   const DecisionLogOutcome& outcome) const {
+    write(render_decision_done(context, outcome));
+}
+
+void OperationalLog::decision_failure(const DecisionLogContext& context,
+                                      const RequestFailure& failure) const {
+    write(render_decision_failure(context, failure));
 }
 
 void OperationalLog::response_failure(std::uint64_t request_id,

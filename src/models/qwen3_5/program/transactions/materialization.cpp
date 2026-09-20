@@ -1,6 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
-#include "models/qwen3_5/program/context.h"
 
 #include <algorithm>
 #include <array>
@@ -19,10 +18,9 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
-runtime::ContextTransactionReserveStatus
-ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptData&& prompt,
-                                     runtime::CancellationFlagView cancellation) {
-    if (cancellation.requested()) { return runtime::ContextTransactionReserveStatus::Aborted; }
+bool ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptData&& prompt,
+                                          runtime::CancellationFlagView cancellation) {
+    if (cancellation.requested()) { return false; }
     const runtime::PreflightStatus preflight = revalidate_materialization(plan, prompt);
     if (preflight != runtime::PreflightStatus::Ready) {
         throw std::logic_error("materialization changed after successful preflight");
@@ -361,9 +359,8 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
             }
             destination.role = ContinuationSlotRole::ReservedMaterialization;
         }
-        advance_resource_revision();
         context_transaction_.emplace<MaterializationTransaction>(std::move(transaction));
-        return runtime::ContextTransactionReserveStatus::Reserved;
+        return true;
     } catch (...) {
         release_materialization_staging(transaction);
         throw;
@@ -483,38 +480,10 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
         }
     };
 
--    if (source.endpoint_valid && source.execution_frontier > details.reuse_base) {
--        const StateImageHandle endpoint = source.state.read;
--        source.endpoint_valid           = false;
--        source.state                    = {};
--        source.tail_hidden              = {};
--        source.tail_hidden_valid        = false;
--        release_if_unreferenced(endpoint);
--    }
--    for (std::size_t index = source.long_anchors.size(); index != 0; --index) {
--        LongAnchorCheckpoint& anchor = source.long_anchors[index - 1U];
--        if (anchor.frontier <= details.reuse_base) { continue; }
--        const StateImageHandle state = anchor.state;
--        state_store->release_checkpoint_reference(state);
--        source.long_anchors.erase(source.long_anchors.begin() +
--                                  static_cast<std::ptrdiff_t>(index - 1U));
--        release_if_unreferenced(state);
--    }
--    if (details.reuse == ReusePath::PrivateEndpoint &&
--        details.rewrite_disposition != RewriteCheckpointDisposition::RetainExisting &&
--        source.rewrite_state) {
--        const StateImageHandle rewrite = *source.rewrite_state;
--        state_store->release_checkpoint_reference(rewrite);
--        source.rewrite_state.reset();
--        source.rewrite_checkpoint        = {};
--        source.rewrite_checkpoint_hidden = {};
--        release_if_unreferenced(rewrite);
--    }
--
-+    // Validation-first pass: before any StateImage/KV mutation, confirm every source KV address
-+    // space is consumable at the planned frontier. A source whose KV tail was concurrently pinned
-+    // by another owner is a per-session capacity conflict, not an invariant breach; the caller
-+    // converts it into an Aborted transaction so only this session is released, not the engine.
+    // Validation-first pass: before any StateImage/KV mutation, confirm every source KV address
+    // space is consumable at the planned frontier. A source whose KV tail was concurrently pinned
+    // by another owner is a per-session capacity conflict, not an invariant breach; the caller
+    // converts it into an Aborted transaction so only this session is released, not the engine.
     struct TruncateTarget {
         KVAddressSpaceStore* addresses = nullptr;
         LogicalKVPageStore* pages      = nullptr;
@@ -574,35 +543,35 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
             throw std::logic_error("consumed source KV is not destructively truncatable");
         }
     }
-+
-+    if (source.endpoint_valid && source.execution_frontier > details.reuse_base) {
-+        const StateImageHandle endpoint = source.state.read;
-+        source.endpoint_valid           = false;
-+        source.state                    = {};
-+        source.tail_hidden              = {};
-+        source.tail_hidden_valid        = false;
-+        release_if_unreferenced(endpoint);
-+    }
-+    for (std::size_t index = source.long_anchors.size(); index != 0; --index) {
-+        LongAnchorCheckpoint& anchor = source.long_anchors[index - 1U];
-+        if (anchor.frontier <= details.reuse_base) { continue; }
-+        const StateImageHandle state = anchor.state;
-+        state_store->release_checkpoint_reference(state);
-+        source.long_anchors.erase(source.long_anchors.begin() +
-+                                  static_cast<std::ptrdiff_t>(index - 1U));
-+        release_if_unreferenced(state);
-+    }
-+    if (details.reuse == ReusePath::PrivateEndpoint &&
-+        details.rewrite_disposition != RewriteCheckpointDisposition::RetainExisting &&
-+        source.rewrite_state) {
-+        const StateImageHandle rewrite = *source.rewrite_state;
-+        state_store->release_checkpoint_reference(rewrite);
-+        source.rewrite_state.reset();
-+        source.rewrite_checkpoint        = {};
-+        source.rewrite_checkpoint_hidden = {};
-+        release_if_unreferenced(rewrite);
-+    }
-+
+
+    if (source.endpoint_valid && source.execution_frontier > details.reuse_base) {
+        const StateImageHandle endpoint = source.state.read;
+        source.endpoint_valid           = false;
+        source.state                    = {};
+        source.tail_hidden              = {};
+        source.tail_hidden_valid        = false;
+        release_if_unreferenced(endpoint);
+    }
+    for (std::size_t index = source.long_anchors.size(); index != 0; --index) {
+        LongAnchorCheckpoint& anchor = source.long_anchors[index - 1U];
+        if (anchor.frontier <= details.reuse_base) { continue; }
+        const StateImageHandle state = anchor.state;
+        state_store->release_checkpoint_reference(state);
+        source.long_anchors.erase(source.long_anchors.begin() +
+                                  static_cast<std::ptrdiff_t>(index - 1U));
+        release_if_unreferenced(state);
+    }
+    if (details.reuse == ReusePath::PrivateEndpoint &&
+        details.rewrite_disposition != RewriteCheckpointDisposition::RetainExisting &&
+        source.rewrite_state) {
+        const StateImageHandle rewrite = *source.rewrite_state;
+        state_store->release_checkpoint_reference(rewrite);
+        source.rewrite_state.reset();
+        source.rewrite_checkpoint        = {};
+        source.rewrite_checkpoint_hidden = {};
+        release_if_unreferenced(rewrite);
+    }
+
     if (host_tail_release_count != 0) {
         const std::span<const HostKVPageReplicaRelease> releases(host_tail_releases.data(),
                                                                  host_tail_release_count);
@@ -2139,18 +2108,17 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
     }
 
     if (!transaction.source_prepared) {
--        prepare_consumed_source(transaction);
-+        try {
-+            prepare_consumed_source(transaction);
-+        } catch (...) {
-+            // A source-consumption conflict (e.g. the source KV tail is no longer destructively
-+            // truncatable because a concurrent owner pinned it) is a per-session capacity problem,
-+            // not an invariant breach. Aborting the transaction releases only this session's
-+            // logical/physical claims; the engine then completes this session as Cancelled and
-+            // keeps serving the remaining sessions instead of failing the whole server.
-+            abort_transaction();
-+            return out;
-+        }
+        try {
+            prepare_consumed_source(transaction);
+        } catch (...) {
+            // A source-consumption conflict (e.g. the source KV tail is no longer destructively
+            // truncatable because a concurrent owner pinned it) is a per-session capacity problem,
+            // not an invariant breach. Aborting the transaction releases only this session's
+            // logical/physical claims; the engine then completes this session as Cancelled and
+            // keeps serving the remaining sessions instead of failing the whole server.
+            abort_transaction();
+            return out;
+        }
         if (cancellation.requested()) { transaction.cancel_pending = true; }
         if (transaction.cancel_pending) {
             abort_transaction();

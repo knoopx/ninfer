@@ -4,6 +4,7 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
+#include "ninfer/decision.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
@@ -246,6 +247,48 @@ public:
         request_admission_check();
         queue_cv_.notify_one();
         return Submission(*this, std::move(request));
+    }
+
+    // The decisions route runs on this loaded engine: the call serializes against in-flight
+    // generation rounds (the worker holds execution_mutex_ per execution round), so a decision
+    // job executes atomically between rounds and never shares program state with a round. The
+    // Program owns the decision state/KV reservation for the job's lifetime on Generation's
+    // working set (forked in rounds bounded by the live free rows); the job is independent of the
+    // ResourceManager request admission policy.
+    [[nodiscard]] DecisionResult decide(DecisionPrepared prepared, float temperature) {
+        std::scoped_lock lock(execution_mutex_);
+        CancellationFlagView cancellation{};
+        try {
+            auto candidate = instance_.program->inspect_decision_admission(std::move(prepared));
+            if (!candidate) {
+                // Admission rejects only when the shared working set cannot hold the caller-owned
+                // row 0 plus one branch row; dereferencing a null candidate would crash here.
+                throw RequestError(RequestErrorKind::Unavailable,
+                                   "decision job has no capacity for a branch fork");
+            }
+            (void)instance_.program->start_decision_transaction(std::move(*candidate),
+                                                                cancellation);
+            DecisionResult result =
+                instance_.program->progress_decision_transaction(temperature, cancellation);
+            // A decision job prefills the shared state once plus every branch suffix, so count its
+            // prompt tokens like a generation prefill and publish the snapshot: the periodic
+            // throughput record then reports decision work (prefill tokens, no decode) instead of
+            // staying silent for a decision-only interval.
+            cumulative_stats_.computed_prefill_tokens += result.input_tokens;
+            publish_runtime_stats();
+            return result;
+        } catch (const RequestError&) {
+            // A decision job is fire-and-forget: every failure path must release the transaction,
+            // or its state/KV reservation stays pinned and wedges every later decision job until a
+            // restart. RequestError derives from std::invalid_argument, so without this arm the
+            // finalize below would be skipped and the transaction would leak.
+            instance_.program->finalize_decision_transaction();
+            throw;
+        } catch (const std::exception& error) {
+            instance_.program->finalize_decision_transaction();
+            throw RequestError(RequestErrorKind::Unavailable,
+                               std::string("decision job failed: ") + error.what());
+        }
     }
 
     [[nodiscard]] MemorySummary memory_summary() const {

@@ -53,6 +53,7 @@ GenerationOutcome EngineModelBackend::run(PreparedRequest& prepared, const Strea
                                           std::function<bool()> is_cancelled) {
     return service_->run(prepared, sink, std::move(is_cancelled));
 }
+const GenerationService* EngineModelBackend::decision_service() const { return service_.get(); }
 
 ninfer::LoadSummary EngineModelBackend::load_summary() const { return service_->load_summary(); }
 void EngineModelBackend::warmup() { service_->warmup(); }

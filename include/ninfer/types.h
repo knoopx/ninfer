@@ -36,6 +36,7 @@ enum class KvCacheStorage : std::uint8_t {
 enum class EnginePurpose : std::uint8_t {
     Generation,
     CausalScoring,
+    DecisionScoring,
 };
 
 enum class KvCapacityMode : std::uint8_t {

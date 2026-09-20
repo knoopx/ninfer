@@ -20,7 +20,7 @@ class logger;
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 25;
+inline constexpr int kRequestLogSchemaVersion        = 26;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct ServerLogEnvironment {
@@ -61,6 +61,17 @@ std::string format_request_done_json(const std::string& server_instance_id,
 std::string format_request_error_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context, const std::string& message);
+std::string format_decision_start_json(const std::string& server_instance_id,
+                                       std::uint64_t timestamp_unix_ms,
+                                       const DecisionLogContext& context);
+std::string format_decision_done_json(const std::string& server_instance_id,
+                                      std::uint64_t timestamp_unix_ms,
+                                      const DecisionLogContext& context,
+                                      const DecisionLogOutcome& outcome);
+std::string format_decision_error_json(const std::string& server_instance_id,
+                                       std::uint64_t timestamp_unix_ms,
+                                       const DecisionLogContext& context,
+                                       const std::string& message);
 std::string format_throughput_json(const std::string& server_instance_id,
                                    std::uint64_t timestamp_unix_ms, const ThroughputReport& report);
 
@@ -94,6 +105,9 @@ public:
     void write_request_rejected(const RequestRejectionLogContext& context);
     void write_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void write_request_error(const RequestLogContext& context, const std::string& message);
+    void write_decision_start(const DecisionLogContext& context);
+    void write_decision_done(const DecisionLogContext& context, const DecisionLogOutcome& outcome);
+    void write_decision_error(const DecisionLogContext& context, const std::string& message);
     void write_throughput(const ThroughputReport& report);
 
 private:

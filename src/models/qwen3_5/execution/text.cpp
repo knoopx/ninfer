@@ -1135,8 +1135,12 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     const std::uint32_t base = text_kv_base_;
 
     if (text_prefill != nullptr) {
-        if (multimodal != nullptr || base != text_prefill->begin ||
-            text_prefill->token_ids.size() < static_cast<std::size_t>(base) + ids.size()) {
+        // The chunk is token_ids[begin .. begin + len): it must fit the span, and the span may
+        // start before the chunk when the prefix is already resident in the KV (the decision
+        // suffix prefill passes only the suffix span: base = prefix_length, begin = 0).
+        if (multimodal != nullptr || base < text_prefill->begin ||
+            text_prefill->token_ids.size() <
+                static_cast<std::size_t>(text_prefill->begin) + ids.size()) {
             throw std::invalid_argument("text prefill chunk does not match its full prompt");
         }
     }
@@ -1292,10 +1296,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     : text_prefill != nullptr
                         ? static_cast<std::uint32_t>(text_prefill->token_ids.size())
                         : static_cast<std::uint32_t>(T);
+                // Span-relative alignment: index the alignment span (token_ids) from its own
+                // begin, not from the absolute cache position — the decision suffix prefill
+                // decouples base from begin (identical for coupled callers, where base == begin).
                 const std::uint32_t alignment_begin =
-                    multimodal != nullptr || text_prefill != nullptr
-                        ? prompt_t0
-                        : static_cast<std::uint32_t>(t0);
+                    multimodal != nullptr     ? multimodal->begin + static_cast<std::uint32_t>(t0)
+                    : text_prefill != nullptr ? text_prefill->begin + static_cast<std::uint32_t>(t0)
+                                              : static_cast<std::uint32_t>(t0);
                 const qwen3_5::MtpAlignmentWindow mtp_window = qwen3_5::plan_mtp_alignment_window(
                     alignment_tokens, alignment_begin, static_cast<std::uint32_t>(len));
                 const std::span<const int> alignment_ids =
@@ -1381,10 +1388,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
             work_.reset();
             tap.consume_prefill_chunk(len, split_rel > 0 && t0 + len == split_rel);
+        } else {
+            // Non-tap path: the chunk's scratch is fully consumed within the iteration, so reset
+            // and let a subsequent chunk of the same call (a decision suffix longer than one
+            // prefill chunk) start its intermediates at offset 0.
+            work_.reset();
         }
 
         t0 += len;
-        break;
     }
 
     prefill_split_frontier_ = -1;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ninfer/decision.h"
 #include "ninfer/types.h"
 
 #include <chrono>
@@ -80,6 +81,25 @@ public:
     // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()).
     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
                                                   std::uint32_t first_target);
+
+    // Renders the shared state prefix + one branch per question via the model Frontend (the
+    // input of Engine::decision_score); throws std::invalid_argument on framing/label-table
+    // contract violations.
+    [[nodiscard]] DecisionPrepared prepare_decision(std::string state_text,
+                                                    std::vector<DecisionQuestion> questions) const;
+
+    // Media-capable decision preparation: the state context is a PromptInput (chat messages that
+    // may carry image/video parts). The Frontend prepends the decision system prompt, expands any
+    // media to Vision tokens, and stores the media-expanded prefix in DecisionPrepared.state_media
+    // (a text-only context leaves state_media null and fills state_tokens). Throws
+    // std::invalid_argument on framing/label-table contract violations.
+    [[nodiscard]] DecisionPrepared prepare_decision(PromptInput input,
+                                                    std::vector<DecisionQuestion> questions) const;
+
+    // Returns one DecisionAnswer per prepared branch for a DecisionScoring Engine; zero tokens
+    // are generated.
+    [[nodiscard]] DecisionResult decision_score(DecisionPrepared prepared,
+                                                float temperature = 1.0f);
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
