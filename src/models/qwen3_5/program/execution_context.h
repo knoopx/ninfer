@@ -144,7 +144,29 @@ void target_accept(ExecutionCore&, Tensor& continuation_hidden_store, TargetVeri
                                                     std::span<const TokenId> ids,
                                                     std::uint32_t nominal_length,
                                                     std::optional<std::uint32_t> split_frontier,
-                                                    bool finalize_at_end);
+                                                    bool finalize_at_end,
+                                                    std::uint32_t chunk_begin =
+                                                        std::numeric_limits<std::uint32_t>::max());
+
+// Decision-scoring batched suffix prefill. tokens is a right-padded [N, width] TokenId tensor
+// (row-major, flat): row i's real suffix is valid_lengths[i] tokens, the remaining width -
+// valid_lengths[i] columns are right padding and never run. Each row is a forked row from
+// open_branches: kv_rows[i] is that row's execution view, state_source_slots[i] /
+// state_destination_slots[i] are its GDN state slots, and the row's absolute positions continue
+// from prefix_length. Row i's attention sees exactly [0, prefix_length + valid_lengths[i]);
+// padded columns are masked out by never being processed. last_hidden is an optional [hidden, N]
+// BF16 matrix: when non-null, each row's hidden at its last real suffix position is copied into
+// column i right after that row's pass.
+[[nodiscard]] PrefillChunkResult prefill_decision_batch(PrefillContext& state,
+                                                        std::span<const TokenId> state_tokens,
+                                                        std::span<const TokenId> tokens,
+                                                        std::uint32_t width,
+                                                        std::span<const std::uint32_t> valid_lengths,
+                                                        std::span<const qwen3_5::PagedKVCacheView> kv_rows,
+                                                        std::span<const std::int32_t> state_source_slots,
+                                                        std::span<const std::int32_t> state_destination_slots,
+                                                        std::uint32_t prefix_length,
+                                                        Tensor* last_hidden = nullptr);
 
 [[nodiscard]] PrefillChunkResult
 prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,

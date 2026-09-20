@@ -334,3 +334,65 @@ Each floating-point Op is qualified against its independent mathematical oracle 
 public inputs. Packed weights are decoded with their stored scales. Exact transforms use exact
 oracles; private accumulation, staging and reduction order use the Op's numerical criteria.
 [Op development](op-development.md) owns that qualification contract.
+
+## Decision scoring
+
+The decision-scoring path answers per-candidate questions over a shared state prefix without
+generating tokens. The route, wire contract and binding design choices are in
+[Decision scoring](../decisions.md); this section owns the model execution path.
+
+**Planning.** The plan reserves a decision region above the Generation capacity axes: two
+Device StateImage slots (the caller-owned row 0 plus one branch row), `D + 1` KV addresses, and
+`D + 1` Main KV execution-table rows, where `D` is the decision branch capacity. It also plans a
+per-branch KV tail entitlement of at most 128 pages: branch suffixes are bounded (a question
+plus its options), so a prepared suffix longer than the entitlement is rejected upstream (422).
+The per-job readout workspace is not planned: it is allocated per job, sized to the live branch
+count.
+
+**Admission and transaction.** A job is admitted when the shared working set holds row 0 plus
+one branch row: at least 2 free Device StateImage slots, 2 free KV addresses, and 2 free
+decision execution rows. A larger question set is never rejected — it runs as successive
+rounds. Every failure path finalizes the decision transaction, so a failed job never pins its
+state/KV reservation for later jobs.
+
+**Execution.** One job is one serialized sequence of rounds on Generation's working set:
+
+1. **State prefill.** The shared state prefix prefills row 0 in text chunks, or through the
+   Vision path for a media state (Vision encode plus text).
+2. **Round fork.** Row 0 forks into one branch row per branch of the round via `open_branches`
+   with `round + 1` rows, so row 0 stays the caller-owned source: its page membership and GDN
+   state are untouched, and every round forks the same prefilled prefix. The fork copies the
+   GDN state device-to-device into Device StateImage slots, so the round holds
+   `min(free Device StateImage slots, free KV addresses, free decision execution rows)`
+   branches; host StateImage replicas never widen a round.
+3. **Suffix prefill.** Each branch's question suffix (the rendered question text plus its
+   criteria) prefills over the round's branch rows. A fork publishes only the shared prefix
+   pages, so each branch row's growth pages are mapped through `state_length + suffix` before
+   the suffix prefill writes KV there.
+4. **Readout.** Each branch row's last-position hidden state gathers into the per-job
+   `decision_readout_hidden` buffer (`[hidden, round]`).
+5. **Projection.** The readout hidden states project through the full `output_head` into the
+   per-job `decision_readout_logits` buffer (`[vocab, round]`, BF16).
+6. **Candidate slice.** Each branch's candidate token logits gather from the `[vocab, round]`
+   readout (a candidate index is not a vocabulary position) and run the temperature-scaled
+   group-pooled slice softmax (`ops::candidate_slice_softmax`; a group index of -1 disables
+   pooling). One op call per branch row: candidate counts differ per question type, so no
+   padding enters a softmax row.
+7. **Round release.** The round's forked rows and StateImage slots release, and the next round
+   forks the same row 0. Peak residency stays at one round; the branch count is bounded by the
+   job, not by the plan.
+
+**Readout buffers.** The per-job readout buffers (device readout buffers, projection scratch,
+pinned host mirrors) are allocated outside the scratch arena, sized to one round, and freed on
+job exit. The branch suffix prefill resets the scratch arena to offset 0 for its chunk
+intermediates; readout tensors allocated in the arena would be clobbered before the
+last-position gather and the projection ran.
+
+**Answers.** `noul` reports P(true) with no confidence; `choice` reports the winning key,
+per-option probabilities, and a normalized Gini confidence; `score` reports the expected 0-based
+level index, the level legend, per-level probabilities, and a normalized Gini confidence.
+Probabilities are uncalibrated slice statistics: each option scores in isolation over the
+question's candidate set, so changing the option set rescales the surviving options.
+
+The slice softmax is the path's only non-trivial numerics; it is pinned by
+`tests/ops/test_candidate_selector.cpp` against a CUDA oracle.
