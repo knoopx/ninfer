@@ -1,6 +1,7 @@
 // ninfer::ops - causal cached Softmax Attention validation and finite route dispatch.
 #include "ninfer/ops/softmax_attention.h"
 
+#include "core/device.h" // CUDA_CHECK
 #include "core/layout.h"
 #include "core/paged_kv_storage.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
@@ -392,6 +393,18 @@ const char* causal_attention_route_name(CausalAttentionRoute route) {
 }
 
 } // namespace detail
+
+std::int32_t causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry) {
+    require_causal_geometry(geometry, "causal_softmax_attention prompt wave");
+    int device          = 0;
+    int multiprocessors = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device));
+    // Every prompt kernel runs one CTA per SM over at most kPromptWaveRows query rows of one head,
+    // and kPromptWaveRows is a multiple of every prompt kernel's row block.
+    const std::int32_t row_blocks = std::max(1, multiprocessors / geometry.query_heads);
+    return row_blocks * detail::kPromptWaveRows;
+}
 
 std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,

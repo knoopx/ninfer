@@ -881,6 +881,21 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 
 } // namespace
 
+// Every chunk but a prompt's last one has the effective width, so with the fast INT8 prompt kernel
+// it is rounded down to whole prompt-attention waves, keeping each full chunk's attention free of
+// a partial last wave. Other cache formats keep the requested chunk.
+std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
+                                      const EngineOptions& options) {
+    const std::uint32_t requested = std::min(options.prefill_chunk, options.max_context);
+    if (options.kv_cache != KvCacheStorage::Int8Group64) { return requested; }
+    const auto& attention = *parameters.model.config().text.attention;
+    const auto wave = static_cast<std::uint32_t>(ops::causal_softmax_attention_prompt_wave_tokens(
+        {static_cast<std::int32_t>(attention.head_dim),
+         static_cast<std::int32_t>(attention.num_attention_heads),
+         static_cast<std::int32_t>(attention.num_key_value_heads)}));
+    return requested < wave ? requested : requested / wave * wave;
+}
+
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options) {
@@ -889,7 +904,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .parameters          = &parameters,
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
-        .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
+        .prefill_chunk       = effective_prefill_chunk(parameters, options),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
         .kv_storage          = options.kv_cache,

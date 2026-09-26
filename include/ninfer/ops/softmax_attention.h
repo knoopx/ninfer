@@ -155,6 +155,15 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 /**
+ * Return the prompt-route width granule of one registered head geometry on the current device.
+ * A single-sequence call whose width is a multiple of the granule launches whole waves of prompt
+ * CTAs, so a caller that splits a long prompt into such calls leaves no SM idle behind a partial
+ * wave. The granule is a positive multiple of 128 tokens.
+ */
+[[nodiscard]] std::int32_t
+causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry);
+
+/**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
  * head geometry, cache dtype, and execution envelope are fixed implementation-profile inputs.
  * Invalid profiles or intervals throw; an interval containing only prompt routes returns zero.

@@ -14,6 +14,10 @@ namespace ninfer::ops::detail {
 
 enum class CausalAttentionRoute { SmallT, ChunkedSmallT, Prompt };
 
+// The widest prompt-route row block (the eight-warp fast INT8 kernel); every prompt kernel's row
+// block divides it.
+inline constexpr std::int32_t kPromptWaveRows = 128;
+
 struct CausalSmallTInvocation {
     const Tensor* valid_columns = nullptr;
     const Tensor* table_rows    = nullptr;
