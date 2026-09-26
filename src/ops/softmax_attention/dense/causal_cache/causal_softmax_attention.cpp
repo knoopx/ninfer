@@ -1,6 +1,7 @@
 // ninfer::ops - causal cached Softmax Attention validation and finite route dispatch.
 #include "ninfer/ops/softmax_attention.h"
 
+#include "core/device.h" // CUDA_CHECK
 #include "core/layout.h"
 #include "core/paged_kv_storage.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/plan.h"
@@ -28,6 +29,10 @@ constexpr std::int32_t kHeadDim             = 256;
 constexpr float kExpectedScale              = 0.0625f;
 constexpr std::int32_t kMaximumVerifyTokens = 16;
 constexpr std::int32_t kMaximumBatchSize    = 8;
+// Max live visible keys a single-pass prompt covers per chunk count before the dispatch
+// falls back to chunked small-T: two chunks (width <= 12) vs three chunks (width > 12).
+constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
+constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
@@ -261,6 +266,72 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
 
 } // namespace
 
+namespace detail {
+
+enum class CausalAttentionRoute { SmallT, ChunkedSmallT, Prompt };
+
+CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
+                                                    std::int32_t batch_size, KvCacheStorage storage,
+                                                    CausalAttentionExecutionEnvelope envelope) {
+    if (q_heads == 24 && width <= kMaximumVerifyTokens) {
+        if (batch_size == 1) {
+            std::uint32_t prompt_limit = 0;
+            switch (storage) {
+            case KvCacheStorage::BFloat16:
+                prompt_limit = width <= 4 ? 128 : width <= 8 ? 256 : 640;
+                break;
+            case KvCacheStorage::Int8Group64:
+                prompt_limit = width <= 8 ? 0 : 256;
+                break;
+            case KvCacheStorage::Fp8E4M3Row256:
+                prompt_limit = width <= 4 ? 0 : width <= 8 ? 128 : 320;
+                break;
+            case KvCacheStorage::Nvfp4Group16:
+                prompt_limit = width <= 8 ? 0 : 256;
+                break;
+            case KvCacheStorage::Fp8KeyNvfp4Value:
+                prompt_limit = width <= 4 ? 0 : width <= 8 ? 128 : 320;
+                break;
+            }
+            if (envelope.max_visible_keys <= prompt_limit) return CausalAttentionRoute::Prompt;
+        }
+        return width <= 8 ? CausalAttentionRoute::SmallT : CausalAttentionRoute::ChunkedSmallT;
+    }
+    if (width <= 6) return CausalAttentionRoute::SmallT;
+    if (batch_size > 1) return CausalAttentionRoute::ChunkedSmallT;
+    const std::uint32_t prompt_visible_keys =
+        width <= 12 ? kTwoChunkPromptVisibleKeys : kThreeChunkPromptVisibleKeys;
+    if (q_heads == 16 && width <= kMaximumVerifyTokens &&
+        envelope.max_visible_keys > prompt_visible_keys)
+        return CausalAttentionRoute::ChunkedSmallT;
+    return CausalAttentionRoute::Prompt;
+}
+
+const char* causal_attention_route_name(CausalAttentionRoute route) {
+    switch (route) {
+    case CausalAttentionRoute::SmallT:
+        return "small_t";
+    case CausalAttentionRoute::ChunkedSmallT:
+        return "chunked_small_t";
+    case CausalAttentionRoute::Prompt:
+        return "prompt";
+    }
+    return "unknown";
+}
+
+} // namespace detail
+
+std::int32_t causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry) {
+    require_causal_geometry(geometry, "causal_softmax_attention prompt wave");
+    int device          = 0;
+    int multiprocessors = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device));
+    // Every prompt kernel runs one CTA per SM over at most kInt8PromptWaveRows query rows of one
+    // head, and kInt8PromptWaveRows is a multiple of every prompt kernel's row block.
+    const std::int32_t row_blocks = std::max(1, multiprocessors / geometry.query_heads);
+    return row_blocks * detail::kInt8PromptWaveRows;
+}
 std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
     CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_width,

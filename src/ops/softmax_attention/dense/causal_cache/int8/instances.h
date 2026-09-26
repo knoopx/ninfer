@@ -17,6 +17,6 @@ struct Int8KvGroupedInstance {
     using Merge                     = Int8KvMergeSchedule<G::QHeads == 24 ? 256 : 64>;
 };
 
-using Int8KvTiledInstance = Int8KvTiledMmaSchedule<64, 64, 128>;
+using Int8KvTiledInstance = Int8KvFastMmaSchedule<8>;
 
 } // namespace ninfer::ops::detail

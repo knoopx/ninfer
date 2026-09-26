@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/paged_kv_cache.h"
 #include "ops/softmax_attention/common/causal_geometry.h"
 
 namespace ninfer::ops::detail {
@@ -17,33 +18,33 @@ struct Int8KvGroupedMmaSchedule {
     static constexpr int kArenaBytes    = 4 * KeyTile * 256;
 };
 
-// One QK warp per row tile; four PV warps split the output D axis.
-template <int QueryTile = 64, int KeyTile = 64, int MaxRegisters = 120>
-struct Int8KvTiledMmaSchedule {
-    static_assert(QueryTile == 16 || QueryTile == 32 || QueryTile == 64);
-    static_assert(KeyTile == 32 || KeyTile == 64);
-    static_assert(MaxRegisters > 0 && MaxRegisters <= 255);
-    static constexpr int kQueryRows       = QueryTile;
-    static constexpr int kKeyRows         = KeyTile;
-    static constexpr int kRowTiles        = QueryTile / 16;
-    static constexpr int kDConsumers      = 4;
-    static constexpr int kWarps           = kRowTiles * kDConsumers;
-    static constexpr int kThreads         = kWarps * 32;
-    static constexpr int kProducerWarps   = kRowTiles;
-    static constexpr int kProducerThreads = kProducerWarps * 32;
-    static constexpr int kMaxRegisters    = MaxRegisters;
-    static constexpr int kQBytes          = QueryTile * 256;
-    static constexpr int kQScaleBytes     = QueryTile * 4 * 4;
-    static constexpr int kKBytes          = KeyTile * 256;
-    static constexpr int kVBytes          = KeyTile * 256;
-    static constexpr int kVStageBytes     = KeyTile * 256 * 2;
-    static constexpr int kPBytes          = QueryTile * KeyTile * 2;
-    static constexpr int kScaleBytes      = 2 * KeyTile * 4 * 2;
-    static constexpr int kStatsBytes      = 2 * QueryTile * 4;
-    static constexpr int kSharedBytes = kQBytes + kQScaleBytes + kKBytes + kVBytes + kVStageBytes +
-                                        kPBytes + kScaleBytes + kStatsBytes;
-    static_assert(kSharedBytes <= 99 * 1024);
+// Fast INT8 prompt schedule: each warp owns 16 query rows of one head for the whole key sweep,
+// so scores, probabilities and the D256 output accumulator never leave registers. Eight warps
+// fill an SM's register file; four serve launches too narrow to occupy every SM with 128-row
+// CTAs. K and V codes are double-buffered as raw INT8 pages (one 64-key page per tile).
+inline constexpr int kInt8FastBc        = 64;
+inline constexpr int kInt8FastGroupSize = 64; // INT8 G64 codec group
+inline constexpr int kInt8FastGroups    = kCausalHeadDim / kInt8FastGroupSize;
+inline constexpr int kInt8FastTileBytes   = kInt8FastBc * kCausalHeadDim;
+inline constexpr int kInt8FastScaleBytes  = kInt8FastBc * kInt8FastGroups * 2;
+inline constexpr int kInt8FastStageBytes  = 2 * kInt8FastTileBytes + 2 * kInt8FastScaleBytes;
+
+// A 64-key FP16 partial is bounded by 64 * 127 * max_scale (every probability is at most one).
+// Keeping max_scale at or below 8 leaves that bound, with FP16 rounding slack, under 65504.
+inline constexpr float kInt8FastF16PartialScaleLimit = 8.0f;
+
+template <int Warps>
+struct Int8KvFastMmaSchedule {
+    static_assert(Warps == 4 || Warps == 8);
+    static constexpr int Threads   = Warps * 32;
+    static constexpr int Br        = Warps * 16;
+    static constexpr int QBytes    = Br * kCausalHeadDim;
+    static constexpr int SmemBytes = QBytes + 2 * kInt8FastStageBytes;
 };
+
+static_assert(kInt8FastBc == kPagedKVPageSize);
+static_assert(kInt8FastGroups == 4);
+static_assert(Int8KvFastMmaSchedule<8>::SmemBytes == 100352);
 
 template <int DChunk>
 struct Int8KvMergeSchedule {
