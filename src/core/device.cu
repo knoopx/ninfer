@@ -157,6 +157,13 @@ DeviceExecutionView DeviceContext::execution_view() const noexcept {
 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }
 
+std::size_t DeviceContext::free_bytes() const {
+    std::size_t free  = 0;
+    std::size_t total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free, &total));
+    return free;
+}
+
 const char* DeviceContext::sync_mode() const {
     bind_to_current_thread();
     unsigned int flags    = 0;

@@ -617,6 +617,9 @@ public:
     // First Main KV execution row of the decision path's own row block, above the Generation
     // lanes' rows; 0 when decision scoring is disabled. Assigned once from the planned table.
     std::uint32_t decision_row_base_ = 0;
+    // Free Device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
+    // launch of every executable), for comparison with graph_allowance_bytes.
+    std::size_t graph_measured_bytes = 0;
     const WorkspacePlan workspace_plan;
 
     DeviceArena persistent;
