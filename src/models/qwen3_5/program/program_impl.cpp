@@ -76,6 +76,30 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
     }
+    if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None) ||
+        replay_fold.has_value() != replay_records.has_value()) {
+        throw std::logic_error("ReplaySSM records do not match the sequence plan");
+    }
+    if (plan.persistent.round.mtp_decode) {
+        const std::vector<std::uint32_t> ladder = mtp_draft_ladder(draft_window);
+        mtp_rungs.reserve(ladder.size());
+        for (const std::uint32_t k : ladder) {
+            MtpRung& rung = mtp_rungs.emplace_back();
+            rung.k        = k;
+            rung.frame    = qwen3_5::MtpDecodeState(backing, *plan.persistent.round.mtp_decode,
+                                                    plan.persistent.round.spec.batch_capacity, k);
+            rung.records  = replay_records->with_width(static_cast<std::int32_t>(k + 1U));
+            rung.fold.emplace(rung.records, state_images->linear().all_layers_view());
+        }
+        // Until startup measures the graphs, every rung is assumed to cost a base round plus a
+        // fifth of it per drafted token; this is also the model an eager (graph-free) run keeps.
+        std::vector<double> prior(ladder.size());
+        for (std::size_t rung = 0; rung < ladder.size(); ++rung) {
+            prior[rung] = 1.0 + 0.2 * static_cast<double>(ladder[rung]);
+        }
+        mtp_policy     = MtpDraftPolicy(ladder, std::move(prior));
+        mtp_round_rung = mtp_policy.initial_rung();
+    }
     if (plan.persistent.dflash) {
         auto* local = state_images->dflash_local();
         if (!local) { throw std::logic_error("DFlash StateImage has no local state"); }

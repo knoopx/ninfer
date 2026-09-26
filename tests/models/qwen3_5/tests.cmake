@@ -104,3 +104,7 @@ set_tests_properties(
   ninfer_qwen3_5_context_store_test
   ninfer_qwen3_5_visual_scatter_test
   PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+
+ninfer_add_test(ninfer_qwen3_5_mtp_draft_policy_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_draft_policy.cpp"
+  LIBRARIES ninfer_model_runtime)

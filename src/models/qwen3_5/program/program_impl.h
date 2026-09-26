@@ -10,6 +10,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/speculative/mtp_draft_policy.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_address_space.h"
@@ -155,7 +156,9 @@ struct SequenceState {
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
-    bool tail_hidden_valid        = false;
+    // How far this sequence's drafts get accepted; steers the draft length of its rounds.
+    MtpAcceptanceEstimate mtp_acceptance;
+    bool tail_hidden_valid = false;
     bool endpoint_valid           = false;
 };
 
@@ -363,8 +366,21 @@ public:
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
     std::vector<CheckpointSlot> checkpoints;
 
+    // One MTP draft length: its decode frame over the shared round-state backing and the graph
+    // family captured at that length.
+    struct MtpRung {
+        std::uint32_t k = 0;
+        qwen3_5::MtpDecodeState frame;
+        // ReplaySSM records and their fold at this round's width of k + 1 columns.
+        GdnReplayRecords records;
+        std::optional<ops::GdnReplayFoldPlan> fold;
+        DecodeGraphFamily graphs;
+    };
     DecodeGraphFamily ordinary_graphs;
-    DecodeGraphFamily mtp_graphs;
+    std::vector<MtpRung> mtp_rungs;
+    MtpDraftPolicy mtp_policy;
+    // Rung of the MTP round in flight, read by the commit that follows it.
+    std::size_t mtp_round_rung = 0;
     DecodeGraphFamily dflash_graphs;
 
     std::optional<PinnedHostBuffer> round_host;
