@@ -4,6 +4,7 @@
 #include <string_view>
 
 int run_softmax_attention_causal_cache_tests(std::optional<ninfer::KvCacheStorage> storage);
+int run_softmax_attention_int8_prompt_tests();
 int run_softmax_attention_plain_and_packed_tests();
 int run_softmax_attention_context_tests();
 
@@ -20,13 +21,15 @@ int main(int argc, char** argv) {
                 storage     = name == "all" ? std::nullopt
                                             : std::optional(ninfer::test::parse_kv_cache_storage(name));
                 causal_only = true;
+            } else if (argument == "--int8-prompt-only") {
+                return run_softmax_attention_int8_prompt_tests();
             } else
                 throw std::invalid_argument("invalid attention test option");
         }
     } catch (const std::exception& error) {
         std::cerr << error.what()
                   << "\nusage: ninfer_softmax_attention_test [--causal-only] "
-                     "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|all]\n";
+                     "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|all] [--int8-prompt-only]\n";
         return 2;
     }
     const int causal = run_softmax_attention_causal_cache_tests(storage);

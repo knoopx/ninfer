@@ -108,9 +108,9 @@ void execute_parallel(const CausalAttentionOperands& p, Int8KvReadView cache,
 
 void tiled(const CausalAttentionOperands& p, Int8KvReadView cache, cudaStream_t stream) {
     if (p.query_heads == 24)
-        launch_int8_kv_tiled_mma<CausalD256H24Kv4, Int8KvTiledInstance>(p, cache, stream);
+        launch_int8_kv_tiled_mma_fast<CausalD256H24Kv4>(p, cache, stream);
     else
-        launch_int8_kv_tiled_mma<CausalD256H16Kv2, Int8KvTiledInstance>(p, cache, stream);
+        launch_int8_kv_tiled_mma_fast<CausalD256H16Kv2>(p, cache, stream);
 }
 
 } // namespace

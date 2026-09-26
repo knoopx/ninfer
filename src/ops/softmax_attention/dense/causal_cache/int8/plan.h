@@ -2,10 +2,18 @@
 
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/softmax_attention/common/causal_partition.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/schedule.cuh"
 
 namespace ninfer::ops::detail {
 
 enum class Int8KvFamily { Grouped, ParallelGrouped, Tiled };
+
+// Widest prompt-route row block (the eight-warp fast INT8 kernel's Br); every prompt
+// kernel's row block divides it. Consumed by causal_softmax_attention_prompt_wave_tokens.
+inline constexpr std::int32_t kInt8PromptWaveRows = 128;
+
+static_assert(kInt8PromptWaveRows == Int8KvFastMmaSchedule<8>::Br);
+static_assert(kInt8PromptWaveRows % Int8KvFastMmaSchedule<4>::Br == 0);
 
 struct Int8KvCausalPlan {
     static constexpr int kTokenTile = 8;
