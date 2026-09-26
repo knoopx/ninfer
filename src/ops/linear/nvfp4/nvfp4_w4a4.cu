@@ -2,6 +2,7 @@
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 
@@ -31,19 +32,20 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4W4a4Works
     // error and into a runtime message.
     if constexpr (ActivationGeometry::kGroupsPerRow % kNvfp4ScaleTileGroups == 0) {
         if (layout == Nvfp4ScaleLayout::Tiled) {
-            nvfp4_w4a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::Tiled>
-                <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales, tokens,
-                                                  written_tokens, weight.input_scale_divisor);
-            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(pdl::launch_consumer(
+                {dim3(blocks), dim3(kThreads), 0, stream},
+                nvfp4_w4a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::Tiled>,
+                input, workspace.codes, workspace.scales, tokens, written_tokens,
+                weight.input_scale_divisor));
             return;
         }
     } else if (layout == Nvfp4ScaleLayout::Tiled) {
         throw std::invalid_argument("nvfp4 W4A4 tiled scales need K groups in whole tiles");
     }
-    nvfp4_w4a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor>
-        <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales, tokens,
-                                          written_tokens, weight.input_scale_divisor);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(blocks), dim3(kThreads), 0, stream},
+        nvfp4_w4a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor>, input,
+        workspace.codes, workspace.scales, tokens, written_tokens, weight.input_scale_divisor));
 }
 
 } // namespace

@@ -1,5 +1,6 @@
 #pragma once
 #include "ops/common/dflash_rope.cuh"
+#include "core/pdl.cuh"
 #include "ops/rmsnorm_rope/d128.cuh"
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -12,6 +13,7 @@ __global__ __launch_bounds__(256) void rmsnorm_rope_d128_kernel(
     const std::int32_t* __restrict__ positions, const __nv_bfloat16* __restrict__ q_norm,
     const __nv_bfloat16* __restrict__ k_norm, __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ k) {
+    pdl::enter();
     constexpr int kPairs = 64;
     const int token      = blockIdx.x;
     const bool query     = Pair && blockIdx.y < 4;

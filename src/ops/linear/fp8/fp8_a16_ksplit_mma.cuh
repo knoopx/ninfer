@@ -7,6 +7,7 @@
 // once to the complete FP32 dot product. The public activation is never quantized.
 
 #include "ops/common/mma.cuh"
+#include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
 #include "ops/linear/fp8/fp8_config.h"
@@ -108,6 +109,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ks
     float accumulators[kTokenMmas][4] = {};
 
     stage_codes(0);
+    pdl::enter_streaming();
     stage_activation(0);
     cp_commit();
     cp_wait<0>();
@@ -154,6 +156,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ks
         }
     }
 
+    pdl::trigger_dependents();
     __syncthreads();
     auto* partial = shared.partial;
     if ((warp & 1) != 0) {

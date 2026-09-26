@@ -1,5 +1,6 @@
 #include "ops/linear/bf16/bf16_shapes.h"
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/token_slices.h"
 #include "ops/linear/bf16/bf16_n256_k5120.cuh"
 
@@ -14,8 +15,9 @@ void launch_chunk(const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bflo
         cudaFuncSetAttribute(bf16_n256_k5120_mma_kernel<Schedule>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
     CUDA_CHECK(attr);
-    bf16_n256_k5120_mma_kernel<Schedule>
-        <<<grid, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(x, weight, out, tokens);
+    CUDA_CHECK(
+        pdl::launch_consumer({dim3(grid), dim3(Schedule::kThreads), Schedule::kSharedBytes, stream},
+                             bf16_n256_k5120_mma_kernel<Schedule>, x, weight, out, tokens));
     CUDA_CHECK(cudaGetLastError());
 }
 

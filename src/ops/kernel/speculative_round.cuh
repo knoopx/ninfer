@@ -7,6 +7,7 @@
 // pipeline and caller-owned workspace. Sparse acceptance and emission use one warp per request.
 
 #include "ops/kernel/sampling_device.cuh"
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 
@@ -23,6 +24,7 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
                                                          const std::int32_t* current_extents,
                                                          std::int32_t* verify_ids,
                                                          std::int32_t* positions, std::int32_t k) {
+    pdl::enter();
     const int row = static_cast<int>(blockIdx.y);
     const int T   = k + 1;
     int extent    = current_extents[row];
@@ -386,6 +388,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
     std::int32_t cols, std::int32_t k, SamplingWorkspace workspace,
     std::size_t workspace_row_stride) {
+    pdl::enter();
     const int row     = static_cast<int>(blockIdx.z);
     const int col     = static_cast<int>(blockIdx.y);
     const int partial = static_cast<int>(blockIdx.x);
@@ -462,6 +465,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     std::int32_t* licensed_counts, std::int32_t* accepted, const SamplingConfig* configs,
     std::int32_t token_domain, std::int32_t cols, std::int32_t partial_blocks,
     std::int32_t group_count, SamplingWorkspace workspace, std::size_t workspace_row_stride) {
+    pdl::enter();
     const int row   = static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
     const int col   = static_cast<int>(blockIdx.y);
@@ -690,6 +694,7 @@ __global__ void speculative_select_accepted_hidden_kernel(const __nv_bfloat16* h
                                                           const std::int32_t* selectors,
                                                           __nv_bfloat16* out, std::int32_t rows,
                                                           std::int32_t cols) {
+    pdl::enter();
     const int batch = static_cast<int>(blockIdx.y);
     const int row   = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) { return; }

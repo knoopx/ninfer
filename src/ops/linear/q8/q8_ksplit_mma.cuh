@@ -9,6 +9,7 @@
 // optional caller epilogue may instead consume the FP32 tile.
 
 #include "ops/common/mma.cuh"
+#include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/q8/q8_ksplit_config.h"
 #include "ops/linear/q8/q8_rowsplit_output.cuh"
@@ -199,6 +200,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
     }
 
     stage_codes(0);
+    pdl::enter_streaming();
     stage_x(0);
     cp_commit();
     cp_wait<0>();
@@ -286,6 +288,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
         }
     }
 
+    pdl::trigger_dependents();
     __syncthreads();
     auto* partial = shared.partial;
     if ((k_split & 1) != 0) {

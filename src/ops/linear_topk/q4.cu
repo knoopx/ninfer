@@ -2,6 +2,7 @@
 #include "ops/linear_topk/linear_topk_launch.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/score_id_order.cuh"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 
@@ -47,12 +48,13 @@ void launch_ksplit(const Tensor& hidden, const Weight& head, const Tensor& row_t
     const Q4KSplitTopKOutput output{static_cast<std::uint64_t*>(workspace.partial_keys.data),
                                     static_cast<const std::int32_t*>(row_to_global_ids.data),
                                     workspace.producer_groups, hidden.ne[1]};
-    q4_ksplit_mma_kernel<Geometry, kTileColumns, Capacity, Q4KSplitTopKOutput,
-                          Q4KSplitIdentityRows, true>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(hidden.data),
-                                                     static_cast<const std::uint8_t*>(head.qdata),
-                                                     static_cast<const std::uint8_t*>(head.scales),
-                                                     nullptr, output, Q4KSplitIdentityRows{}, hidden.ne[1]);
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        q4_ksplit_mma_kernel<Geometry, kTileColumns, Capacity, Q4KSplitTopKOutput,
+                             Q4KSplitIdentityRows, true>,
+        static_cast<const __nv_bfloat16*>(hidden.data),
+        static_cast<const std::uint8_t*>(head.qdata), static_cast<const std::uint8_t*>(head.scales),
+        nullptr, output, Q4KSplitIdentityRows{}, hidden.ne[1]));
     CUDA_CHECK(cudaGetLastError());
 }
 

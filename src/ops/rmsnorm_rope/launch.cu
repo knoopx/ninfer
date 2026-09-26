@@ -1,6 +1,7 @@
 #include "ops/rmsnorm_rope/launch.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/rmsnorm_rope/kernel.cuh"
 
 #include <cstdint>
@@ -12,12 +13,13 @@ template <bool Pair>
 void launch_fixed(const Tensor& positions, const Tensor* q_norm_weight, const Tensor& k_norm_weight,
                   Tensor* q, Tensor& k, std::int32_t tokens, cudaStream_t stream) {
     const dim3 grid(tokens, Pair ? 5 : 1);
-    rmsnorm_rope_d128_kernel<Pair><<<grid, 256, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(grid), dim3(256), 0, stream}, rmsnorm_rope_d128_kernel<Pair>,
         static_cast<const std::int32_t*>(positions.data),
         q_norm_weight == nullptr ? nullptr : static_cast<const __nv_bfloat16*>(q_norm_weight->data),
         static_cast<const __nv_bfloat16*>(k_norm_weight.data),
         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
-        static_cast<__nv_bfloat16*>(k.data));
+        static_cast<__nv_bfloat16*>(k.data)));
 }
 
 } // namespace

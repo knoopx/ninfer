@@ -5,6 +5,7 @@
 // and reduce FP32 fragments in shared memory before the final BF16 store.
 
 #include "ops/common/math.h"
+#include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 
@@ -47,6 +48,7 @@ template <class Schedule>
 __global__ __launch_bounds__(Schedule::kThreads, 1) void bf16_n256_k5120_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ out, std::int32_t tokens) {
+    pdl::enter();
     constexpr int kRows       = 256;
     constexpr int kHidden     = 5120;
     constexpr int kMmaRows    = 16;

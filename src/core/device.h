@@ -38,8 +38,13 @@ struct DeviceContext {
     int multiprocessor_count() const noexcept;
     DeviceExecutionView execution_view() const noexcept;
     std::size_t total_vram() const noexcept;
+    // Device memory currently free on this device (cudaMemGetInfo).
+    std::size_t free_bytes() const;
     const char* sync_mode() const;
     void synchronize() const;
+    // Submits queued work without waiting for it. On a batched driver model (WDDM) a launch can
+    // otherwise sit in the command buffer until the next blocking call or launch.
+    void flush() const;
 };
 
 class CudaEventTimer {

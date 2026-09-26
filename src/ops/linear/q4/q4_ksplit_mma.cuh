@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/mma.cuh"
+#include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
@@ -149,6 +150,7 @@ __launch_bounds__(256, 6) __global__
     float acc[kNt][4]   = {};
 
     stage_weight(0);
+    pdl::enter_streaming();
     stage_x(0);
     cp_commit();
     cp_wait<0>();
@@ -198,6 +200,7 @@ __launch_bounds__(256, 6) __global__
         }
     }
 
+    pdl::trigger_dependents();
     __syncthreads();
     auto* partial = shared.partial;
     if ((k_split & 1) != 0) {

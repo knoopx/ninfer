@@ -6,6 +6,7 @@
 // consumers retain their observable semantics without duplicating the contraction.
 
 #include "ops/linear/fp8/fp8_gemv.cuh"
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 
@@ -91,6 +92,8 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int row_begin = row_block * kStoredRowsPerCta + warp * kStoredRowsPerWarp;
     float accumulators[Schedule::kRowsPerWarp][Schedule::kTokenTile][Schedule::kAccumulatorChains] =
         {};
+
+    pdl::enter_streaming();
 
 #pragma unroll Schedule::kPhaseUnroll
     for (int phase = 0; phase < kPhases; ++phase) {
@@ -179,6 +182,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         }
     }
 
+    pdl::trigger_dependents();
     if constexpr (Finalization == Fp8SimtFinalization::RowVector) {
         static_assert(!PairRows, "row-vector finalization does not pair output rows");
         static_assert(Schedule::kTokenTile == ActiveTokens,

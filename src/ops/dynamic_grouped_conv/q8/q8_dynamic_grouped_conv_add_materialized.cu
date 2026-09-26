@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_kernels.h"
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/q8/q8_ksplit_config.h"
 #include "ops/linear/q8/q8_launch.h"
 #include "ops/linear/q8/q8_rowsplit_output.cuh"
@@ -52,13 +53,13 @@ void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
     const int columns = x.ne[1];
     Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kRows};
     const dim3 grid(kRows / 16, (columns + TileColumns - 1) / TileColumns);
-    q8_ksplit_mma_kernel<Geometry, TileColumns, Schedule, Q8ContiguousOutput, Q8KSplitStoreEpilogue,
-                         Q8KSplitIdentityRows, false, true>
-        <<<grid, Schedule::kThreads, SharedBytes, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitStoreEpilogue{},
-            Q8KSplitIdentityRows{}, columns);
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(grid), dim3(Schedule::kThreads), SharedBytes, stream},
+        q8_ksplit_mma_kernel<Geometry, TileColumns, Schedule, Q8ContiguousOutput,
+                             Q8KSplitStoreEpilogue, Q8KSplitIdentityRows, false, true>,
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitStoreEpilogue{},
+        Q8KSplitIdentityRows{}, columns));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -73,6 +74,7 @@ constexpr auto mlp       = make_launchers<17408>(std::make_index_sequence<11>{})
 
 __global__ void finish_kernel(const __nv_bfloat16* projected, const __nv_bfloat16* base,
                               const __nv_bfloat16* delta, __nv_bfloat16* residual, int width) {
+    pdl::enter();
     const int row = blockIdx.x * blockDim.x + threadIdx.x, col = blockIdx.y;
     if (row >= kRows) return;
     const int index = col * kRows + row;
@@ -98,10 +100,11 @@ void materialized(Q8DynamicConvAddSchedule schedule, const Tensor& x, const Weig
         break;
     }
     const dim3 grid((kRows + 255) / 256, tokens);
-    finish_kernel<<<grid, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(projected.data),
-                                            static_cast<const __nv_bfloat16*>(base.data),
-                                            static_cast<const __nv_bfloat16*>(delta.data),
-                                            static_cast<__nv_bfloat16*>(residual.data), x.ne[1]);
+    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(256), 0, stream}, finish_kernel,
+                                    static_cast<const __nv_bfloat16*>(projected.data),
+                                    static_cast<const __nv_bfloat16*>(base.data),
+                                    static_cast<const __nv_bfloat16*>(delta.data),
+                                    static_cast<__nv_bfloat16*>(residual.data), x.ne[1]));
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace

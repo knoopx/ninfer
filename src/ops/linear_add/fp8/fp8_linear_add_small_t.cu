@@ -2,6 +2,7 @@
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_output.cuh"
 #include "ops/linear/fp8/fp8_simt.cuh"
@@ -36,12 +37,15 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaS
     constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
     auto* output              = static_cast<__nv_bfloat16*>(residual.data);
-    fp8_simt_kernel<Geometry, ActiveTokens, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const __nv_bfloat16*>(weight.scales),
-        Fp8ContiguousOutput{output, Geometry::kOutputRows},
-        Fp8AddResidualEpilogue{output, Geometry::kOutputRows});
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer({dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+                                    fp8_simt_kernel<Geometry, ActiveTokens, Schedule,
+                                                    Fp8ContiguousOutput, Fp8AddResidualEpilogue>,
+                                    static_cast<const __nv_bfloat16*>(x.data),
+                                    static_cast<const std::uint8_t*>(weight.qdata),
+                                    static_cast<const __nv_bfloat16*>(weight.scales),
+                                    Fp8ContiguousOutput{output, Geometry::kOutputRows},
+                                    Fp8AddResidualEpilogue{output, Geometry::kOutputRows},
+                                    Fp8GemvIdentityRows{}, ActiveTokens));
 }
 
 template <class Geometry, std::size_t... Offsets>

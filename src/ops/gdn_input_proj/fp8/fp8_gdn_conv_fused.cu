@@ -2,6 +2,7 @@
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/gdn_input_proj/gdn_conv_output.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_gemv.cuh"
@@ -37,15 +38,15 @@ void launch_small_t(const Tensor& x, const Weight& weight, const Tensor& conv_we
     static_assert(Schedule::kTokenTile == ActiveTokens);
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     using Output          = GdnConvOutput<ActiveTokens, Publish>;
-    fp8_simt_kernel<Geometry, ActiveTokens, Schedule, Output, Fp8IdentityEpilogue,
-                    Fp8GemvIdentityRows, false, Fp8SimtFinalization::RowVector>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const __nv_bfloat16*>(weight.scales),
-            make_gdn_conv_output<ActiveTokens>(conv_weight, conv_states, valid_columns,
-                                               initial_slot, query, key, value, z, publish));
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        fp8_simt_kernel<Geometry, ActiveTokens, Schedule, Output, Fp8IdentityEpilogue,
+                        Fp8GemvIdentityRows, false, Fp8SimtFinalization::RowVector>,
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const __nv_bfloat16*>(weight.scales),
+        make_gdn_conv_output<ActiveTokens>(conv_weight, conv_states, valid_columns, initial_slot,
+                                           query, key, value, z, publish),
+        Fp8IdentityEpilogue{}, Fp8GemvIdentityRows{}, ActiveTokens));
 }
 
 template <int ActiveTokens>

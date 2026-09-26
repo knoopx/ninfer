@@ -32,12 +32,13 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
     };
 
     static_assert(Schedule::kSharedBytes <= 48 * 1024);
-    fp8_mma_kernel<Geometry, Schedule, FullTokens>
-        <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
-            workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const __nv_bfloat16*>(weight.scales), tokens, Fp8IdentityEpilogue{},
-            output);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(blocks), dim3(Schedule::kThreads), Schedule::kSharedBytes, stream},
+        fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue,
+                       Fp8AttentionInputOutput>,
+        workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const __nv_bfloat16*>(weight.scales), tokens, Fp8IdentityEpilogue{}, output,
+        Fp8MmaIdentityRows{}));
 }
 
 template <class Schedule>

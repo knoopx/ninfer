@@ -2,6 +2,7 @@
 #include "ops/attn_input_proj/q8/q8_attn_input_kernels.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/q8/q8_ksplit_config.h"
@@ -43,13 +44,13 @@ void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, T
     const Output output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
                         static_cast<__nv_bfloat16*>(v.data)};
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
-    q8_ksplit_mma_kernel<Geometry, Columns, Schedule, Output, Q8KSplitStoreEpilogue,
-                         Q8KSplitIdentityRows, false, !Exact>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitStoreEpilogue{},
-            Q8KSplitIdentityRows{}, x.ne[1]);
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        q8_ksplit_mma_kernel<Geometry, Columns, Schedule, Output, Q8KSplitStoreEpilogue,
+                             Q8KSplitIdentityRows, false, !Exact>,
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitStoreEpilogue{},
+        Q8KSplitIdentityRows{}, x.ne[1]));
     CUDA_CHECK(cudaGetLastError());
 }
 

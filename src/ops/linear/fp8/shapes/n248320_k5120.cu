@@ -1,5 +1,6 @@
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/fp8/fp8_a16_ksplit_mma.cuh"
@@ -15,12 +16,11 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
     static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const Fp8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
-    fp8_a16_ksplit_mma_kernel<Geometry, ActiveTokens, Schedule, Fp8ContiguousOutput, true>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const __nv_bfloat16*>(weight.scales), output, x.ne[1]);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        fp8_a16_ksplit_mma_kernel<Geometry, ActiveTokens, Schedule, Fp8ContiguousOutput, true>,
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const __nv_bfloat16*>(weight.scales), output, x.ne[1]));
 }
 
 void launch_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {

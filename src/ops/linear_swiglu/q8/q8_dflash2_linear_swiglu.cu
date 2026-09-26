@@ -2,6 +2,7 @@
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_kernels.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/q8/q8_ksplit_config.h"
 #include "ops/linear/q8/q8_rowsplit_output.cuh"
 #include "ops/linear/q8/q8_ksplit_mma.cuh"
@@ -34,11 +35,13 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
     const Q8SwiGluDirectEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
     const RowPolicy row_policy{};
     constexpr int kBlocks = kIntermediate / RowPolicy::kOutputRowsPerCta;
-    q8_ksplit_mma_kernel<Geometry, Capacity, Schedule, Q8ContiguousOutput, Q8SwiGluDirectEpilogue,
-                         RowPolicy, true, true><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(kBlocks), dim3(Schedule::kThreads), 0, stream},
+        q8_ksplit_mma_kernel<Geometry, Capacity, Schedule, Q8ContiguousOutput,
+                             Q8SwiGluDirectEpilogue, RowPolicy, true, true>,
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue, row_policy,
-        x.ne[1]);
+        x.ne[1]));
     CUDA_CHECK(cudaGetLastError());
 }
 

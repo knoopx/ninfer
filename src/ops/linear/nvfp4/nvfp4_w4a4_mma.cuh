@@ -4,6 +4,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
+#include "core/pdl.cuh"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
 
 #include <cuda_bf16.h>
@@ -221,13 +222,23 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     constexpr int kKTiles       = Geometry::kInputRows / Schedule::kBlockK;
     constexpr int kWaitGroups   = kKTiles < Schedule::kStages ? kKTiles - 1 : Schedule::kStages - 1;
 
+    // Weights are immutable, so every prologue stage of them is issued before the dependency wait
+    // and streams while a programmatic producer finishes. The first commit group then holds all of
+    // those weight stages with activation stage 0, and group s holds activation stage s, so each
+    // stage is complete when the main loop's wait-group count admits it.
+#pragma unroll
+    for (int stage = 0; stage < Schedule::kStages; ++stage) {
+        if (stage < kKTiles) {
+            stage_nvfp4_w4a4_weight<Geometry, Schedule>(weight_codes, weight_scales, shared, stage,
+                                                        stage, row_begin, row_policy);
+        }
+    }
+    pdl::enter_streaming();
 #pragma unroll
     for (int stage = 0; stage < Schedule::kStages; ++stage) {
         if (stage < kKTiles) {
             stage_nvfp4_w4a4_activation<Geometry, Schedule>(activation, shared, stage, stage,
                                                             token_begin, tokens);
-            stage_nvfp4_w4a4_weight<Geometry, Schedule>(weight_codes, weight_scales, shared, stage,
-                                                        stage, row_begin, row_policy);
             cp_commit();
         }
     }
@@ -327,6 +338,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
         cp_commit();
     }
 
+    pdl::trigger_dependents();
     const int accumulator_row   = lane >> 2;
     const int accumulator_col   = 2 * (lane & 3);
     constexpr int kOutputStride = Schedule::kBlockN + 8;
@@ -416,6 +428,7 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_w4a4_quantize_ke
     static_assert(Layout == Nvfp4ScaleLayout::RowMajor ||
                   (Geometry::kInputRows / 16) % kNvfp4ScaleTileGroups == 0);
     constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
+    pdl::enter();
     const int task =
         static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
     const int tasks = tokens * kGroupsPerRow;

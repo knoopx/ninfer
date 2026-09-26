@@ -7,6 +7,7 @@
 // output vectors, while the output policy remains replaceable by a fused semantic Op.
 
 #include "ops/common/math.cuh"
+#include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 
@@ -142,10 +143,9 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int row_begin          = row_tile * rows_per_block;
     const int token_begin        = token_tile * BM;
 
-    auto stage_inputs = [&](int stage, int k_tile) {
+    auto stage_activation = [&](int stage, int k_tile) {
         const int k_begin      = k_tile * BK;
         auto* activation_stage = activation_shared + stage * BM * BK;
-        auto* weight_stage     = weight_shared + stage * BN * BK;
 
 #pragma unroll 1
         for (int task = tid; task < BM * Schedule::kSegmentsPerRow; task += THREADS) {
@@ -170,6 +170,11 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                     valid ? 16 : 0);
             }
         }
+    };
+
+    auto stage_weight = [&](int stage, int k_tile) {
+        const int k_begin  = k_tile * BK;
+        auto* weight_stage = weight_shared + stage * BN * BK;
 
 #pragma unroll 1
         for (int task = tid; task < BN * Schedule::kSegmentsPerRow; task += THREADS) {
@@ -185,9 +190,19 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         }
     };
 
+    auto stage_inputs = [&](int stage, int k_tile) {
+        stage_activation(stage, k_tile);
+        stage_weight(stage, k_tile);
+    };
+
+    // Immutable weight stages are issued before the dependency wait; the first commit group then
+    // holds all of them with activation stage 0, and group s holds activation stage s.
+#pragma unroll
+    for (int stage = 0; stage < S; ++stage) { stage_weight(stage, stage); }
+    pdl::enter_streaming();
 #pragma unroll
     for (int stage = 0; stage < S; ++stage) {
-        stage_inputs(stage, stage);
+        stage_activation(stage, stage);
         cp_commit();
     }
 
@@ -285,6 +300,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         }
     }
 
+    pdl::trigger_dependents();
     const int accumulator_token = lane >> 2;
     const int accumulator_row   = 2 * (lane & 3);
     constexpr int output_stride = BN + 8;

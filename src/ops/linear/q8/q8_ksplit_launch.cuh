@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear/q8/q8_ksplit_mma.cuh"
 
 #include <stdexcept>
@@ -18,13 +19,13 @@ void launch_q8_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
         throw std::invalid_argument("q8 K-split: padded K differs from the registered geometry");
     }
     const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
-    q8_ksplit_mma_kernel<Geometry, ColumnCapacity, Schedule, Q8ContiguousOutput, Epilogue,
-                         Q8KSplitIdentityRows, false, true>
-        <<<Geometry::kOutputRows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, Epilogue{},
-            Q8KSplitIdentityRows{}, x.ne[1]);
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(Geometry::kOutputRows / Schedule::kRowsPerCta), dim3(Schedule::kThreads), 0, stream},
+        q8_ksplit_mma_kernel<Geometry, ColumnCapacity, Schedule, Q8ContiguousOutput, Epilogue,
+                             Q8KSplitIdentityRows, false, true>,
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), output, Epilogue{}, Q8KSplitIdentityRows{},
+        x.ne[1]));
     CUDA_CHECK(cudaGetLastError());
 }
 
