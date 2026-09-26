@@ -92,6 +92,12 @@ int main(int argc, char** argv) {
         options.speculative.proposal_head =
             optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
         ninfer::Engine engine(options);
+        if (graph) {
+            const ninfer::MemorySummary memory = engine.memory_summary();
+            require(memory.cuda_graph_measured_bytes != 0 &&
+                        memory.cuda_graph_measured_bytes <= memory.cuda_graph_allowance_bytes,
+                    "CUDA Graph memory exceeds its allowance");
+        }
         const auto prompt = engine.tokenize_text("Count from one to twenty: one, two, three,");
         ninfer::test::speculative_page_boundary(engine);
         const auto first = engine.generate(engine.prepare_tokens(prompt), request(24));

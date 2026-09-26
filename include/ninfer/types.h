@@ -856,6 +856,9 @@ struct MemorySummary {
     std::size_t planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
+    // Device memory CUDA Graph preparation actually took at startup (free memory before minus
+    // after instantiating, uploading and launching every executable); 0 without CUDA Graphs.
+    std::size_t cuda_graph_measured_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
     std::uint32_t host_state_capacity_slots       = 0;
     std::uint32_t host_state_occupied_slots       = 0;
