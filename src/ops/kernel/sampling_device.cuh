@@ -363,9 +363,45 @@ sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, s
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, cap);
 }
 
-// Single-block fallback for large columns when the finite multi-block workspace
-// route cannot represent the launch. It still reads each vocab entry once and
-// keeps a bounded per-thread top-20, so it avoids a top_k*vocab global reread.
+// Single-block route for large columns when the finite multi-block workspace
+// route cannot represent the launch: a one-pass bounded per-thread top-cap
+// gather (each thread inserts its strided items into a sorted cap-entry
+// register list) followed by a parallel 2-level warp-ballot head merge of the
+// per-thread lists to the block top-cap. It reads each vocab entry once, so
+// it avoids a top_k*vocab global reread.
+//
+//   Gather: each thread inserts its strided items (adjusted logits) into a
+//     sorted cap-entry register list (value desc, lower-index tie-break).
+//     The all-(-inf) case needs no special handling: the lists hold the
+//     lowest indices (all -inf) and the merge's lower-index tie-break
+//     selects them.
+//   Merge: the 2-level warp-ballot head merge (reusing the ballot idiom of
+//     sampling_store_tile_topk) over the per-thread sorted lists yields the
+//     block top-cap:
+//     Level 1: every warp head-merges its 32 lanes' sorted top-cap lists to
+//       a per-warp top-cap, staged into the caller's merge_val/merge_idx as
+//       bit-preserving (high, low) 32-bit halves of the 64-bit ordering key
+//       (high in the float bits of merge_val, low in merge_idx); no new
+//       shared memory and no caller changes.
+//     Level 2: warp 0 lanes [0, kSamplingTileWarps) head-merge the 8
+//       per-warp lists to the block top-cap; lane 0 decodes each winning key
+//       into cand_val/cand_idx (exact bit round-trip). Thread 0's normalize
+//       reads are its own level-2 writes, so no barrier is needed before
+//       sampling_normalize_support (which ends with its own __syncthreads()).
+// Exactness: the union of the per-thread top-cap lists contains the global
+// top-cap: any global top-cap entry x sits in a thread with at most cap-1
+// entries above x, so it is in that thread's top-cap list. The merge
+// therefore yields the exact top-cap set and ordering (value desc,
+// lower-index tie-break) of the reference bounded-insertion route, so a
+// fixed seed draws a bit-identical token.
+// Safety: ordering keys are unique (the vocab index disambiguates value
+// ties), so each rank's ballot has exactly one winner; a per-lane position
+// advances at most once per rank, so it never exceeds cap-1 during reads
+// (at most cap ranks, cap <= kSamplerFastCandidates); sentinel entries
+// (id == INT_MAX) encode to key 0, which loses to every real entry, and
+// cap <= vocab, so the top-cap is all real entries.
+// Deterministic and CUDA-graph-safe: no atomics, no RNG, no host sync, no
+// mutable device state.
 __device__ inline void sampling_build_truncated_block_fast(
     const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
     float* merge_val, int* merge_idx, float* cand_val, int* cand_idx, float* prob, int* n_support,
@@ -381,34 +417,73 @@ __device__ inline void sampling_build_truncated_block_fast(
         local_idx[j] = INT_MAX;
     }
 
-    const int fast_cap = cap;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    constexpr unsigned int kFullWarpMask = 0xffffffffu;
+
+    // Per-thread bounded top-cap insertion (one pass over the vocab): each
+    // thread inserts its strided items into a sorted cap-entry register list,
+    // so the block top-cap is the union of the per-thread top-cap lists. The
+    // all-(-inf) case needs no special handling: the lists hold the lowest
+    // indices (all -inf) and the merge's lower-index tie-break selects them.
     for (int v = tid; v < vocab; v += blockDim.x) {
-        const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg, overlay,
-                                                overlay_len);
-        sampling_insert_candidate(local_val, local_idx, fast_cap, x, v);
+        const float x =
+            sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg, overlay, overlay_len);
+        sampling_insert_candidate(local_val, local_idx, cap, x, v);
     }
 
-    for (int j = 0; j < kSamplerFastCandidates; ++j) {
-        const int off  = tid * kSamplerFastCandidates + j;
-        merge_val[off] = local_val[j];
-        merge_idx[off] = local_idx[j];
+    // Step 5 (merge): the existing 2-level warp-ballot head merge of the
+    // per-thread sorted lists to the block top-cap.
+    // Level 1: each warp head-merges its 32 lanes' sorted top-cap lists to a
+    // per-warp top-cap and stages the result as (high, low) key halves.
+    int position = 0;
+    for (int rank = 0; rank < cap; ++rank) {
+        const unsigned long long key =
+            sampling_sort_key(local_val[position], local_idx[position]);
+        const unsigned int high     = static_cast<unsigned int>(key >> 32);
+        const unsigned int max_high = __reduce_max_sync(kFullWarpMask, high);
+        const unsigned int low      = high == max_high ? static_cast<unsigned int>(key) : 0u;
+        const unsigned int max_low  = __reduce_max_sync(kFullWarpMask, low);
+        const unsigned int winners  = __ballot_sync(kFullWarpMask, high == max_high && low == max_low);
+        const int source            = __ffs(static_cast<int>(winners)) - 1;
+        if (lane == 0) {
+            // Repurpose the caller's staging arrays: only the first
+            // kSamplingTileWarps * kSamplerFastCandidates slots are used, one
+            // (high, low) key half pair per warp per rank.
+            const int off = warp * kSamplerFastCandidates + rank;
+            merge_val[off] = __uint_as_float(max_high); // bit-preserving
+            merge_idx[off] = static_cast<int>(max_low); // bit-preserving
+        }
+        if (lane == source) { ++position; }
     }
     __syncthreads();
 
-    if (tid == 0) {
-        for (int j = 0; j < cap; ++j) {
-            cand_val[j] = -CUDART_INF_F;
-            cand_idx[j] = INT_MAX;
-        }
-        const int merge_n = blockDim.x * kSamplerFastCandidates;
-        for (int p = 0; p < merge_n; ++p) {
-            const int idx = merge_idx[p];
-            if (idx == INT_MAX) { continue; }
-            sampling_insert_candidate(cand_val, cand_idx, fast_cap, merge_val[p], idx);
+    // Level 2: warp 0 head-merges the 8 per-warp top-cap lists to the block
+    // top-cap; lane 0 decodes each winner (exact bit round-trip).
+    if (warp == 0 && lane < kSamplingTileWarps) {
+        constexpr unsigned int kMergeMask = (1u << kSamplingTileWarps) - 1u;
+        int merge_position                 = 0;
+        for (int rank = 0; rank < cap; ++rank) {
+            const int off = lane * kSamplerFastCandidates + merge_position;
+            const unsigned long long key =
+                (static_cast<unsigned long long>(__float_as_uint(merge_val[off])) << 32) |
+                static_cast<unsigned int>(merge_idx[off]);
+            const unsigned int high     = static_cast<unsigned int>(key >> 32);
+            const unsigned int max_high = __reduce_max_sync(kMergeMask, high);
+            const unsigned int low      = high == max_high ? static_cast<unsigned int>(key) : 0u;
+            const unsigned int max_low  = __reduce_max_sync(kMergeMask, low);
+            const unsigned int winners  = __ballot_sync(kMergeMask, high == max_high && low == max_low);
+            const int source            = __ffs(static_cast<int>(winners)) - 1;
+            if (lane == 0) {
+                const unsigned long long best =
+                    (static_cast<unsigned long long>(max_high) << 32) | max_low;
+                cand_val[rank] = sampling_key_float(best);
+                cand_idx[rank] = sampling_key_index(best);
+            }
+            if (lane == source) { ++merge_position; }
         }
     }
-    __syncthreads();
-    sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, fast_cap);
+    sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, cap);
 }
 
 // thread-0 helper: inverse-CDF pick over a normalized `prob[0..n-1]` support,

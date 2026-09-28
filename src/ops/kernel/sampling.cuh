@@ -83,8 +83,8 @@ __launch_bounds__(kSamplerBlock) __global__
         sampling_build_truncated_small(logits, base, token_domain, cfg, red_val, red_idx, cand_val,
                                        cand_idx, prob, &n_support);
     } else {
-        sampling_build_truncated_block_fast(logits, base, token_domain, cfg, merge_val, merge_idx,
-                                            cand_val, cand_idx, prob, &n_support);
+        sampling_build_truncated_block_fast(logits, base, token_domain, cfg, merge_val,
+                                            merge_idx, cand_val, cand_idx, prob, &n_support);
     }
 
     if (tid != 0) { return; }
