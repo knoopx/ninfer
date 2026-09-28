@@ -22,11 +22,25 @@ enum class LinearPolicy : std::uint8_t {
     A16Only, ///< Admit only A16 compute profiles.
     AllowA8, ///< Admit either A16 or A8 compute profiles.
     AllowA4, ///< Admit A16, A8 or A4 compute profiles.
+    /// Admit either A16 or integer-A8 compute profiles. Distinct from AllowA8, which selects the
+    /// FP8 activation path against FP8 weights; this one quantises activations to s8 with one
+    /// scale per weight group and feeds groupwise-int weights (here the PQ2_0/PTQ1_0 ternary route)
+    /// to the integer tensor cores. Held to the same A8 activation allowance.
+    AllowA8Int,
+    /// AllowA8Int plus the integer small-T route at decode and verify widths. Separate because that
+    /// route is a quality trade the prefill one is not asked to carry: it applies s8 activation
+    /// quantisation to every decode step rather than to full prefill tiles only, so it is opt-in.
+    AllowA8IntDecode,
+    /// AllowA8Int plus the cuBLAS prefill route at wide token counts. A further quality trade (the
+    /// integer route carries per-group scales), so it is opt-in and falls back to AllowA8Int below
+    /// the width where it pays.
+    AllowPrefillCublas,
 };
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
-           policy == LinearPolicy::AllowA4;
+           policy == LinearPolicy::AllowA4 || policy == LinearPolicy::AllowA8Int ||
+           policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowPrefillCublas;
 }
 
 [[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
@@ -35,6 +49,12 @@ enum class LinearPolicy : std::uint8_t {
 
 [[nodiscard]] constexpr bool allows_a4(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::AllowA4;
+}
+
+/// Integer-A8 (s8 activation, groupwise-int weight) profiles. Never implies the FP8 A8 path.
+[[nodiscard]] constexpr bool allows_a8_int(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowA8Int || policy == LinearPolicy::AllowA8IntDecode ||
+           policy == LinearPolicy::AllowPrefillCublas;
 }
 
 /**

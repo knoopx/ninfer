@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/math.h"
+#include "ops/linear/ternary/ternary_rowsplit_storage.cuh"
 
 // ninfer::ops - embedding kernels. Dense copies BF16 rows; quantized variants decode only the
 // selected rows into contiguous BF16 output columns.
@@ -245,6 +246,37 @@ __launch_bounds__(256) __global__
             out_pairs[word_index * 2 + pair] = __floats2bfloat162_rn(
                 static_cast<float>(q0) * scale, static_cast<float>(q1) * scale);
         }
+    }
+}
+
+// Prism ternary tables (group 128). One thread decodes one output element: it resolves the
+// source row from the token id, then the 128-weight group that element belongs to, then hands
+// that group's plane pointers to the SAME decode atom the ternary linear path uses -- so the
+// embedding table and the linear weights cannot drift apart. PQ2_0 passes high == nullptr
+// (row_split_geometry reports zero high-plane bytes for it); PTQ1_0 reads qh from the high plane.
+template <class Storage, class Atom>
+__global__ void embed_gather_ternary_kernel(const std::int32_t* ids, const std::uint8_t* codes,
+                                            const std::uint8_t* high, const std::uint8_t* scales,
+                                            __nv_bfloat16* out, std::int32_t d, std::int32_t T,
+                                            std::int32_t padded_d) {
+    const std::int32_t kg     = padded_d / Storage::kGroupK;
+    const std::int64_t n      = static_cast<std::int64_t>(d) * T;
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+
+    for (std::int64_t i = start; i < n; i += stride) {
+        const std::int32_t t    = static_cast<std::int32_t>(i / d);
+        const std::int32_t k    = static_cast<std::int32_t>(i - static_cast<std::int64_t>(t) * d);
+        const std::int32_t row  = ids[t];
+        const std::int32_t g    = k / Storage::kGroupK;
+        const std::int32_t lane = k - g * Storage::kGroupK;
+        const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + g;
+
+        const std::uint8_t* group_codes = codes + group_index * Storage::kCodeBytesPerGroup;
+        const std::uint8_t* group_high =
+            high == nullptr ? nullptr : high + group_index * Storage::kHighBytesPerGroup;
+        const float scale = Atom::load_scale(scales + group_index * Storage::kScaleBytesPerGroup);
+        out[i]            = __float2bfloat16(Atom::decode_one(group_codes, group_high, scale, lane));
     }
 }
 

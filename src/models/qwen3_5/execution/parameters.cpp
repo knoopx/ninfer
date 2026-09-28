@@ -251,6 +251,139 @@ public:
         return out;
     }
 
+public:
+    // Folded (rotated-basis) ternary weights store their activation transform as a sign block
+    // selected by input width, plus the GDN output projection's feature permutation. The sign
+    // table lives on the device (Model::hadamard_signs); attach it to every ternary Weight so the
+    // op layer can map activations into the folded basis. Non-ternary weights are left untouched.
+    Weight& attach(Weight& w) {
+        if (w.qtype != QType::PTQ1_0_G128 && w.qtype != QType::PQ2_0_G128) { return w; }
+        const float* signs = model_.hadamard_signs(w.k);
+        if (signs == nullptr) {
+            throw std::invalid_argument(
+                "folded ternary weight has no sign block for input width " + std::to_string(w.k));
+        }
+        w.hadamard_signs = signs;
+        w.hadamard_n_blk = w.k / 1024;
+        // Only the GDN output projection (input width 6144) stores grouped columns while the
+        // runtime produces tiled v-heads, so it carries the feature permutation P.
+        constexpr std::int32_t kGdnOutputWidth = 6144;
+        constexpr std::int32_t kNv             = 48;
+        constexpr std::int32_t kNk             = 16;
+        if (w.k == kGdnOutputWidth) {
+            w.hadamard_perm_hd  = kGdnOutputWidth / kNv;
+            w.hadamard_perm_nk  = kNk;
+            w.hadamard_perm_rep = kNv / kNk;
+        }
+        return w;
+    }
+
+    ops::SingleProjectionWeight& attach(ops::SingleProjectionWeight& p) {
+        attach(p.weight);
+        return p;
+    }
+
+    ops::PairedProjectionWeights& attach(ops::PairedProjectionWeights& p) {
+        attach(p.first);
+        attach(p.second);
+        return p;
+    }
+
+    ops::ProjectionWeights& attach(ops::ProjectionWeights& p) {
+        std::visit([this](auto& w) { attach(w); }, p);
+        return p;
+    }
+
+    ops::SparseMoeWeights& attach(ops::SparseMoeWeights& w) {
+        attach(w.router_shared_gate);
+        attach(w.routed_gate_up);
+        attach(w.routed_down);
+        attach(w.shared_gate_up);
+        attach(w.shared_down);
+        return w;
+    }
+
+    void attach(DenseParameters& d) {
+        attach(d.gate_up);
+        attach(d.down);
+    }
+
+    void attach(FfnParameters& f) {
+        std::visit([this](auto& p) { attach(p); }, f);
+    }
+
+    void attach(AttentionParameters& a) {
+        attach(a.projection);
+        attach(a.output);
+    }
+
+    void attach(GdnParameters& g) {
+        attach(g.projection);
+        attach(g.control);
+        attach(g.output);
+    }
+
+    void attach(BlockParameters& b) {
+        attach(b.ffn);
+        std::visit([this](auto& m) { attach(m); }, b.mixer);
+    }
+
+    void attach(DynamicConvParameters& c) { attach(c.kernel_projection); }
+
+    void attach(DraftBlockParameters& d) {
+        attach(d.query_key_value);
+        attach(d.context_key);
+        attach(d.context_value);
+        attach(d.output);
+        attach(d.mlp);
+        if (d.attention_conv) { attach(*d.attention_conv); }
+        if (d.mlp_conv) { attach(*d.mlp_conv); }
+    }
+
+    void attach(SelectorParameters& s) { attach(s.hidden_projection); }
+
+    void attach(VisionBlockParameters& v) {
+        attach(v.qkv);
+        attach(v.output);
+        attach(v.fc1);
+        attach(v.fc2);
+    }
+
+    void attach(TextParameters& t) {
+        attach(t.token_embedding);
+        attach(t.output_head);
+        for (auto& l : t.layers) { attach(l); }
+    }
+
+    void attach(MtpProjectionParameters& p) {
+        attach(p.packed);
+        if (p.rows) { for (auto& r : *p.rows) { attach(r); } }
+    }
+
+    void attach(MtpParameters& m) {
+        attach(m.input_projection);
+        attach(m.projection);
+        attach(m.output);
+        attach(m.ffn);
+        attach(m.output_head);
+    }
+
+    void attach(VisionParameters& v) {
+        attach(v.patch_embedding);
+        for (auto& l : v.layers) { attach(l); }
+        attach(v.merger_fc1);
+        attach(v.merger_fc2);
+    }
+
+    void attach(DraftParameters& d) {
+        attach(d.feature_projection);
+        for (auto& l : d.layers) { attach(l); }
+        if (d.selector) { attach(*d.selector); }
+        attach(d.output_head);
+    }
+
+    void attach(ProposalParameters& p) { attach(p.head); }
+
 private:
     const Model& model_;
 };
@@ -258,7 +391,7 @@ private:
 } // namespace
 
 Parameters::Parameters(const Model& source) : model(source) {
-    const Prepare prepare(model);
+    Prepare prepare(model);
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head     = prepare.linear(w.text.output_head_use);
@@ -283,6 +416,12 @@ Parameters::Parameters(const Model& source) : model(source) {
             ProposalParameters{prepare.linear(w.proposal->head), std::nullopt, w.proposal->rows};
         if (w.proposal->token_ids) { proposal->token_ids = prepare.tensor(*w.proposal->token_ids); }
     }
+    // Attach the folded sign table to every ternary Weight before any Op reads the transform.
+    prepare.attach(text);
+    if (mtp) { prepare.attach(*mtp); }
+    if (vision) { prepare.attach(*vision); }
+    if (draft) { prepare.attach(*draft); }
+    if (proposal) { prepare.attach(*proposal); }
 }
 
 } // namespace ninfer::models::qwen3_5::execution

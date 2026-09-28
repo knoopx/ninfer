@@ -7,6 +7,9 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
+#include "ops/linear/ternary/ternary_dispatch.h"
+#include "ops/linear/ternary/ternary_rotation.h"
+#include "ninfer/ops/silu_mul.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -54,6 +57,15 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+    }
+    if (qtype == QType::PTQ1_0_G128 || qtype == QType::PQ2_0_G128) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("linear_swiglu workspace: ternary admits only A16");
+        }
+        // The folded ternary route projects the whole fused gate/up parent into a scoped
+        // [2*intermediate, T] scratch and then reuses silu_mul, so it needs that scratch plus the
+        // activation rotation buffer.
+        return detail::ternary_projection_workspace_bytes(gate_up_rows, input_rows, max_tokens);
     }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }
@@ -104,8 +116,28 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
     const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
-    if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight) {
+    const bool ternary_weight =
+        large_shape &&
+        (gate_up_weight.qtype == QType::PTQ1_0_G128 || gate_up_weight.qtype == QType::PQ2_0_G128) &&
+        gate_up_weight.group == 128 && common_row_split;
+    if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight && !ternary_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
+    }
+
+    if (ternary_weight) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("ternary linear_swiglu admits only A16");
+        }
+        // out = silu(gate) * up. There is no fused ternary SwiGLU kernel, so project the whole
+        // fused parent with the shared ternary GEMM (which also maps x into the folded basis) and
+        // then reuse the existing elementwise silu_mul over the two half-row ranges, exactly as the
+        // MTP path already does for its W8 gate/up parent.
+        auto scope     = ws.scope();
+        Tensor gate_up = ws.alloc(DType::BF16, {gate_up_weight.n, t});
+        detail::ternary_dispatch(x, gate_up_weight, gate_up, policy, &ws, stream);
+        const std::int32_t rows = gate_up_weight.n / 2;
+        silu_mul(gate_up.slice(0, 0, rows), gate_up.slice(0, rows, rows), out, stream);
+        return;
     }
 
     if (fp8_weight) {

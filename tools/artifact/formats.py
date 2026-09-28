@@ -43,7 +43,20 @@ class Fp8RowFormat:
     name: str
 
 
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat
+@dataclass(frozen=True, slots=True)
+class TernaryFormat:
+    """Prism-private ternary codes (Bonsai 2 27B): 128-group base-3 / 2-bit codes
+    with an optional high plane and one binary16 scale per group."""
+
+    name: str
+    group_size: int
+    base_bytes_per_group: int
+    high_bytes_per_group: int
+
+
+NumericFormat: TypeAlias = (
+    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | TernaryFormat
+)
 
 
 BF16 = DirectFormat("bf16", 2)
@@ -56,6 +69,10 @@ Q6_G64_FP16 = QuantFormat("q6_g64_fp16", 6, 64, -32, 31)
 Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
+# PQ2_0: 32 B of 2-bit codes (no high plane) + 2 B scale = 34 B/128.
+# PTQ1_0: 24 B base-3 trits + 2 B extra trits + 2 B scale = 28 B/128.
+PQ2_0_G128 = TernaryFormat("PQ2_0_G128", 128, 32, 0)
+PTQ1_0_G128 = TernaryFormat("PTQ1_0_G128", 128, 24, 2)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
@@ -64,8 +81,17 @@ QUANT_FORMATS = MappingProxyType(
 )
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType({FP8_E4M3FN_ROW_BF16.name: FP8_E4M3FN_ROW_BF16})
+TERNARY_FORMATS = MappingProxyType(
+    {item.name: item for item in (PQ2_0_G128, PTQ1_0_G128)}
+)
 NUMERIC_FORMATS = MappingProxyType(
-    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS}
+    {
+        **DIRECT_FORMATS,
+        **QUANT_FORMATS,
+        **NVFP4_FORMATS,
+        **FP8_ROW_FORMATS,
+        **TERNARY_FORMATS,
+    }
 )
 
 
@@ -147,15 +173,19 @@ __all__ = [
     "Q8_G32_FP16",
     "NVFP4",
     "FP8_E4M3FN_ROW_BF16",
+    "PQ2_0_G128",
+    "PTQ1_0_G128",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
     "NVFP4_FORMATS",
     "FP8_ROW_FORMATS",
+    "TERNARY_FORMATS",
     "NUMERIC_FORMATS",
     "DirectFormat",
     "QuantFormat",
     "Nvfp4Format",
     "Fp8RowFormat",
+    "TernaryFormat",
     "NumericFormat",
     "get_format",
     "decode_e2m1_word",

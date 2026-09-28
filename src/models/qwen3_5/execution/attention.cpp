@@ -29,6 +29,16 @@ std::size_t attention_projection_workspace_bytes(const AttentionParameters& para
         return ops::attn_input_proj_workspace_capacity_bytes(weight.qtype, weight.n, weight.k,
                                                              single->policy, first, last);
     }
+    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
+        // Only folded ternary parents take a workspace (the shared rotation buffer); the fused
+        // Q4/Q5 pair needs none, so it stays at zero.
+        const auto& w = pair->first;
+        if (w.qtype == QType::PTQ1_0_G128 || w.qtype == QType::PQ2_0_G128) {
+            return ops::attn_input_proj_workspace_capacity_bytes(w.qtype, w.n, w.k,
+                                                                 ops::LinearPolicy::A16Only, first,
+                                                                 last);
+        }
+    }
     return 0;
 }
 
@@ -36,7 +46,8 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
                           Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                           WorkspaceArena& workspace, cudaStream_t stream) {
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
-        ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value, stream);
+        ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value, workspace,
+                             stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::attn_input_proj(hidden, single.weight, query, gate, key, value, single.policy,

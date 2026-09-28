@@ -53,6 +53,19 @@ int grid_for_q6_grouped(std::int32_t d, std::int32_t T) {
                                                           static_cast<std::int64_t>(group_blocks)));
 }
 
+// Must sit after grid_for() so the template can call it.
+template <class Storage, class Atom>
+void launch_ternary(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+    const std::int32_t d = out.ne[0];
+    const std::int32_t T = ids.ne[0];
+    const std::int64_t n = static_cast<std::int64_t>(d) * T;
+    embed_gather_ternary_kernel<Storage, Atom><<<grid_for(n), kBlock, 0, stream>>>(
+        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata),
+        static_cast<const std::uint8_t*>(table.qhigh), static_cast<const std::uint8_t*>(table.scales),
+        static_cast<__nv_bfloat16*>(out.data), d, T, table.padded_shape[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 const char* q8_embed_route_name(Q8EmbedRoute route) {
@@ -157,6 +170,16 @@ void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, Tensor& out
     else
         launch_fp8<5, 128>(ids, table, out, stream);
     CUDA_CHECK(cudaGetLastError());
+}
+
+void embed_gather_pq2_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                             cudaStream_t stream) {
+    launch_ternary<PQ2RowSplitStorage, PQ2SimtDecodeAtom>(ids, table, out, stream);
+}
+
+void embed_gather_ptq1_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                              cudaStream_t stream) {
+    launch_ternary<PTQ1RowSplitStorage, PTQ1SimtDecodeAtom>(ids, table, out, stream);
 }
 
 } // namespace ninfer::ops::detail

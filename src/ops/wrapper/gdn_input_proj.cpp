@@ -15,6 +15,9 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/ternary/ternary_dispatch.h"
+#include "ops/linear/ternary/ternary_row_view.h"
+#include "ops/linear/ternary/ternary_rotation.h"
 
 #include <algorithm>
 #include <array>
@@ -558,8 +561,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                    const Tensor& initial_state_slots, Tensor& conv_record,
                                    Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                    LinearPolicy policy, WorkspaceArena& workspace,
-                                   cudaStream_t stream) {
-    validate_policy(policy);
+                                   cudaStream_t stream) {    validate_policy(policy);
 
     if (weight.qtype == QType::NVFP4) {
         constexpr std::int32_t kHidden     = 5120;
@@ -692,6 +694,69 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
                                                    query, key, value, z, stream);
 }
 
+// --- folded (rotated-basis) ternary split parents -----------------------------------------
+//
+// The ternary parents carry the same row-split layout as Q4/Q5 but a different group geometry
+// (128 wide; 24 + 2 bytes per group for PTQ1_0 and 32 bytes with no high plane for PQ2_0), so the
+// Q4/Q5 required-geometry checks cannot accept them and their fused dispatch cannot run them.
+
+bool is_ternary_parent(QType qtype) noexcept {
+    return qtype == QType::PTQ1_0_G128 || qtype == QType::PQ2_0_G128;
+}
+
+// The GDN input projection always consumes the 5120-wide hidden state on this target.
+constexpr std::int32_t kFoldedGdnHidden = 5120;
+
+void require_ternary_split_parents(const Weight& qk_weight, const Weight& value_z_weight,
+                                   std::int32_t qk_rows, std::int32_t parent_rows,
+                                   std::int32_t hidden) {
+    const Weight* const parents[]{&qk_weight, &value_z_weight};
+    for (const Weight* parent : parents) {
+        if (!is_ternary_parent(parent->qtype) || parent->layout != QuantLayout::RowSplit ||
+            parent->scale_dtype != DType::FP16 || parent->group != 128 || parent->ndim != 2 ||
+            parent->k != hidden || parent->shape[1] != hidden ||
+            parent->padded_shape[1] != hidden || (parent->k % 1024) != 0) {
+            throw std::invalid_argument("gdn_input_proj: unsupported ternary split parent geometry");
+        }
+    }
+    if (qk_weight.n != qk_rows || qk_weight.shape[0] != qk_rows) {
+        throw std::invalid_argument("gdn_input_proj: ternary qk parent has the wrong row count");
+    }
+    if (value_z_weight.n != parent_rows || value_z_weight.shape[0] != parent_rows) {
+        throw std::invalid_argument("gdn_input_proj: ternary value/z parent has the wrong row count");
+    }
+    if (qk_weight.qtype != value_z_weight.qtype) {
+        throw std::invalid_argument(
+            "gdn_input_proj: both ternary split parents must use the same format");
+    }
+}
+
+// `scratch` is the int8 rung's activation-quantization scratch (empty = stay on the bf16 rungs);
+// the caller allocates it from its arena because this function never sees one -- see
+// allocate_ternary_s8_scratch. Passing it is what lets these three projections take the s8 rung on a
+// long prefill, where they would otherwise fall all the way back to bf16.
+void launch_ternary_split(const Tensor& activation, const Weight& qk_weight,
+                          const Weight& value_z_weight, Tensor& qkv, Tensor& z,
+                          std::int32_t qk_rows, std::int32_t value_rows, std::int32_t z_rows,
+                          detail::TernaryS8Scratch scratch, cudaStream_t stream) {
+    // THREE projections, ONE activation: quantize it once here and let the three dispatches below
+    // skip their own pass (they compare the shape the scratch records).
+    detail::quantize_ternary_s8_activation(activation, scratch, stream);
+    const Weight value_head = detail::ternary_row_view(value_z_weight, 0, value_rows);
+    const Weight value_tail = detail::ternary_row_view(value_z_weight, value_rows, z_rows);
+    // Under ninfer's ne[0]-contiguous layout the token stride of the fused qkv output is its ROW
+    // count, so the two halves must be told the parent's stride rather than their own.
+    const std::int32_t qkv_rows = qk_rows + value_rows;
+    Tensor qk_out               = qkv.slice(0, 0, qk_rows);
+    Tensor value_out            = qkv.slice(0, qk_rows, value_rows);
+    detail::ternary_dispatch_basis_strided(activation, qk_weight, qk_out, qkv_rows,
+                                           LinearPolicy::A16Only, stream, scratch);
+    detail::ternary_dispatch_basis_strided(activation, value_head, value_out, qkv_rows,
+                                           LinearPolicy::A16Only, stream, scratch);
+    detail::ternary_dispatch_basis(activation, value_tail, z, LinearPolicy::A16Only, stream,
+                                   scratch);
+}
+
 } // namespace
 
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
@@ -707,10 +772,56 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     require_matrix(x, kHidden, cols, "x");
     require_matrix(qkv, kQkvRows, cols, "qkv");
     require_matrix(z, kZRows, cols, "z");
+
+    if (is_ternary_parent(qk_weight.qtype)) {
+        require_ternary_split_parents(qk_weight, value_z_weight, kQkRows, kParentRows, kHidden);
+        if (detail::ternary_rotation_enabled()) {
+            // Folded parents need a [5120, T] rotation buffer, and this entry point has no
+            // workspace to take it from. Fail loudly instead of running untransformed weights.
+            throw std::invalid_argument(
+                "gdn_input_proj: folded ternary parents need the workspace overload "
+                "(or NINFER_TERNARY_HADAMARD=0 to measure without the rotation)");
+        }
+        launch_ternary_split(x, qk_weight, value_z_weight, qkv, z, kQkRows, kValueRows, kZRows,
+                             detail::TernaryS8Scratch{}, stream);
+        return;
+    }
+
     require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, "qk weight");
     require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
 
     detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
+}
+
+void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                    Tensor& qkv, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kQkRows     = 4096;
+    constexpr std::int32_t kValueRows  = 6144;
+    constexpr std::int32_t kZRows      = 6144;
+    constexpr std::int32_t kQkvRows    = kQkRows + kValueRows;
+    constexpr std::int32_t kParentRows = kValueRows + kZRows;
+    const std::int32_t cols            = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(qkv, kQkvRows, cols, "qkv");
+    require_matrix(z, kZRows, cols, "z");
+
+    if (!is_ternary_parent(qk_weight.qtype)) {
+        gdn_input_proj(x, qk_weight, value_z_weight, qkv, z, stream);
+        return;
+    }
+    require_ternary_split_parents(qk_weight, value_z_weight, kQkRows, kParentRows, kHidden);
+    // Scoped: the rotation scratch is handed back when this call returns, so it does not accumulate
+    // across the (many) graph constructions of one load. The int8 scratch rides in the same scope,
+    // and the arena capacity already counts its bytes (gdn_input_proj's ternary capacity calls
+    // ternary_rotation_workspace_bytes).
+    auto scope             = workspace.scope();
+    const Tensor activation = detail::folded_activation(x, qk_weight, workspace, stream);
+    const detail::TernaryS8Scratch s8_scratch =
+        detail::allocate_ternary_s8_scratch(workspace, qk_weight.n, kHidden, cols);
+    launch_ternary_split(activation, qk_weight, value_z_weight, qkv, z, kQkRows, kValueRows,
+                         kZRows, s8_scratch, stream);
 }
 
 std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
@@ -741,6 +852,15 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
         (void)detail::q8_gdn_input_resolve_plan(
             {input_rows, 8192, 4096, parent_rows, input_rows, max_tokens});
         return 0;
+    }
+    if (parent_qtype == QType::PTQ1_0_G128 || parent_qtype == QType::PQ2_0_G128) {
+        if (input_rows != 5120) {
+            throw std::invalid_argument("gdn_input_proj workspace: unsupported ternary profile");
+        }
+        // Folded ternary parents take the workspace route: a shared [5120, T] rotation buffer plus
+        // the int8 scratch. This statement IS the capacity, so it equals the reservation the
+        // workspace overload takes (folded_activation + allocate_ternary_s8_scratch).
+        return detail::ternary_rotation_workspace_bytes(input_rows, max_tokens);
     }
     throw std::invalid_argument("gdn_input_proj workspace: unsupported parent profile");
 }
@@ -791,10 +911,15 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
         (void)resolve_q8_conv_plan(max_width, 1);
         if (max_width >= 17) { largest_materialized_width = max_width; }
     }
-    if (largest_materialized_width == 0) { return 0; }
+    // Folded ternary parents never take the fused schedule, so they always need the projected
+    // workspace plus a [hidden, token] rotation buffer; reserve both. This query carries no
+    // weights profile (it is keyed on the row geometry, which the ternary parents share), so the
+    // reservation is unconditional; for a groupwise-int artifact it is just a larger leaf arena.
     WorkspaceLayoutBuilder layout;
-    (void)allocate_projected_workspace(layout, channels, largest_materialized_width);
-    return layout.peak_bytes(1);
+    (void)allocate_projected_workspace(
+        layout, channels, largest_materialized_width == 0 ? max_width : largest_materialized_width);
+    return layout.peak_bytes(1) +
+           detail::ternary_rotation_workspace_bytes(kFoldedGdnHidden, batch_size * max_width);
 }
 
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
@@ -839,10 +964,14 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     if (q4_q5) {
         (void)resolve_q4_q5_conv_plan(min_width, batch_size);
         (void)resolve_q4_q5_conv_plan(max_width, batch_size);
-    } else {
-        (void)resolve_q8_conv_plan(min_width, batch_size);
-        (void)resolve_q8_conv_plan(max_width, batch_size);
+        // Folded ternary parents share the q4_q5 row geometry and take the non-fused conv record
+        // path, whose projection reserves a [hidden, token] rotation buffer plus the int8 scratch
+        // from the arena. The fused Q4/Q5 record needs none, so for a groupwise-int artifact this is
+        // a larger leaf arena; for a folded ternary artifact it is exactly the reservation taken.
+        return detail::ternary_rotation_workspace_bytes(kFoldedGdnHidden, batch_size * max_width);
     }
+    (void)resolve_q8_conv_plan(min_width, batch_size);
+    (void)resolve_q8_conv_plan(max_width, batch_size);
     return 0;
 }
 
@@ -893,8 +1022,14 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
     constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
     constexpr std::int32_t kParentRows = kValueRows + kZRows;
     const ConvGeometry geometry        = require_snapshot_input(x, kHidden);
-    require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQueryRows + kKeyRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
+    const bool ternary                 = is_ternary_parent(qk_weight.qtype);
+    if (ternary) {
+        require_ternary_split_parents(qk_weight, value_z_weight, kQueryRows + kKeyRows, kParentRows,
+                                     kHidden);
+    } else {
+        require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQueryRows + kKeyRows, "qk weight");
+        require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
+    }
     require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
                               snapshot_base_slots, kChannels, geometry);
     require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
@@ -911,14 +1046,14 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
             x, conv_weight, conv_states, valid_columns, initial_state_slots, snapshot_base_slots,
             query, key, value, z, kQueryRows, kKeyRows, kValueRows, geometry, ws, stream,
             [&](const Tensor& x_flat, Tensor& projected, Tensor& z_flat) {
-                gdn_input_proj(x_flat, qk_weight, value_z_weight, projected, z_flat, stream);
+                gdn_input_proj(x_flat, qk_weight, value_z_weight, projected, z_flat, ws, stream);
             });
         return;
     }
 
     const detail::Q4Q5GdnInputConvPlan plan =
         resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
-    if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
+    if (!ternary && plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
         detail::q4_q5_gdn_input_conv_snapshot_launch(
             x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns,
             initial_state_slots, snapshot_base_slots, query, key, value, z, stream);
@@ -927,7 +1062,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
 
     auto scope                 = ws.scope();
     ProjectedWorkspace scratch = allocate_projected_workspace(ws, kChannels, geometry.width);
-    gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, stream);
+    gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, ws, stream);
     detail::gdn_projected_conv_snapshot_launch(scratch.projected, conv_weight, conv_states,
                                                valid_columns, initial_state_slots,
                                                snapshot_base_slots, query, key, value, stream);
@@ -947,8 +1082,14 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
     constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
     constexpr std::int32_t kParentRows = kValueRows + kZRows;
     const ConvGeometry geometry        = require_record_input(x, kHidden);
-    require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQueryRows + kKeyRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
+    const bool ternary                 = is_ternary_parent(qk_weight.qtype);
+    if (ternary) {
+        require_ternary_split_parents(qk_weight, value_z_weight, kQueryRows + kKeyRows, kParentRows,
+                                     kHidden);
+    } else {
+        require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQueryRows + kKeyRows, "qk weight");
+        require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
+    }
     require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots, kChannels,
                             geometry);
     require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch,
@@ -966,7 +1107,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
 
     const detail::Q4Q5GdnInputConvPlan plan =
         resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
-    if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
+    if (!ternary && plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
         detail::q4_q5_gdn_input_conv_record_launch(x, qk_weight, value_z_weight, conv_weight,
                                                    conv_states, valid_columns, initial_state_slots,
                                                    conv_record, query, key, value, z, stream);
@@ -976,7 +1117,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                    query, key, value, z, geometry, workspace, stream,
                    [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
                        gdn_input_proj(x_flat, qk_weight, value_z_weight, record_flat, z_flat,
-                                      stream);
+                                      workspace, stream);
                    });
 }
 

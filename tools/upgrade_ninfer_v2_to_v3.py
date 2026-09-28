@@ -27,6 +27,8 @@ FORMATS = {
     "W8G32_F16S": "q8_g32_fp16",
     "NVFP4": "nvfp4",
     "FP8_E4M3FN_ROW_BF16S": "fp8_e4m3fn_row_bf16",
+    "PQ2_0_G128": "PQ2_0_G128",
+    "PTQ1_0_G128": "PTQ1_0_G128",
 }
 LAYOUTS = {
     "contiguous-le-v1": "contiguous_le_v1",
@@ -37,7 +39,7 @@ LAYOUTS = {
 KNOWN_COUNTS = {
     ("qwen3.6-27b", "groupwise-int"): (1124,),
     ("qwen3.6-27b", "nvfp4"): (1307,),
-    ("qwen3.8-27b", "groupwise-int"): (1124, 1190),
+    ("qwen3.8-27b", "groupwise-int"): (1124, 1190, 1126),
     ("qwen3.8-27b", "nvfp4"): (1124, 1190),
     ("qwen3.6-35b-a3b", "groupwise-int"): (940,),
 }
@@ -160,6 +162,14 @@ def encoded_bytes(obj):
         low = n * groups * (group if bits == 8 else group // 2)
         high = n * groups * (0 if bits in (4, 8) else group * (bits - 4) // 8)
         return align(low, 256) + align(high, 256) + n * groups * 2
+    if layout == "row_split_k128_v1" and format in ("PQ2_0_G128", "PTQ1_0_G128"):
+        base, high = (32, 0) if format == "PQ2_0_G128" else (24, 2)
+        groups = align(k, 128) // 128
+        return (
+            align(n * groups * base, 256)
+            + align(n * groups * high, 256)
+            + n * groups * 2
+        )
     if (
         layout == "block_scale_k16_m128x4_v1"
         and format == "nvfp4"
@@ -266,6 +276,9 @@ def make_directory(identity, old_objects):
         raise ValueError(f"unsupported v2 input {key} with {len(old_objects)} objects")
     moe = key[0] == "qwen3.6-35b-a3b"
     has_dflash2 = any(o["name"].startswith("dflash2/") for o in old_objects)
+    has_ternary = any(
+        o["name"] in ("text/hadamard_signs", "text/hadamard_widths") for o in old_objects
+    )
     text = text_config(moe)
     components = {
         "text": {
@@ -390,6 +403,9 @@ def make_directory(identity, old_objects):
                 obj,
                 (131072, h) if name.endswith("draft_head") else (131072,),
             )
+            continue
+        if name in ("text/hadamard_signs", "text/hadamard_widths"):
+            put(name, obj, tuple(obj["shape"]))
             continue
         if name in (
             "mtp/input_projection",
@@ -672,7 +688,9 @@ def make_directory(identity, old_objects):
             uses.append(use)
     if scalar_uses.keys() - bindings.keys():
         raise ValueError("activation scalar refers to an absent logical projection")
-    expected_bindings = 32713 if moe else 1513 if has_dflash2 else 1422
+    expected_bindings = 32713 if moe else 1513 if has_dflash2 else (
+        1424 if has_ternary else 1422
+    )
     if len(bindings) != expected_bindings:
         raise ValueError("the known logical parameter mapping is incomplete")
     for component, required in (

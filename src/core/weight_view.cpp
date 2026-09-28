@@ -96,7 +96,8 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     const auto k       = shape[1];
     out.padded_columns = k;
     if (layout == QuantLayout::RowSplit) {
-        std::uint64_t high_per_group = 0;
+        std::uint64_t high_per_group  = 0;
+        std::uint64_t base_per_group  = 32;
         switch (format) {
         case QType::Q4_G64_FP16:
             out.group_size = 64;
@@ -112,12 +113,24 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         case QType::Q8_G32_FP16:
             out.group_size = 32;
             break;
+        // Prism ternary: 128-weight group -> base plane {qs} + high plane {qh} + fp16 scale.
+        // PTQ1_0 = 24 B base-3 trits (5/byte) + 2 B extra trits (4/byte) + 2 B scale = 28 B/128.
+        case QType::PTQ1_0_G128:
+            out.group_size   = 128;
+            base_per_group   = 24;
+            high_per_group   = 2;
+            break;
+        // PQ2_0 = 32 B of 2-bit codes (no high plane) + 2 B scale = 34 B/128.
+        case QType::PQ2_0_G128:
+            out.group_size   = 128;
+            base_per_group   = 32;
+            break;
         default:
             throw std::invalid_argument("RowSplit requires a grouped integer format");
         }
         out.padded_columns      = aligned(k, 128);
         const auto groups       = out.padded_columns / out.group_size;
-        out.code_bytes_per_row  = mul(groups, 32);
+        out.code_bytes_per_row  = mul(groups, base_per_group);
         out.high_bytes_per_row  = mul(groups, high_per_group);
         out.scale_bytes_per_row = mul(groups, 2);
         out.code_bytes          = mul(n, out.code_bytes_per_row);

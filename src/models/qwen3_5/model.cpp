@@ -7,10 +7,12 @@ namespace ninfer::models::qwen3_5 {
 
 Model::Model(Config config, LoadOptions options, ModelWeights weights,
              std::vector<BoundWeight> bound, FrontendResources resources, InstanceInfo info,
-             artifact::MaterializedArtifact backing)
+             artifact::MaterializedArtifact backing, const float* hadamard_signs,
+             std::vector<std::pair<std::int32_t, std::uint64_t>> hadamard_width_offsets)
     : backing_(std::move(backing)), config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), resources_(std::move(resources)),
-      info_(std::move(info)) {}
+      info_(std::move(info)), hadamard_signs_base_(hadamard_signs),
+      hadamard_width_offsets_(std::move(hadamard_width_offsets)) {}
 
 Model::~Model() = default;
 

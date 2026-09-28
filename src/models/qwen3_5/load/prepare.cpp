@@ -68,6 +68,44 @@ WeightId Bindings::direct(std::string name, artifact::Shape shape, QType format)
     return parameter(std::move(name), std::move(shape), {}, format);
 }
 
+// --- folded (rotated-basis) sign table ---------------------------------------
+//
+// These constants describe the artifact contract the ternary port writes: 1024-wide normalized
+// Sylvester-Hadamard blocks, 28672 explicit signs, and widths that partition the signs exactly.
+inline constexpr std::size_t kHadamardSignValues = 28672;
+inline constexpr std::size_t kHadamardWidthCount = 3;
+
+std::optional<HadamardSigns> bind_hadamard_signs(Bindings& bindings) {
+    auto& binder = bindings.binder;
+    if (!binder.contains("text/hadamard_signs")) { return std::nullopt; }
+
+    HadamardSigns out;
+    out.values = binder.parameter("text/hadamard_signs", {kHadamardSignValues},
+                                  artifact::Residency::Device, QType::FP32);
+    // The widths only need to reach the host: they are read here to derive each width's element
+    // offset, which is what lets a weight find its block from its input dimension alone.
+    const auto widths_ref = binder.parameter("text/hadamard_widths", {kHadamardWidthCount},
+                                             artifact::Residency::Values, QType::INT32);
+    const auto widths = binder.values(widths_ref.binding, QType::INT32).integers();
+    if (widths.size() != kHadamardWidthCount) {
+        throw artifact::ArtifactError("text/hadamard_widths is shorter than its declared count");
+    }
+    std::uint64_t offset = 0;
+    for (std::size_t i = 0; i < widths.size(); ++i) {
+        if (widths[i] <= 0) {
+            throw artifact::ArtifactError("text/hadamard_widths entries must be positive");
+        }
+        out.width_offsets.emplace_back(widths[i], offset);
+        offset += static_cast<std::uint64_t>(widths[i]);
+    }
+    if (offset != kHadamardSignValues) {
+        throw artifact::ArtifactError("text/hadamard_widths must sum to " +
+                                      std::to_string(kHadamardSignValues) + ", got " +
+                                      std::to_string(offset));
+    }
+    return out;
+}
+
 std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,
                                          const artifact::MaterializedArtifact& materialized) {
     std::vector<BoundWeight> out;

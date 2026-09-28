@@ -11,6 +11,9 @@
 #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/q8/q8_linear_add_plan.h"
+#include "ops/linear/ternary/ternary_dispatch.h"
+#include "ops/linear/ternary/ternary_rotation.h"
+#include "ninfer/ops/residual_add.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -137,6 +140,15 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return detail::fp8_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                                min_tokens, max_tokens);
     }
+    if (qtype == QType::PTQ1_0_G128 || qtype == QType::PQ2_0_G128) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("linear_add workspace: ternary admits only A16");
+        }
+        // The folded ternary route projects into a scoped [N, T] scratch with the shared ternary
+        // GEMM and then folds the residual in, so it needs the projection scratch and the
+        // activation rotation buffer.
+        return detail::ternary_projection_workspace_bytes(output_rows, input_rows, max_tokens);
+    }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
 
@@ -240,6 +252,21 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
         }
         detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        return;
+    }
+
+    if (w.qtype == QType::PTQ1_0_G128 || w.qtype == QType::PQ2_0_G128) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("ternary linear_add admits only A16");
+        }
+        // residual_out += W * x. There is no fused ternary residual kernel, so compose it from the
+        // shared ternary GEMM and the existing elementwise add. The GEMM also maps x into the
+        // folded basis, which is why the projection scratch and the rotation buffer both come from
+        // this op's workspace.
+        auto scope       = ws.scope();
+        Tensor projected = ws.alloc(DType::BF16, {w.n, t});
+        detail::ternary_dispatch(x, w, projected, policy, &ws, stream);
+        residual_add(projected, residual_out, stream);
         return;
     }
 

@@ -4,6 +4,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
 
 namespace ninfer {
 
@@ -17,6 +19,32 @@ struct DeviceExecutionView {
     cudaStream_t stream               = nullptr;
     std::int32_t multiprocessor_count = 0;
 };
+
+// CUDA function attributes are scoped to a device context. A process-wide `static` result
+// therefore leaves the same kernel unconfigured the first time it launches on a second GPU. Give
+// each launcher specialization a cheap, device-keyed cache instead; single-GPU behaviour is
+// unchanged (the map holds exactly one entry).
+template <typename Configure>
+void configure_cuda_device_once(Configure&& configure) {
+    static std::mutex mutex;
+    static std::unordered_map<int, cudaError_t> results;
+
+    int device = -1;
+    CUDA_CHECK(cudaGetDevice(&device));
+
+    cudaError_t result = cudaSuccess;
+    {
+        const std::scoped_lock lock(mutex);
+        const auto existing = results.find(device);
+        if (existing != results.end()) {
+            result = existing->second;
+        } else {
+            result = std::forward<Configure>(configure)();
+            results.emplace(device, result);
+        }
+    }
+    CUDA_CHECK(result);
+}
 
 struct DeviceContext {
     int device                   = 0;

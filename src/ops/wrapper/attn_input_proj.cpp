@@ -10,6 +10,9 @@
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear/ternary/ternary_dispatch.h"
+#include "ops/linear/ternary/ternary_row_view.h"
+#include "ops/linear/ternary/ternary_rotation.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -160,6 +163,65 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     detail::q8_attn_input_dispatch(x, weight, q, gate, k, v, stream);
 }
 
+// --- folded (rotated-basis) ternary split parents -----------------------------------------
+//
+// The ternary parents carry the row-split layout of Q4/Q5 but a 128-wide group geometry, so the
+// Q4/Q5 required-geometry checks cannot accept them and their fused dispatch cannot run them.
+
+bool is_ternary_attn_parent(QType qtype) noexcept {
+    return qtype == QType::PTQ1_0_G128 || qtype == QType::PQ2_0_G128;
+}
+
+void require_ternary_attn_parents(const Weight& query_key_weight,
+                                  const Weight& gate_value_weight, std::int32_t rows,
+                                  std::int32_t hidden) {
+    const Weight* const parents[]{&query_key_weight, &gate_value_weight};
+    for (const Weight* parent : parents) {
+        if (!is_ternary_attn_parent(parent->qtype) || parent->layout != QuantLayout::RowSplit ||
+            parent->scale_dtype != DType::FP16 || parent->group != 128 || parent->ndim != 2 ||
+            parent->k != hidden || parent->shape[1] != hidden ||
+            parent->padded_shape[1] != hidden || (parent->k % 1024) != 0) {
+            throw std::invalid_argument(
+                "attn_input_proj: unsupported ternary split parent geometry");
+        }
+    }
+    const Weight* const both[]{&query_key_weight, &gate_value_weight};
+    for (const Weight* parent : both) {
+        if (parent->n != rows || parent->shape[0] != rows) {
+            throw std::invalid_argument(
+                "attn_input_proj: ternary split parent has the wrong row count");
+        }
+    }
+    if (query_key_weight.qtype != gate_value_weight.qtype) {
+        throw std::invalid_argument(
+            "attn_input_proj: both ternary split parents must use the same format");
+    }
+}
+
+// The activation is `hidden` wide for all four projections, so one rotation serves all of them.
+// `scratch` is the int8 rung's activation-quantization scratch (empty = stay on the bf16 rungs);
+// the caller allocates it from its arena because this function never sees one -- see
+// allocate_ternary_s8_scratch. Passing it is what lets these four projections take the s8 rung on a
+// long prefill, where they would otherwise fall all the way back to bf16.
+void launch_ternary_attn(const Tensor& activation, const Weight& query_key_weight,
+                         const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
+                         Tensor& v, std::int32_t query_rows, std::int32_t kv_rows,
+                         detail::TernaryS8Scratch scratch, cudaStream_t stream) {
+    // FOUR projections, ONE activation: quantize it once here and let the four dispatches below
+    // skip their own pass (they compare the shape the scratch records). Without this the absmax
+    // reduction and the int8 code pass ran four times over the same k x T bytes.
+    detail::quantize_ternary_s8_activation(activation, scratch, stream);
+    const Weight q_head = detail::ternary_row_view(query_key_weight, 0, query_rows);
+    const Weight k_tail = detail::ternary_row_view(query_key_weight, query_rows, kv_rows);
+    const Weight g_head = detail::ternary_row_view(gate_value_weight, 0, query_rows);
+    const Weight v_tail = detail::ternary_row_view(gate_value_weight, query_rows, kv_rows);
+    detail::ternary_dispatch_basis(activation, q_head, q, LinearPolicy::A16Only, stream, scratch);
+    detail::ternary_dispatch_basis(activation, g_head, gate, LinearPolicy::A16Only, stream,
+                                   scratch);
+    detail::ternary_dispatch_basis(activation, k_tail, k, LinearPolicy::A16Only, stream, scratch);
+    detail::ternary_dispatch_basis(activation, v_tail, v, LinearPolicy::A16Only, stream, scratch);
+}
+
 } // namespace
 
 std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
@@ -198,6 +260,15 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
         (void)detail::q8_attn_input_resolve_plan(
             {input_rows, 4096, 512, parent_rows, input_rows, max_tokens});
         return 0;
+    case QType::PTQ1_0_G128:
+    case QType::PQ2_0_G128:
+        if (parent_rows != 7168 || input_rows != 5120) {
+            throw std::invalid_argument("attn_input_proj workspace: unsupported ternary profile");
+        }
+        // Folded ternary parents take the workspace route: a shared [5120, T] rotation buffer plus
+        // the int8 scratch. This statement IS the capacity, so it must equal the reservation the
+        // workspace overload takes (folded_activation + allocate_ternary_s8_scratch).
+        return detail::ternary_rotation_workspace_bytes(input_rows, max_tokens);
     case QType::Q4_G64_FP16:
     case QType::Q5_G64_FP16:
     case QType::Q6_G64_FP16:
@@ -220,11 +291,57 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_matrix(gate, kQRows, cols, "gate");
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
+    if (is_ternary_attn_parent(query_key_weight.qtype)) {
+        require_ternary_attn_parents(query_key_weight, gate_value_weight, kQRows + kKvRows,
+                                    kHidden);
+        if (detail::ternary_rotation_enabled()) {
+            // Folded parents need a [5120, T] rotation buffer, and this entry point has no
+            // workspace to take it from. Fail loudly instead of running untransformed weights.
+            throw std::invalid_argument(
+                "attn_input_proj: folded ternary parents need the workspace overload "
+                "(or NINFER_TERNARY_HADAMARD=0 to measure without the rotation)");
+        }
+        launch_ternary_attn(x, query_key_weight, gate_value_weight, q, gate, k, v, kQRows, kKvRows,
+                            detail::TernaryS8Scratch{}, stream);
+        return;
+    }
+
     require_rowsplit(query_key_weight, QType::Q4_G64_FP16, kQRows + kKvRows, "query/key weight");
     require_rowsplit(gate_value_weight, QType::Q5_G64_FP16, kQRows + kKvRows, "gate/value weight");
 
     detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
                                       stream);
+}
+
+void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                     WorkspaceArena& workspace, cudaStream_t stream) {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 1024;
+    const std::int32_t cols        = x.ne[1];
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(q, kQRows, cols, "q");
+    require_matrix(gate, kQRows, cols, "gate");
+    require_matrix(k, kKvRows, cols, "k");
+    require_matrix(v, kKvRows, cols, "v");
+
+    if (!is_ternary_attn_parent(query_key_weight.qtype)) {
+        attn_input_proj(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+        return;
+    }
+    require_ternary_attn_parents(query_key_weight, gate_value_weight, kQRows + kKvRows, kHidden);
+    // Scoped: the rotation scratch is handed back when this call returns, so it does not
+    // accumulate across the (many) graph constructions of one load. The int8 scratch rides in the
+    // same scope, and the arena capacity already counts its bytes (ternary_rotation_workspace_bytes
+    // is this op's capacity statement).
+    auto scope = workspace.scope();
+    const Tensor activation =
+        detail::folded_activation(x, query_key_weight, workspace, stream);
+    const detail::TernaryS8Scratch s8_scratch =
+        detail::allocate_ternary_s8_scratch(workspace, query_key_weight.n, kHidden, cols);
+    launch_ternary_attn(activation, query_key_weight, gate_value_weight, q, gate, k, v, kQRows,
+                        kKvRows, s8_scratch, stream);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,

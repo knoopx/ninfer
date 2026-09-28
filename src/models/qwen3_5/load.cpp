@@ -3,7 +3,9 @@
 #include "artifact/reader.h"
 #include "models/qwen3_5/load/bindings.h"
 
+#include <optional>
 #include <utility>
+#include <vector>
 
 namespace ninfer::models::qwen3_5 {
 
@@ -12,6 +14,7 @@ struct LoadPlan::Impl {
     LoadOptions options;
     ModelWeights weights;
     std::vector<loading::PendingWeight> pending;
+    std::optional<loading::HadamardSigns> hadamard_signs;
     artifact::MaterializationPlan materialization;
     FrontendResources resources;
     InstanceInfo info;
@@ -50,6 +53,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     loading::Bindings bindings(binder);
     const auto& text  = out->config.text;
     out->weights.text = loading::bind_text(bindings, text, options);
+    out->hadamard_signs = loading::bind_hadamard_signs(bindings);
     if (out->config.vision) {
         out->weights.vision = loading::bind_vision(bindings, *out->config.vision, text);
     }
@@ -107,9 +111,17 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto backing = artifact::materialize(*data->materialization.source,
                                          std::move(data->materialization), device, observer);
     auto bound   = loading::resolve_weights(std::move(data->pending), backing);
+    const float* hadamard_signs = nullptr;
+    std::vector<std::pair<std::int32_t, std::uint64_t>> hadamard_width_offsets;
+    if (data->hadamard_signs) {
+        const auto handle = data->hadamard_signs->values.binding.parts.front().object;
+        hadamard_signs     = reinterpret_cast<const float*>(backing.device_parent(handle).data);
+        hadamard_width_offsets = data->hadamard_signs->width_offsets;
+    }
     return std::unique_ptr<Model>(new Model(
         std::move(data->config), data->options, std::move(data->weights), std::move(bound),
-        std::move(data->resources), std::move(data->info), std::move(backing)));
+        std::move(data->resources), std::move(data->info), std::move(backing), hadamard_signs,
+        std::move(hadamard_width_offsets)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

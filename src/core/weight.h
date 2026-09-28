@@ -16,6 +16,9 @@ enum class QType : std::uint16_t {
     INT32               = 6,
     NVFP4               = 7,
     FP8_E4M3FN_ROW_BF16 = 8,
+    // Prism-private ternary (Bonsai 2 27B): group 128, base-3 / 2-bit codes.
+    PTQ1_0_G128         = 9,
+    PQ2_0_G128          = 10,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -47,6 +50,28 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
+
+    // Prism ternary weights are stored folded into a rotated basis: the model computes
+    // y = W' * (H * (s * P * x)), so every activation feeding one of the folded weights must
+    // be mapped by (signs, then normalized Sylvester-Hadamard) before the matmul, and the
+    // token-embedding lookup must be mapped by (rotate, then signs) afterwards.
+    //
+    // hadamard_signs points at the sign block for THIS weight's input width (each width owns
+    // k/1024 rows of 1024 F32 +-1 values, and row b within the width is selected by the
+    // activation's 1024-block index). nullptr means no transform. hadamard_n_blk = k/1024.
+    const float* hadamard_signs = nullptr;
+    std::int32_t hadamard_n_blk = 0;
+
+    // Folded-basis feature permutation P, applied BEFORE the signs and the rotation:
+    //
+    //     x.view(perm_hd, perm_nk, perm_rep) -> swap the last two axes -> flatten
+    //
+    // Only the GDN output projection stores grouped columns while the runtime produces tiled
+    // v-heads, so perm_rep > 1 enables it and everything else leaves it at 1. Geometry comes
+    // from the model's head counts: perm_hd = K/n_v, perm_nk = n_k, perm_rep = n_v/n_k.
+    std::int32_t hadamard_perm_hd  = 0;
+    std::int32_t hadamard_perm_nk  = 0;
+    std::int32_t hadamard_perm_rep = 1;
 };
 
 } // namespace ninfer

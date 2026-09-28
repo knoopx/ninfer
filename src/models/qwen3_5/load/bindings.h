@@ -6,13 +6,24 @@
 #include "models/qwen3_5/weights.h"
 
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::loading {
 
 [[nodiscard]] FrontendResources bind_resources(artifact::Binder& binder, const Config& config);
+
+// Sign table of the rotated (folded) ternary weight basis. `values` holds every +-1 sign on the
+// device; `width_offsets` partitions it, because a weight whose input dimension is W owns exactly
+// W/1024 consecutive sign rows of 1024 values. The prefix sum lets a weight find its own block
+// from its input width alone. Absent on artifacts whose weights are not folded.
+struct HadamardSigns {
+    artifact::ParameterReference values;
+    std::vector<std::pair<std::int32_t, std::uint64_t>> width_offsets;
+};
 
 struct PendingWeight {
     artifact::ParameterReference reference;
@@ -40,6 +51,9 @@ public:
 private:
     std::map<std::string, WeightId, std::less<>> parameters_;
 };
+
+// Bind the folded sign table when the artifact carries one; nullopt otherwise.
+[[nodiscard]] std::optional<HadamardSigns> bind_hadamard_signs(Bindings& bindings);
 
 [[nodiscard]] AttentionWeights bind_attention(Bindings& bindings, const TextConfig& config,
                                               const std::string& prefix);
