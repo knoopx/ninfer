@@ -2,16 +2,28 @@
 
 #include "core/layout.h"
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/mtp_pack.h"
 
 #include <algorithm>
+#include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
 
 std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parameters,
                                            std::int32_t first, std::int32_t last) {
-    const auto& p = parameters.packed;
+    if (const auto* gguf = std::get_if<ops::GgufProjectionWeights>(&parameters.packed)) {
+        // Native GGUF parents are separate Linear operands.
+        std::size_t bytes = 0;
+        for (const auto& part : gguf->parts) {
+            bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
+                                        part.weight.qtype, part.weight.n, part.weight.k,
+                                        ops::LinearPolicy::A16Only, first, last));
+        }
+        return bytes;
+    }
+    const auto& p = std::get<LinearParameters>(parameters.packed);
     const auto& w = p.weight;
     if (!parameters.rows) {
         return ops::attn_input_proj_workspace_capacity_bytes(w.qtype, w.n, w.k, p.policy, first,
@@ -28,8 +40,18 @@ std::size_t mtp_kv_workspace_bytes(const MtpProjectionParameters& parameters,
                                    const AttentionConfig& config, std::int32_t first,
                                    std::int32_t last) {
     if (parameters.rows) {
-        return ops::linear_pair_workspace_capacity_bytes((*parameters.rows)[1].weight,
-                                                         (*parameters.rows)[3].weight, first, last);
+        const auto& k = (*parameters.rows)[1];
+        const auto& v = (*parameters.rows)[3];
+        if (k.weight.layout == QuantLayout::GgufNative ||
+            v.weight.layout == QuantLayout::GgufNative) {
+            // Native GGUF K/V are separate parents, so the Q8 pair form does not apply.
+            return std::max(
+                ops::linear_workspace_capacity_bytes(k.weight.qtype, k.weight.n, k.weight.k,
+                                                     ops::LinearPolicy::A16Only, first, last),
+                ops::linear_workspace_capacity_bytes(v.weight.qtype, v.weight.n, v.weight.k,
+                                                     ops::LinearPolicy::A16Only, first, last));
+        }
+        return ops::linear_pair_workspace_capacity_bytes(k.weight, v.weight, first, last);
     }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {dimension(config.query_width()), last});
@@ -59,7 +81,22 @@ std::size_t mtp_query_gate_workspace_bytes(const MtpProjectionParameters& parame
 void mtp_projection(const Tensor& hidden, const MtpProjectionParameters& parameters,
                     const AttentionConfig& config, Tensor& query, Tensor& gate, Tensor& key,
                     Tensor& value, WorkspaceArena& workspace, cudaStream_t stream) {
-    const auto& p = parameters.packed;
+    if (const auto* gguf = std::get_if<ops::GgufProjectionWeights>(&parameters.packed)) {
+        // Public output order is q, gate, k, v.
+        for (const auto& part : gguf->parts) {
+            if (part.row != 0) {
+                throw std::invalid_argument(
+                    "MTP projection: a GGUF part must fill its output from row zero");
+            }
+            Tensor* out = part.output == 0   ? &query
+                          : part.output == 1 ? &gate
+                          : part.output == 2 ? &key
+                                             : &value;
+            ops::linear(hidden, part.weight, *out, ops::LinearPolicy::A16Only, workspace, stream);
+        }
+        return;
+    }
+    const auto& p = std::get<LinearParameters>(parameters.packed);
     if (!parameters.rows) {
         ops::attn_input_proj(hidden, p.weight, query, gate, key, value, p.policy, workspace,
                              stream);
@@ -84,8 +121,16 @@ void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& para
                        const AttentionConfig& config, Tensor& key, Tensor& value,
                        WorkspaceArena& workspace, cudaStream_t stream) {
     if (parameters.rows) {
-        ops::linear_pair(hidden, (*parameters.rows)[1].weight, (*parameters.rows)[3].weight, key,
-                         value, stream);
+        const auto& k = (*parameters.rows)[1];
+        const auto& v = (*parameters.rows)[3];
+        if (k.weight.layout == QuantLayout::GgufNative ||
+            v.weight.layout == QuantLayout::GgufNative) {
+            // Native GGUF K/V are separate parents: project each on its own.
+            ops::linear(hidden, k.weight, key, ops::LinearPolicy::A16Only, workspace, stream);
+            ops::linear(hidden, v.weight, value, ops::LinearPolicy::A16Only, workspace, stream);
+            return;
+        }
+        ops::linear_pair(hidden, k.weight, v.weight, key, value, stream);
         return;
     }
     auto scope   = workspace.scope();

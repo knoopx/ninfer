@@ -5,9 +5,11 @@
 #include "ops/common/math.h"
 #include "ops/kernel/embed_gather.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "strata/kernels/iq_kernels.hpp"
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -156,6 +158,23 @@ void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, Tensor& out
         launch_fp8<10, 128>(ids, table, out, stream);
     else
         launch_fp8<5, 128>(ids, table, out, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void embed_gather_gguf_launch(const Tensor& ids, const Weight& table, Tensor& out, float* scratch,
+                              cudaStream_t stream) {
+    const std::int32_t d = out.ne[0];
+    const std::int32_t T = ids.ne[0];
+    if (scratch == nullptr) {
+        throw std::invalid_argument("embed_gather_gguf: a scratch plane is required");
+    }
+    const auto row_bytes = static_cast<std::size_t>(table.payload_bytes / table.n);
+    strata::kernels::iq_embed_rows(table.ggml_type, table.payload, row_bytes,
+                                   static_cast<const std::int32_t*>(ids.data), T, d, scratch,
+                                   stream);
+    const auto total = static_cast<std::int64_t>(d) * T;
+    embed_gather_gguf_transpose_kernel<<<grid_for(total), kBlock, 0, stream>>>(
+        scratch, static_cast<__nv_bfloat16*>(out.data), T, d);
     CUDA_CHECK(cudaGetLastError());
 }
 

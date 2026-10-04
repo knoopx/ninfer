@@ -3,9 +3,17 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+    # Strata (github.com/Niko1221/Strata) has no flake — fetch the source tree
+    # (header-only GGUF reader, CUDA kernels, ggml block-layout headers) and
+    # pin it to a commit for reproducibility.
+    strata = {
+      url = "github:Niko1221/Strata/6f32ec070f23ced9f50e704d854d775da52591ab";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, strata }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs {
@@ -110,6 +118,8 @@
         cmakeFlags = [
           "-DCMAKE_CUDA_ARCHITECTURES=120a"
           "-DNINFER_WEBUI_SRC=${llamaWebui}/share/ninfer/webui"
+          # The fetched Strata source tree (GGUF reader + CUDA kernels).
+          "-DNINFER_STRATA_SRC=${strata}"
           # Opt out of the Ninja clang-scan-deps `.ddi` rule (see the comment on
           # the scandepsDisable store path): with CMAKE_CXX_SCANDEP_SOURCE unset
           # the Ninja generator falls back to compiler-based dependency
@@ -186,6 +196,10 @@
           (pkgs.spdlog.override { staticBuild = true; })
           pkgs.utf8proc
         ];
+
+        # Expose the fetched Strata source tree to out-of-flake dev builds in
+        # /tmp/ninfer-build (cmake -DNINFER_STRATA_SRC=$NINFER_STRATA_SRC).
+        env.NINFER_STRATA_SRC = "${strata}";
       };
     };
 }

@@ -25,6 +25,10 @@ void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, Tensor& out
                              cudaStream_t stream);
 void embed_gather_q8_2048_launch(const Tensor& ids, const Weight& table, Tensor& out,
                                  Q8EmbedRoute route, cudaStream_t stream);
+// Native GGUF table: strata's iq_embed_rows dequantizes the selected rows to the caller's FP32
+// scratch in [T, d] order, then the transpose pass writes the op's [d, T] BF16 output.
+void embed_gather_gguf_launch(const Tensor& ids, const Weight& table, Tensor& out, float* scratch,
+                              cudaStream_t stream);
 const char* q8_embed_route_name(Q8EmbedRoute route);
 
 } // namespace ninfer::ops::detail

@@ -53,12 +53,18 @@ public:
     }
 
     DenseParameters dense(const DenseWeights& w) const {
-        return {with_context(model_.weight(w.gate).name,
-                             [&] {
-                                 return ops::prepare_linear_swiglu_weight(model_.input(w.gate),
-                                                                          model_.input(w.up));
-                             }),
-                linear(w.down)};
+        DenseParameters out;
+        out.down = linear(w.down);
+        // Native GGUF gate/up are separate parents: the fused SwiGLU bank cannot be built.
+        if (model_.weight(w.gate).view.parts.front().parent->geometry.layout ==
+            QuantLayout::GgufNative) {
+            out.gguf_gate_up = std::array{linear(w.gate), linear(w.up)};
+            return out;
+        }
+        out.gate_up = with_context(model_.weight(w.gate).name, [&] {
+            return ops::prepare_linear_swiglu_weight(model_.input(w.gate), model_.input(w.up));
+        });
+        return out;
     }
 
     FfnParameters ffn(const BlockWeights& w) const {
@@ -115,8 +121,11 @@ public:
 
     ops::SparseMoeHints prefetch(const ops::ProjectionWeights& projection, WeightId query) const {
         const auto* single = std::get_if<LinearParameters>(&projection);
+        const auto* gguf   = std::get_if<ops::GgufProjectionWeights>(&projection);
         const auto& weight =
-            single ? single->weight : std::get<ops::PairedProjectionWeights>(projection).first;
+            single   ? single->weight
+            : gguf   ? gguf->parts.front().weight
+                     : std::get<ops::PairedProjectionWeights>(projection).first;
         const auto& geometry = model_.weight(query).view.parts.front().parent->geometry;
         const auto row_bytes = geometry.layout == QuantLayout::Contiguous
                                    ? std::uint64_t(weight.k) * dtype_size(DType::BF16)
@@ -126,8 +135,6 @@ public:
 
     MtpParameters mtp(const MtpWeights& w) const {
         const auto& a = std::get<AttentionWeights>(w.layer.mixer);
-        const std::array inputs{model_.input(a.query), model_.input(a.key), model_.input(a.gate),
-                                model_.input(a.value)};
         MtpParameters out;
         out.input_projection    = linear(w.input_projection);
         out.embedding_norm      = tensor(w.embedding_norm);
@@ -135,7 +142,20 @@ public:
         out.input_norm          = tensor(w.layer.input_norm);
         out.post_attention_norm = tensor(w.layer.post_attention_norm);
         out.final_norm          = tensor(w.final_norm);
-        out.projection.packed   = ops::prepare_linear_weight(inputs);
+        // The complete Q/K/gate/V projection. A single-parent artifact keeps its packed bank; a
+        // native GGUF one has separate parents and uses the shared fused preparation.
+        const auto& first = model_.input(a.query).weight;
+        const bool gguf   = !first.parts.empty() && first.parts.front().parent != nullptr &&
+                          first.parts.front().parent->geometry.layout == QuantLayout::GgufNative;
+        if (gguf) {
+            out.projection.packed = ops::prepare_attn_input_proj_weights(
+                model_.input(a.query), model_.input(a.key), model_.input(a.gate),
+                model_.input(a.value));
+        } else {
+            const std::array packed{model_.input(a.query), model_.input(a.key),
+                                    model_.input(a.gate), model_.input(a.value)};
+            out.projection.packed = ops::prepare_linear_weight(packed);
+        }
         if (model_.config().text.architecture == Architecture::Qwen3_5) {
             out.projection.rows = {linear(a.query), linear(a.key), linear(a.gate), linear(a.value)};
         }

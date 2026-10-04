@@ -287,7 +287,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
         Tensor residual = work.alloc(DType::BF16, {dimension(target.hidden_size), width, batch});
         Tensor flat_residual = residual.view({dimension(target.hidden_size), columns});
         ops::embedding(ids.view({columns}), state.execution.parameters.text.token_embedding,
-                       flat_residual, stream);
+                       flat_residual, work, stream);
         for (std::size_t layer_index = 0; layer_index < weights.layers.size(); ++layer_index) {
             const auto& layer = weights.layers[layer_index];
             nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
@@ -340,8 +340,14 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                     work.alloc(DType::BF16, {dimension(config.intermediate_size), width, batch});
                 Tensor intermediate_flat =
                     intermediate.view({dimension(config.intermediate_size), columns});
-                project_swiglu(branch.prepared.view({dimension(target.hidden_size), columns}),
-                               layer.mlp.gate_up, intermediate_flat, work, stream);
+                if (layer.mlp.gguf_gate_up) {
+                    project_swiglu(branch.prepared.view({dimension(target.hidden_size), columns}),
+                                   (*layer.mlp.gguf_gate_up)[0], (*layer.mlp.gguf_gate_up)[1],
+                                   intermediate_flat, work, stream);
+                } else {
+                    project_swiglu(branch.prepared.view({dimension(target.hidden_size), columns}),
+                                   layer.mlp.gate_up, intermediate_flat, work, stream);
+                }
                 finish_dynamic_branch(state.execution, intermediate, layer.mlp.down,
                                       *layer.mlp_conv, branch.finish_delta, residual);
             }
@@ -413,7 +419,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
         Tensor residual =
             state.execution.work.alloc(DType::BF16, {dimension(target.hidden_size), columns});
         ops::embedding(ids.view({columns}), state.execution.parameters.text.token_embedding,
-                       residual, state.execution.device.stream);
+                       residual, state.execution.work, state.execution.device.stream);
 
         for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
             nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
@@ -502,8 +508,14 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                 auto roots = workspace::dflash_mlp(state.execution.work, target, config, columns);
                 ops::rmsnorm(residual, weight.post_attention_norm, config.rms_norm_eps, false,
                              roots.hidden, state.execution.device.stream);
-                project_swiglu(roots.hidden, weight.mlp.gate_up, roots.intermediate,
-                               state.execution.work, state.execution.device.stream);
+                if (weight.mlp.gguf_gate_up) {
+                    project_swiglu(roots.hidden, (*weight.mlp.gguf_gate_up)[0],
+                                   (*weight.mlp.gguf_gate_up)[1], roots.intermediate,
+                                   state.execution.work, state.execution.device.stream);
+                } else {
+                    project_swiglu(roots.hidden, weight.mlp.gate_up, roots.intermediate,
+                                   state.execution.work, state.execution.device.stream);
+                }
                 project_add(roots.intermediate, weight.mlp.down, residual, state.execution.work,
                             state.execution.device.stream);
             }

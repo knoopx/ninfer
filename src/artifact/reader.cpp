@@ -84,6 +84,7 @@ struct Reader::Impl {
 };
 
 Reader::Reader(const std::filesystem::path& path) : impl_(std::make_unique<Impl>(path)) {}
+Reader::Reader() = default;
 
 Reader::~Reader()                            = default;
 Reader::Reader(Reader&&) noexcept            = default;

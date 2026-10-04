@@ -3,6 +3,7 @@
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
+#include "ops/linear/gguf/gguf_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
@@ -98,6 +99,33 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP8_E4M3FN_ROW_BF16:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
+    case QType::GGUF_F16:
+    case QType::GGUF_Q4_0:
+    case QType::GGUF_Q4_1:
+    case QType::GGUF_Q5_0:
+    case QType::GGUF_Q5_1:
+    case QType::GGUF_Q8_0:
+    case QType::GGUF_Q8_1:
+    case QType::GGUF_Q2_K:
+    case QType::GGUF_Q3_K:
+    case QType::GGUF_Q4_K:
+    case QType::GGUF_Q5_K:
+    case QType::GGUF_Q6_K:
+    case QType::GGUF_Q8_K:
+    case QType::GGUF_IQ2_XXS:
+    case QType::GGUF_IQ2_XS:
+    case QType::GGUF_IQ2_S:
+    case QType::GGUF_IQ3_XXS:
+    case QType::GGUF_IQ1_S:
+    case QType::GGUF_IQ1_M:
+    case QType::GGUF_IQ3_S:
+    case QType::GGUF_IQ4_NL:
+    case QType::GGUF_IQ4_XS:
+    case QType::GGUF_I8:
+    case QType::GGUF_Q1_0:
+    case QType::GGUF_Q2_0:
+        detail::gguf_dispatch(x, w, out, policy, workspace, stream);
+        return;
     case QType::FP32:
     case QType::INT32:
         break;
@@ -142,6 +170,33 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
+    case QType::GGUF_F16:
+    case QType::GGUF_Q4_0:
+    case QType::GGUF_Q4_1:
+    case QType::GGUF_Q5_0:
+    case QType::GGUF_Q5_1:
+    case QType::GGUF_Q8_0:
+    case QType::GGUF_Q8_1:
+    case QType::GGUF_Q2_K:
+    case QType::GGUF_Q3_K:
+    case QType::GGUF_Q4_K:
+    case QType::GGUF_Q5_K:
+    case QType::GGUF_Q6_K:
+    case QType::GGUF_Q8_K:
+    case QType::GGUF_IQ2_XXS:
+    case QType::GGUF_IQ2_XS:
+    case QType::GGUF_IQ2_S:
+    case QType::GGUF_IQ3_XXS:
+    case QType::GGUF_IQ1_S:
+    case QType::GGUF_IQ1_M:
+    case QType::GGUF_IQ3_S:
+    case QType::GGUF_IQ4_NL:
+    case QType::GGUF_IQ4_XS:
+    case QType::GGUF_I8:
+    case QType::GGUF_Q1_0:
+    case QType::GGUF_Q2_0:
+        return detail::gguf_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
+                                                             min_tokens, max_tokens);
     case QType::FP32:
     case QType::INT32:
         break;

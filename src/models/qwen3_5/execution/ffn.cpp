@@ -22,6 +22,28 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
     WorkspaceLayoutBuilder layout;
+    if (p.gguf_gate_up) {
+        // Native GGUF gate/up are separate parents: two projections plus silu_mul.
+        const auto& gate = (*p.gguf_gate_up)[0];
+        const auto& up   = (*p.gguf_gate_up)[1];
+        (void)layout.alloc(DType::BF16, {gate.weight.n, last});
+        {
+            auto scope = layout.scope();
+            (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(
+                gate.weight.qtype, gate.weight.n, gate.weight.k, gate.policy, first, last));
+        }
+        (void)layout.alloc(DType::BF16, {up.weight.n, last});
+        {
+            auto scope = layout.scope();
+            (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(
+                up.weight.qtype, up.weight.n, up.weight.k, up.policy, first, last));
+        }
+        (void)layout.alloc(DType::BF16, {gate.weight.n, last});
+        (void)layout.alloc(DType::BF16, {down.n, last});
+        (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(down.qtype, down.n, down.k,
+                                                                      p.down.policy, first, last));
+        return layout.peak_bytes(1);
+    }
     if (mtp) {
         (void)layout.alloc(DType::BF16, {gu.n, last});
         {
@@ -66,6 +88,27 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     const auto& p    = std::get<DenseParameters>(parameters);
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
+    if (p.gguf_gate_up) {
+        // Native GGUF gate/up are separate parents: project each on its own, then silu_mul.
+        const auto& gate = (*p.gguf_gate_up)[0];
+        const auto& up   = (*p.gguf_gate_up)[1];
+        Tensor g = workspace.alloc(DType::BF16, {gate.weight.n, columns});
+        Tensor u = workspace.alloc(DType::BF16, {up.weight.n, columns});
+        {
+            auto call = workspace.scope();
+            ops::linear(hidden, gate.weight, g, gate.policy, workspace, stream);
+        }
+        {
+            auto call = workspace.scope();
+            ops::linear(hidden, up.weight, u, up.policy, workspace, stream);
+        }
+        Tensor activation = workspace.alloc(DType::BF16, {gate.weight.n, columns});
+        ops::silu_mul(g, u, activation, stream);
+        Tensor delta = workspace.alloc(DType::BF16, {down.n, columns});
+        ops::linear(activation, down, delta, p.down.policy, workspace, stream);
+        ops::residual_add(delta, residual, stream);
+        return;
+    }
     if (mtp) {
         Tensor gate_up = workspace.alloc(DType::BF16, {gu.n, columns});
         {

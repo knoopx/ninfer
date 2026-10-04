@@ -25,6 +25,7 @@ struct TextPrefillRoots {
     Tensor positions;
     Tensor rope_positions;
     Tensor residual;
+    Tensor embedding_scratch;
     Tensor scatter_indices;
 };
 
@@ -37,6 +38,9 @@ TextPrefillRoots text_prefill_roots(Allocator& allocator, const TextConfig& conf
     out.positions = vector(allocator, DType::I32, tokens);
     if (rope_axes != 0) { out.rope_positions = matrix(allocator, DType::I32, tokens, rope_axes); }
     out.residual = matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens);
+    // The embedding op's native GGUF dequantizer writes rows through an FP32 [d,T] scratch.
+    out.embedding_scratch =
+        matrix(allocator, DType::FP32, dimension(config.hidden_size), tokens);
     if (scatter_tokens != 0) {
         out.scatter_indices = vector(allocator, DType::I32, scatter_tokens);
     }
@@ -139,6 +143,7 @@ Tensor post_mixer_hidden(Allocator& allocator, const TextConfig& config, std::in
 
 struct MtpStemRoots {
     Tensor embedding;
+    Tensor embedding_scratch;
     Tensor normalized_embedding;
     Tensor normalized_hidden;
     Tensor packed_input;
@@ -152,6 +157,9 @@ MtpStemRoots mtp_stem(Allocator& allocator, const TextConfig& config, std::int32
     MtpStemRoots out;
     if (allocate_embedding) {
         out.embedding = matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens);
+        // The embedding op's native GGUF dequantizer writes rows through an FP32 [d,T] scratch.
+        out.embedding_scratch =
+            matrix(allocator, DType::FP32, dimension(config.hidden_size), tokens);
     }
     out.normalized_embedding =
         matrix(allocator, DType::BF16, dimension(config.hidden_size), tokens);

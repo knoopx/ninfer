@@ -18,7 +18,25 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "strata": "strata"
+      }
+    },
+    "strata": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791116196,
+        "narHash": "sha256-9jqmV+AbGKiOqW1DvKjqBLVXmJCI9o6WI85QoHj5vBI=",
+        "owner": "Niko1221",
+        "repo": "Strata",
+        "rev": "6f32ec070f23ced9f50e704d854d775da52591ab",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Niko1221",
+        "repo": "Strata",
+        "rev": "6f32ec070f23ced9f50e704d854d775da52591ab",
+        "type": "github"
       }
     }
   },

@@ -112,6 +112,43 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
     return {native_weight(view, divisor), policy};
 }
 
+bool gguf_parent(const WeightInput& input) {
+    return !input.weight.parts.empty() && input.weight.parts.front().parent != nullptr &&
+           input.weight.parts.front().parent->geometry.layout == QuantLayout::GgufNative;
+}
+
+// Native GGUF parts of a fused input projection. Each logical input is prepared independently (a
+// single input is one parent, so it is always a contiguous region); consecutive parts that
+// continue one parent's rows into one output's rows are merged, which recovers a combined q/k/v
+// parent as a single operand per output.
+GgufProjectionWeights gguf_projection(std::span<const WeightInput> inputs,
+                                      std::span<const std::int32_t> outputs,
+                                      std::span<const std::int32_t> rows) {
+    GgufProjectionWeights result;
+    const WeightParent* previous = nullptr;
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        require(gguf_parent(inputs[i]), "input projection: GGUF parts cannot mix formats");
+        const auto* parent = inputs[i].weight.parts.front().parent;
+        auto part          = single(inputs.subspan(i, 1));
+        if (!result.parts.empty() && parent == previous) {
+            auto& last = result.parts.back();
+            const auto row_bytes =
+                last.weight.payload_bytes / static_cast<std::uint64_t>(last.weight.n);
+            if (part.weight.qtype == last.weight.qtype && outputs[i] == last.output &&
+                rows[i] == last.row + last.weight.n) {
+                last.weight.n += part.weight.n;
+                last.weight.shape[0] = last.weight.padded_shape[0] = last.weight.n;
+                last.weight.payload_bytes =
+                    static_cast<std::uint64_t>(last.weight.n) * row_bytes;
+                continue;
+            }
+        }
+        previous = parent;
+        result.parts.push_back({part.weight, outputs[i], rows[i]});
+    }
+    return result;
+}
+
 ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool attention) {
     const auto& q      = matrix(inputs[0]);
     const auto& k      = matrix(inputs[1]);
@@ -128,6 +165,21 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
                   : q == std::vector<std::uint64_t>{2048, 2048} && k == q &&
                         third == std::vector<std::uint64_t>{4096, 2048} && fourth == third;
     require(dense || moe, "input projection: unsupported logical projection geometry");
+    if (std::any_of(inputs.begin(), inputs.end(), gguf_parent)) {
+        require(dense, "input projection: GGUF parts need the dense geometry");
+        const auto q = static_cast<std::int32_t>(matrix(inputs[0])[0]);
+        const auto k = static_cast<std::int32_t>(matrix(inputs[1])[0]);
+        if (attention) {
+            // Public output order is q, gate, k, v; the logical inputs are query, key, gate, value.
+            const std::array<std::int32_t, 4> outputs{0, 2, 1, 3};
+            const std::array<std::int32_t, 4> rows{0, 0, 0, 0};
+            return gguf_projection(inputs, outputs, rows);
+        }
+        // GDN: query, key, value fill the combined qkv output; z is its own output.
+        const std::array<std::int32_t, 4> outputs{0, 0, 0, 1};
+        const std::array<std::int32_t, 4> rows{0, q, q + k, 0};
+        return gguf_projection(inputs, outputs, rows);
+    }
     const auto joined = concatenate_rows(inputs);
     if (contiguous(joined)) {
         auto result       = single(inputs);

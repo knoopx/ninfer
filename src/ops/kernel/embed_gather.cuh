@@ -248,4 +248,16 @@ __launch_bounds__(256) __global__
     }
 }
 
+// GGUF gather: strata's row dequantizer emits one FP32 row per token in [T, d] order, so this
+// pass transposes the selected rows into the embedding op's [d, T] BF16 output.
+__global__ void embed_gather_gguf_transpose_kernel(const float* src, __nv_bfloat16* dst,
+                                                   std::int32_t tokens, std::int32_t width) {
+    const std::int64_t total = static_cast<std::int64_t>(tokens) * width;
+    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= total) { return; }
+    const auto row = static_cast<std::int32_t>(index / width);
+    const auto col = static_cast<std::int32_t>(index % width);
+    dst[static_cast<std::int64_t>(col) * tokens + row] = __float2bfloat16(src[index]);
+}
+
 } // namespace ninfer::ops

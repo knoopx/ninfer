@@ -1,5 +1,6 @@
 #include "runtime/engine/model_instance.h"
 #include "artifact/reader.h"
+#include "artifact/gguf.h"
 #include "artifact/formats.h"
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
@@ -20,8 +21,9 @@ void validate_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
-    if (options.artifact_path.extension() != ".ninfer") {
-        throw std::invalid_argument("NInfer accepts only .ninfer artifacts");
+    const auto extension = options.artifact_path.extension();
+    if (extension != ".ninfer" && extension != ".gguf") {
+        throw std::invalid_argument("NInfer accepts only .ninfer and .gguf artifacts");
     }
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
@@ -132,10 +134,15 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     validate_options(options);
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
-    artifact::Reader reader(options.artifact_path);
+    std::unique_ptr<artifact::Reader> reader;
+    if (options.artifact_path.extension() == ".gguf") {
+        reader = std::make_unique<artifact::GgufReader>(options.artifact_path);
+    } else {
+        reader = std::make_unique<artifact::Reader>(options.artifact_path);
+    }
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
-    auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));
+    auto plan = models::qwen3_5::plan_load(*reader, models::load_options(options));
     binding.complete();
     auto model =
         models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);

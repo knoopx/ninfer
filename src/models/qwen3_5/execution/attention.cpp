@@ -1,8 +1,10 @@
 #include "models/qwen3_5/execution/attention.h"
 
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/rope.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -24,6 +26,17 @@ std::size_t attention_projection_workspace_bytes(const AttentionParameters& para
     if (first <= 0 || last < first) {
         throw std::invalid_argument("attention projection: invalid column interval");
     }
+    if (const auto* gguf = std::get_if<ops::GgufProjectionWeights>(&parameters.projection)) {
+        // Native GGUF parents are separate Linear operands, so the fused Op's workspace does not
+        // apply; each part needs its own Linear capacity.
+        std::size_t bytes = 0;
+        for (const auto& part : gguf->parts) {
+            bytes = std::max(bytes, ops::linear_workspace_capacity_bytes(
+                                        part.weight.qtype, part.weight.n, part.weight.k,
+                                        ops::LinearPolicy::A16Only, first, last));
+        }
+        return bytes;
+    }
     if (const auto* single = std::get_if<LinearParameters>(&parameters.projection)) {
         const auto& weight = single->weight;
         return ops::attn_input_proj_workspace_capacity_bytes(weight.qtype, weight.n, weight.k,
@@ -35,6 +48,23 @@ std::size_t attention_projection_workspace_bytes(const AttentionParameters& para
 void attention_projection(const Tensor& hidden, const AttentionParameters& parameters,
                           Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                           WorkspaceArena& workspace, cudaStream_t stream) {
+    if (const auto* gguf = std::get_if<ops::GgufProjectionWeights>(&parameters.projection)) {
+        // Native GGUF q/k/v/gate are separate parents (or row ranges of one combined parent), so
+        // each part is projected on its own into the public output slot it fills: 0=q, 1=gate,
+        // 2=k, 3=v.
+        for (const auto& part : gguf->parts) {
+            if (part.row != 0) {
+                throw std::invalid_argument(
+                    "attention projection: a GGUF part must fill its output from row zero");
+            }
+            Tensor* out = part.output == 0   ? &query
+                          : part.output == 1 ? &gate
+                          : part.output == 2 ? &key
+                                             : &value;
+            ops::linear(hidden, part.weight, *out, ops::LinearPolicy::A16Only, workspace, stream);
+        }
+        return;
+    }
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value, stream);
     } else {

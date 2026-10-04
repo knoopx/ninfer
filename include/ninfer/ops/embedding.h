@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/arena.h"
 #include "core/weight.h"
 #include "core/tensor.h"
 
@@ -24,5 +25,13 @@ namespace ninfer::ops {
  * There is no workspace or persistent state side effect.
  */
 void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream);
+
+/**
+ * Native GGUF table form. In addition to the forms above, `table` may be a `GgufNative` quantized
+ * table; the dequantizer needs a caller-owned FP32 row scratch of `T * D` floats, taken from
+ * `workspace`. The other forms ignore the workspace.
+ */
+void embedding(const Tensor& ids, const Weight& table, Tensor& out, WorkspaceArena& workspace,
+               cudaStream_t stream);
 
 } // namespace ninfer::ops

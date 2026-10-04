@@ -57,6 +57,24 @@ void project(const Tensor& x, const LinearParameters& parameters, Tensor& out,
     ops::linear(x, parameters.weight, out, parameters.policy, workspace, stream);
 }
 
+// The residual-producing projection. Native GGUF weights have no fused linear_add route, so the
+// projection is applied on its own and added to the residual.
+void project_add(const Tensor& input, const LinearParameters& parameters, Tensor& residual,
+                 WorkspaceArena& workspace, cudaStream_t stream) {
+    if (parameters.weight.layout == QuantLayout::GgufNative) {
+        const auto columns = residual.ne[1];
+        Tensor delta       = workspace.alloc(DType::BF16, {parameters.weight.n, columns});
+        {
+            auto scope = workspace.scope();
+            ops::linear(input, parameters.weight, delta, parameters.policy, workspace, stream);
+        }
+        ops::residual_add(delta, residual, stream);
+        return;
+    }
+    auto scope = workspace.scope();
+    ops::linear_add(input, parameters.weight, residual, parameters.policy, workspace, stream);
+}
+
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
     if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
         destination.data == nullptr) {
@@ -304,7 +322,7 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
         emb = input_embeddings->view({dimension(config_.hidden_size), T});
     } else {
         emb = roots.embedding;
-        ops::embedding(flat_ids, *embed_, emb, s);
+        ops::embedding(flat_ids, *embed_, emb, work_, s);
     }
 
     Tensor e = roots.normalized_embedding;
@@ -700,7 +718,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
 
         Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
-        ops::embedding(ids, *embed_, x, stream);
+        ops::embedding(ids, *embed_, x, work_, stream);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
@@ -754,7 +772,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
 
         Tensor x        = work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
         Tensor flat_ids = ids.view({columns});
-        ops::embedding(flat_ids, *embed_, x, stream);
+        ops::embedding(flat_ids, *embed_, x, work_, stream);
         if constexpr (Tap::enabled) { tap.begin(x); }
         run_layers(x, Phase::Verify, tap);
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
@@ -921,8 +939,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     ops::sigmoid_mul(gate, a, s);
 
-    ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    project_add(a.view({dimension(config_.attention->query_width()), T}), p.output, x, work_, s);
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
@@ -1056,8 +1073,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                            dimension(config_.gdn->linear_num_value_heads), T});
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
 
-    ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+    project_add(on.view({dimension(config_.gdn->value_width()), T}), p.output, x, work_, s);
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1252,7 +1268,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;
-            ops::embedding(ids_device, *embed_, x, s);
+            ops::embedding(ids_device, *embed_, x, work_, s);
             if (!local_scatter_indices.empty()) {
                 Tensor indices_device = roots.scatter_indices;
                 copy_i32(local_scatter_indices.data(), indices_device, s);
@@ -1328,7 +1344,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 if (multimodal != nullptr) {
                     mtp_input_embeddings =
                         work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
-                    ops::embedding(mtp_ids, *embed_, mtp_input_embeddings, s);
+                    ops::embedding(mtp_ids, *embed_, mtp_input_embeddings, work_, s);
                     if (vision_chunk.control != nullptr) {
                         const qwen3_5::MtpVisualOverlap overlap = qwen3_5::shifted_visual_overlap(
                             vision_chunk.control->scatter_indices, alignment_tokens, mtp_window);

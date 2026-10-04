@@ -5,6 +5,15 @@
 namespace ninfer::models::qwen3_5 {
 
 void parse_resources(FrontendResources& resources, const Config& config) {
+    // GGUF artifacts are token-input-only: the four text resource objects are synthesized empty
+    // (0 bytes), so there is no tokenizer sidecar. prepare_tokens/score_tokens/generate-with-
+    // token-ids are supported; text-prompt (string) inputs are unavailable without a tokenizer.
+    // Token-only guard: with an empty tokenizer_json, resources.tokenizer stays null,
+    // public_token_count stays 0, and the vision-preprocessor, stop-token, and DFlash2 selector
+    // checks are all skipped. The non-empty (.ninfer) path below is unchanged.
+    if (resources.tokenizer_json.empty()) {
+        return;
+    }
     resources.tokenizer = std::make_shared<const frontend::Tokenizer>(
         frontend::TokenizerResources{resources.tokenizer_json, resources.tokenizer_config_json,
                                      resources.generation_config_json});

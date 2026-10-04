@@ -350,6 +350,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last) {
+        if (p.weight.layout == QuantLayout::GgufNative) {
+            // The GGUF output projection is a plain Linear plus the delta plane it adds.
+            matrix(layout, DType::BF16, p.weight.n, last);
+            scratch(layout, ops::linear_workspace_capacity_bytes(
+                                p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last));
+            return;
+        }
         scratch(layout, ops::linear_add_workspace_capacity_bytes(
                             p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last));
     };
@@ -640,6 +647,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 WorkspaceLayoutBuilder layout;
                 const std::int32_t tokens = width * batch;
                 matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
+                // The embedding op's native GGUF dequantizer writes rows through an FP32 [d,T]
+                // scratch.
+                matrix(layout, DType::FP32, dimension(config.hidden_size), tokens);
                 if (draft->dflash2.has_value()) {
                     const auto prepare = [&] {
                         (void)workspace::dflash2_branch(layout, config, *draft, width, batch);
@@ -674,6 +684,22 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         prepare();
                         matrix(layout, DType::BF16, dimension(draft->intermediate_size), tokens);
                         for (const auto& block : parameters.draft->layers) {
+                            if (block.mlp.gguf_gate_up) {
+                                const auto& gate = (*block.mlp.gguf_gate_up)[0];
+                                const auto& up   = (*block.mlp.gguf_gate_up)[1];
+                                scratch(layout, ops::linear_workspace_capacity_bytes(
+                                                    gate.weight.qtype, gate.weight.n,
+                                                    gate.weight.k, gate.policy, tokens, tokens));
+                                scratch(layout, ops::linear_workspace_capacity_bytes(
+                                                    up.weight.qtype, up.weight.n, up.weight.k,
+                                                    up.policy, tokens, tokens));
+                                // The two projected planes the pair consumes.
+                                matrix(layout, DType::BF16, dimension(draft->intermediate_size),
+                                       tokens);
+                                matrix(layout, DType::BF16, dimension(draft->intermediate_size),
+                                       tokens);
+                                continue;
+                            }
                             const auto& p = block.mlp.gate_up;
                             scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
                                                 p.weight.qtype, p.weight.n, p.weight.k, p.policy,
@@ -725,6 +751,20 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     auto mlp = layout.scope();
                     (void)workspace::dflash_mlp(layout, config, *draft, tokens);
                     for (const auto& block : parameters.draft->layers) {
+                        if (block.mlp.gguf_gate_up) {
+                            const auto& gate = (*block.mlp.gguf_gate_up)[0];
+                            const auto& up   = (*block.mlp.gguf_gate_up)[1];
+                            scratch(layout, ops::linear_workspace_capacity_bytes(
+                                                gate.weight.qtype, gate.weight.n, gate.weight.k,
+                                                gate.policy, tokens, tokens));
+                            scratch(layout, ops::linear_workspace_capacity_bytes(
+                                                up.weight.qtype, up.weight.n, up.weight.k,
+                                                up.policy, tokens, tokens));
+                            // The two projected planes the pair consumes.
+                            matrix(layout, DType::BF16, dimension(draft->intermediate_size), tokens);
+                            matrix(layout, DType::BF16, dimension(draft->intermediate_size), tokens);
+                            continue;
+                        }
                         const auto& p = block.mlp.gate_up;
                         scratch(layout, ops::linear_swiglu_workspace_capacity_bytes(
                                             p.weight.qtype, p.weight.n, p.weight.k, p.policy,

@@ -251,6 +251,7 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     out.high_plane_bytes = g.high_bytes;
     out.qtype            = g.format;
     out.layout           = g.layout;
+    out.ggml_type        = g.ggml_type;
     out.ndim             = 2;
     out.n = out.shape[0] = out.padded_shape[0] = dimension(view.shape[0]);
     out.k = out.shape[1] = out.padded_shape[1] = dimension(view.shape[1]);
@@ -273,6 +274,14 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     out.scales               = planes.scales;
     out.group_size           = static_cast<std::uint32_t>(g.group_size);
     out.group                = g.group_size ? dimension(g.group_size) : 0;
+    if (g.layout == QuantLayout::GgufNative) {
+        // A GgufNative weight is consumed through its raw GGUF bytes: the GGUF dispatch reads
+        // `payload` directly and requires `payload_bytes == n * row_bytes`. A row sub-range (a
+        // part of a combined q/k/v parent) therefore addresses its own first row and carries only
+        // its own bytes, not the parent's.
+        out.payload       = planes.codes;
+        out.payload_bytes = mul(planes.row_count, planes.code_row_bytes);
+    }
     out.weight_scale_divisor = region.parent->weight_scale_divisor;
     out.input_scale_divisor  = input_divisor;
     if (g.layout == QuantLayout::RowSplit) {

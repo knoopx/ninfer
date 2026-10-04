@@ -41,6 +41,8 @@ endif()
 
 include(cmake/Dependencies.cmake)
 include(cmake/NinferTargets.cmake)
+# Strata.cmake uses the ninfer_cuda_archive helper, so it loads after Ninfertargets.
+include(cmake/Strata.cmake)
 
 # --- Prebuilt webui bundling --------------------------------------------------
 # The webui is a required, always-bundled part of the build. NINFER_WEBUI_SRC must always

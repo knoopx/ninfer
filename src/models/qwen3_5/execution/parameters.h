@@ -25,6 +25,9 @@ using LinearParameters = ops::SingleProjectionWeight;
 struct DenseParameters {
     LinearParameters gate_up;
     LinearParameters down;
+    // Native GGUF FFN: the gate and up parents are separate tensors, so the fused SwiGLU bank
+    // above cannot be built and the two projections are applied on their own.
+    std::optional<std::array<LinearParameters, 2>> gguf_gate_up;
 };
 
 using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights>;
@@ -57,7 +60,9 @@ struct TextParameters {
 };
 
 struct MtpProjectionParameters {
-    LinearParameters packed;
+    // The complete Q/K/gate/V projection. Native GGUF parents are separate tensors, so this is the
+    // shared ProjectionWeights form rather than one packed Linear.
+    ops::ProjectionWeights packed;
     // Dense MTP projects K/V and Q/gate independently in its incremental path.
     // MoE MTP uses its existing complete-parent Attention projection.
     std::optional<std::array<LinearParameters, 4>> rows;

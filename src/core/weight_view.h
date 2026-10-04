@@ -36,6 +36,8 @@ struct WeightGeometry {
     std::uint64_t elements            = 0;
     std::uint64_t bytes               = 0;
     std::uint64_t alignment           = 256;
+    // ggml block-encoding id (strata::ggml_type_name); set only for GgufNative weights.
+    std::uint16_t ggml_type           = 0;
     std::uint64_t padded_columns      = 0;
     std::uint64_t group_size          = 0;
     std::uint64_t code_bytes_per_row  = 0;
@@ -47,6 +49,10 @@ struct WeightGeometry {
     std::uint64_t scale_offset        = 0;
     std::uint64_t scale_bytes         = 0;
     std::uint64_t divisor_offset      = 0;
+    // True when the bytes are reader-owned (an F32->BF16 cast of a GGUF float vector), served
+    // via Reader::read_object rather than a file-backed segment. The materializer uploads them
+    // with a direct host->device copy instead of the aligned file-I/O path.
+    bool owned_payload                 = false;
 };
 
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,

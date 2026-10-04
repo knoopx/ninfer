@@ -72,6 +72,19 @@ void require_weight_2d(const Weight& table) {
     }
 }
 
+void require_gguf_metadata(const Weight& table, const Tensor& out) {
+    require_weight_2d(table);
+    if (table.layout != QuantLayout::GgufNative) {
+        throw std::invalid_argument("embedding: GGUF table must be GgufNative");
+    }
+    if (table.shape[1] != out.ne[0]) {
+        throw std::invalid_argument("embedding: GGUF table d must match out.ne[0]");
+    }
+    if (table.ggml_type == 0 || table.payload == nullptr || table.n <= 0) {
+        throw std::invalid_argument("embedding: GGUF table metadata is incomplete");
+    }
+}
+
 void require_dense_metadata(const Weight& table, const Tensor& out) {
     if (table.layout != QuantLayout::Contiguous) {
         throw std::invalid_argument("embedding: BF16 table must be Contiguous");
@@ -192,9 +205,8 @@ void require_non_empty_tensors(const Tensor& ids, const Tensor& out) {
     }
 }
 
-} // namespace
-
-void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+void embedding_impl(const Tensor& ids, const Weight& table, Tensor& out,
+                    WorkspaceArena* workspace, cudaStream_t stream) {
     if (ids.dtype != DType::I32) { throw std::invalid_argument("embedding: ids must be I32"); }
     if (out.dtype != DType::BF16) { throw std::invalid_argument("embedding: out must be BF16"); }
 
@@ -233,8 +245,34 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         detail::embed_gather_fp8_launch(ids, table, out, stream);
         break;
     default:
+        if (table.layout == QuantLayout::GgufNative) {
+            require_gguf_metadata(table, out);
+            if (is_empty_T(ids, out)) { return; }
+            require_non_empty_tensors(ids, out);
+            if (workspace == nullptr) {
+                throw std::invalid_argument(
+                    "embedding: a native GGUF table requires a caller workspace");
+            }
+            const auto scratch_bytes =
+                static_cast<std::size_t>(ids.ne[0]) * static_cast<std::size_t>(out.ne[0]);
+            auto* scratch = static_cast<float*>(
+                workspace->alloc_bytes(scratch_bytes * sizeof(float), alignof(float)).data);
+            detail::embed_gather_gguf_launch(ids, table, out, scratch, stream);
+            break;
+        }
         throw std::invalid_argument("embedding: unsupported table qtype");
     }
+}
+
+} // namespace
+
+void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
+    embedding_impl(ids, table, out, nullptr, stream);
+}
+
+void embedding(const Tensor& ids, const Weight& table, Tensor& out, WorkspaceArena& workspace,
+               cudaStream_t stream) {
+    embedding_impl(ids, table, out, &workspace, stream);
 }
 
 } // namespace ninfer::ops

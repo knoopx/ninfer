@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <variant>
+#include <vector>
 
 namespace ninfer::ops {
 
@@ -26,7 +27,22 @@ struct PairedProjectionWeights {
     Weight first, second;
 };
 
-using ProjectionWeights = std::variant<SingleProjectionWeight, PairedProjectionWeights>;
+// One part of a fused input projection whose parent is a native GGUF weight. `output` selects the
+// fused output slot (q/gate/k/v for attention, qkv/z for GDN) and `row` the first row that part
+// fills within it. Consecutive parts of one parent merge, so a combined q/k/v parent contributes
+// one part per output while separate q/k/v parents contribute one part each.
+struct GgufProjectionPart {
+    Weight weight;
+    std::int32_t output = 0;
+    std::int32_t row    = 0;
+};
+
+struct GgufProjectionWeights {
+    std::vector<GgufProjectionPart> parts;
+};
+
+using ProjectionWeights =
+    std::variant<SingleProjectionWeight, PairedProjectionWeights, GgufProjectionWeights>;
 
 // Prepare the existing native forms; no device allocation, upload, execution or graph rewrite.
 // Runtime shape/phase choices and scratch remain with the actual calling Op.
