@@ -229,10 +229,8 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             if (!workspace_plan.vision || !request.base->vision_control_plan) {
                 throw std::logic_error("Vision replay has no prepared resource plan");
             }
-            request.replay.reset();
-            request.replay.emplace();
-            auto& replay  = *request.replay;
-            replay.prompt = replay_prompt(*request.base, sequence);
+            auto& replay = request.replay.emplace(
+                RequestControl::Prefill{.prompt = replay_prompt(*request.base, sequence)});
             VisionPrefillPlan plan;
             plan.control = std::make_shared<VisionControl>(
                 build_vision_control(replay.prompt, *request.base->vision_control_plan, 0));
