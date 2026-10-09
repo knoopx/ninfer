@@ -933,24 +933,29 @@ key-gated by `--api-key` like the other API paths.
 ### Model load and unload
 
 - `POST /models/load` — body `{"model": <id>}`. Runs the in-process router's on-demand load/swap.
-  A swap first DRAINS the evicted resident's live VRAM pins: in-flight Engine generation handles
-  keep the backend (its weights, KV cache, and CUDA graphs) and its VRAM alive, and the drain
-  waits on the backend's live-handle pin count reaching 0, bounded by the `healthCheckTimeout`.
-  Only then is the resident destroyed (the VRAM is actually freed) and the target loaded. This
-  is the single-GPU, one-resident, sequential-swap model — no concurrent residency and no
-  preemption of in-flight requests: on a drain timeout the swap is deferred (the resident is
-  restored intact) and the request is rejected.
+  A swap first DRAINS the evicted resident's live in-flight Grants AND its live VRAM handle
+  pins: both keep the backend (its weights, KV cache, and CUDA graphs) and its VRAM alive, and
+  the drain waits on both reaching 0, bounded by the `healthCheckTimeout`. A Grant without a
+  live handle (granted but not yet submitted, or whose handle was already released) keeps the
+  evicted backend + Engine alive, so draining the pin count alone would let the swap construct a
+  second Engine while the old model's VRAM is still resident → OOM. Only then is the resident
+  destroyed (the VRAM is actually freed) and the target loaded. This is the single-GPU,
+  one-resident, sequential-swap model — no concurrent residency and no preemption of in-flight
+  requests: on a drain timeout the swap is deferred (the resident is restored intact) and the
+  request is rejected.
   `extra_args` and other body fields are ignored (model config is fixed at registration).
   `200 {"model":<id>,"status":"loaded"}`; `400 model_required` when `model` is missing;
   `404 model_not_found` for an unknown id; `503 model_not_ready` when the load/swap does not
   reach a ready state (a failed load, a readiness timeout, a drain timeout with the evicted
-  resident still pinned, or a full swap-join queue). This
+  resident's in-flight grant or VRAM pin still live, or a full swap-join queue). This
   endpoint only triggers the load/swap and never does request-concurrency admission: the
   429 `server_overloaded` / 503 `request_queue_timeout` for in-flight generation requests
   originate from the engine layer (bounded FIFO ingress, `--max-pending-requests`), not from
   the router.
-- `POST /models/unload` — body `{"model": <id>}`. Forces the no-resident state: the single
-  resident is unloaded, and a named model that is not the loaded one still returns `200`.
+- `POST /models/unload` — body `{"model": <id>}`. Forces the no-resident state: the unload
+  DRAINS the resident (bounded by the `healthCheckTimeout`) before forcing the no-resident state,
+  and a named model that is not the loaded one still returns `200`. On a drain timeout the
+  resident is restored intact and the request is rejected with `503 model_not_ready`.
   `200 {"model":<id>,"status":"unloaded"}`; `404 model_not_found` for an unknown or missing
   `model`.
 
@@ -1108,7 +1113,7 @@ one model never affects another. Top-level config fields:
 | Field | Meaning | Default |
 |---|---|---:|
 | `models` | object mapping each public model ID to its entry; at least one entry required | none |
-| `healthCheckTimeout` | seconds the router waits for the evicted resident's VRAM-pin drain and the loaded model's readiness gate | `120` |
+| `healthCheckTimeout` | seconds the router waits for the evicted resident's in-flight grant + VRAM-pin drain and the loaded model's readiness gate | `120` |
 | `globalTTL` | idle seconds before a loaded model is unloaded; a model's own `ttl` wins when `> 0`; `0` disables auto-unload | `0` |
 
 Per-model entry fields (all optional; an absent field uses the default):

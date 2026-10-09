@@ -37,8 +37,8 @@ std::string EngineModelBackend::id() const { return model_id_; }
 bool EngineModelBackend::is_available() const { return service_->is_available(); }
 
 std::size_t EngineModelBackend::active_pins() const { return service_->active_pins(); }
-bool EngineModelBackend::wait_pin_release(std::chrono::steady_clock::time_point deadline) const {
-    return service_->wait_pin_release(deadline);
+bool EngineModelBackend::wait_pins_zero(std::chrono::steady_clock::time_point deadline) const {
+    return service_->wait_pins_zero(deadline);
 }
 
 PreparedRequest
@@ -299,14 +299,42 @@ std::string ModelRouter::loaded_id() const {
 }
 
 void ModelRouter::unload() {
+    std::shared_ptr<ModelBackend> evicted;
     std::string evicted_id;
     {
         std::lock_guard<std::mutex> lock(mu_);
-        auto evicted = std::move(resident_); // destroyed at scope exit (frees VRAM)
-        if (evicted) { evicted_id = evicted->id(); }
+        evicted = std::move(resident_); // moved out (no longer the resident)
+        if (evicted) {
+            evicted_id = evicted->id();
+            // Set swapping_ so a concurrent route() for ANY model queues behind the drain
+            // (a second load while the evicted VRAM is still referenced would OOM).
+            swapping_ = true;
+        }
         loaded_id_.clear();
     }
     cv_.notify_all(); // wake any joiners; they re-route
+    if (evicted) {
+        if (!drain_evicted(evicted, evicted_id)) {
+            // Drain timeout: restore the resident intact and reject the unload (the handler maps
+            // it to 503 model_not_ready). The swap-state reset mirrors the rejected-swap path.
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                resident_     = evicted;
+                loaded_id_    = evicted_id;
+                swapping_     = false;
+                scheduler_.drain();
+            }
+            cv_.notify_all();
+            throw std::runtime_error("model '" + evicted_id + "' is still pinned; unload rejected");
+        }
+        evicted.reset(); // VRAM freed outside the lock (every live reference is gone)
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            swapping_ = false;
+            scheduler_.drain();
+        }
+        cv_.notify_all();
+    }
     if (!evicted_id.empty()) {
         // Explicit unload (design §5.2), fired OUTSIDE mu_ (non-blocking w.r.t. the router).
         emit_status(ModelStatusEvent{"unloaded", evicted_id, 0.0, 0});
@@ -360,6 +388,12 @@ void ModelRouter::run_ttl_tick(std::chrono::steady_clock::time_point now) {
         // the request's lifetime; evicting here would strand the in-flight generation and let the
         // next request load a second Engine). Skip the unload this tick and revisit on a later tick.
         if (scheduler_.in_flight(loaded_id_) > 0) {
+            return;
+        }
+        // A retained GenerationHandle pins the Engine's VRAM the same way a Grant does: evicting
+        // now would leave the Engine (weights/KV cache/CUDA graphs) alive via the handle and the
+        // next load would construct a second Engine → OOM. Skip this tick, revisit on a later tick.
+        if (resident_ && resident_->active_pins() > 0) {
             return;
         }
         const int64_t idle_seconds =
@@ -423,6 +457,54 @@ void ModelRouter::emit_status(const ModelStatusEvent& ev) {
     }
 }
 
+bool ModelRouter::drain_evicted(const std::shared_ptr<ModelBackend>& evicted,
+                                const std::string& evicted_id) {
+    // At shutdown the process is exiting; VRAM is reclaimed at exit, so skip the drain (fast).
+    {
+        std::lock_guard<std::mutex> lock(shutdown_mu_);
+        if (shutdown_) {
+            return true;
+        }
+    }
+    // healthCheckTimeout bounds the drain (computed exactly as do_swap does today).
+    const int hct = base_options_.model_config.health_check_timeout > 0
+                        ? base_options_.model_config.health_check_timeout
+                        : 120; // DefaultHealthCheckTimeoutSeconds (process.go)
+    const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(hct);
+    for (;;) {
+        // The drain gates on BOTH the Grant in-flight counter AND the backend's live VRAM pin
+        // count: a Grant without a live handle keeps the backend + Engine alive, and a retained
+        // GenerationHandle pins the VRAM. Both must reach 0 before the evicted VRAM is freed.
+        bool drained = false;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            drained = scheduler_.in_flight(evicted_id) == 0 && evicted->active_pins() == 0;
+        }
+        if (drained) {
+            return true; // every live reference is gone: the VRAM is actually free
+        }
+        bool shutting_down;
+        {
+            std::lock_guard<std::mutex> lock(shutdown_mu_);
+            shutting_down = shutdown_;
+        }
+        if (shutting_down || std::chrono::steady_clock::now() >= drain_deadline) {
+            return false; // the caller restores the resident + rejects
+        }
+        // (a) Bounded wake on the Grant in-flight counter (nested drain_mu_ -> mu_ is safe: the
+        //     notifier locks drain_mu_ and never holds both with mu_).
+        {
+            std::unique_lock<std::mutex> lock(drain_mu_);
+            drain_cv_.wait_until(lock, drain_deadline, [this, &evicted_id] {
+                std::lock_guard<std::mutex> mu_lock(mu_);
+                return scheduler_.in_flight(evicted_id) == 0;
+            });
+        }
+        // (b) Bounded wake on the backend's live VRAM pin count (no busy-poll).
+        evicted->wait_pins_zero(drain_deadline);
+    }
+}
+
 void ModelRouter::do_swap(const ModelConfig& target) {
     // healthCheckTimeout bounds BOTH the evicted-resident drain (step 1) and the readiness gate
     // (step 3).
@@ -430,15 +512,16 @@ void ModelRouter::do_swap(const ModelConfig& target) {
                         ? base_options_.model_config.health_check_timeout
                         : 120; // DefaultHealthCheckTimeoutSeconds (process.go)
 
-    // 1. Evict the current resident and DRAIN its live-handle VRAM pins BEFORE freeing it
+    // 1. Evict the current resident and DRAIN it BEFORE freeing it
     //    (Option-B: process.go Stop on the evicted; the Engine has no unload(); destruction IS
     //    the unload).
     //
-    //    The drain gates on the evicted backend's REAL VRAM pin (active_pins(), the Engine's
-    //    live GenerationHandles), NOT the router's Grant in-flight counter: a Grant can be
-    //    destroyed (the in-flight count drops to 0) while a retained/streaming GenerationHandle
-    //    still pins the Engine's VRAM (weights, KV cache, CUDA graphs). Freeing the resident
-    //    here while its VRAM is still pinned, then constructing the target Engine on top, would
+    //    The drain (drain_evicted) gates on BOTH the evicted backend's live VRAM pin count
+    //    (active_pins(), the Engine's live GenerationHandles) AND the router's Grant in-flight
+    //    counter: a Grant without a live handle (granted but not yet submitted, or whose handle
+    //    was already released) keeps the backend + Engine alive, and a retained/streaming
+    //    GenerationHandle pins the Engine's VRAM (weights, KV cache, CUDA graphs). Freeing the
+    //    resident here while either is live, then constructing the target Engine on top, would
     //    leave BOTH models resident at once (concurrent residency -> OOM).
     //
     //    The drain is bounded by healthCheckTimeout and bails on shutdown. On timeout (or
@@ -454,35 +537,26 @@ void ModelRouter::do_swap(const ModelConfig& target) {
         loaded_id_.clear();
     }
     if (evicted) {
-        const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(hct);
-        for (;;) {
-            if (evicted->active_pins() == 0) {
-                break; // every live handle is gone: the VRAM is actually free
-            }
-            bool shutting_down;
+        // DRAIN the evicted resident (gate on the Grant in-flight counter + the live VRAM pin
+        // count; bounded by healthCheckTimeout, restoring the resident + rejecting the swap on
+        // timeout/shutdown -- the no-preemption policy).
+        if (!drain_evicted(evicted, evicted_id)) {
+            // Restore the evicted resident (it is NOT destroyed) and reject the swap. The
+            // swap-state reset mirrors the factory-failure path: a throw skips route()'s
+            // post-do_swap reset, so do_swap must leave swapping_ clear itself.
             {
-                std::lock_guard<std::mutex> lock(shutdown_mu_);
-                shutting_down = shutdown_;
+                std::lock_guard<std::mutex> lock(mu_);
+                resident_     = evicted;
+                loaded_id_    = evicted_id;
+                swapping_     = false;
+                swap_target_.clear();
+                scheduler_.drain();
             }
-            if (shutting_down || std::chrono::steady_clock::now() >= drain_deadline) {
-                // Restore the evicted resident (it is NOT destroyed) and reject the swap. The
-                // swap-state reset mirrors the factory-failure path: a throw skips route()'s
-                // post-do_swap reset, so do_swap must leave swapping_ clear itself.
-                {
-                    std::lock_guard<std::mutex> lock(mu_);
-                    resident_     = evicted;
-                    loaded_id_    = evicted_id;
-                    swapping_     = false;
-                    swap_target_.clear();
-                    scheduler_.drain();
-                }
-                cv_.notify_all();
-                throw std::runtime_error("model '" + target.id + "': evicted model '" + evicted_id +
-                                         "' is still pinned; swap rejected");
-            }
-            evicted->wait_pin_release(drain_deadline); // wake on a real pin release (not a poll)
+            cv_.notify_all();
+            throw std::runtime_error("model '" + target.id + "': evicted model '" + evicted_id +
+                                     "' is still pinned; swap rejected");
         }
-        evicted.reset(); // VRAM freed outside the lock (every live handle is gone)
+        evicted.reset(); // VRAM freed outside the lock (every live reference is gone)
     }
 
     // Status hook (design §5.2), fired OUTSIDE mu_ (do_swap runs with route()'s lock released):
@@ -594,8 +668,17 @@ void ModelRouter::ttl_loop() {
 }
 
 void ModelRouter::release_in_flight(std::string_view model) {
-    std::lock_guard<std::mutex> lock(mu_);
-    scheduler_.release_in_flight(model);
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        scheduler_.release_in_flight(model);
+    }
+    // Notify the drain (sequentially, NOT nested under mu_): lock drain_mu_ briefly so the
+    // notification happens-after any in-flight predicate check (no lost wakeup). The drain
+    // predicate is checked under drain_mu_, so this pairing is safe.
+    {
+        std::lock_guard<std::mutex> lock(drain_mu_);
+        drain_cv_.notify_all();
+    }
 }
 
 } // namespace ninfer::serve

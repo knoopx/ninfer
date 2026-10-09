@@ -851,7 +851,23 @@ void HttpServer::handle_model_unload(const httplib::Request& req, httplib::Respo
     // what was evicted (the single-resident system may have a different model loaded than the
     // one requested; e.g. the webui requests "other" but "res" is the loaded model).
     const std::string unloaded_id = router_->loaded_id();
-    router_->unload();
+    try {
+        // The unload DRAINS the resident (bounded by healthCheckTimeout) before forcing the
+        // no-resident state; on a drain timeout the resident is restored intact and this throws.
+        router_->unload();
+    } catch (const std::exception& exception) {
+        // A drained-unload timeout (the evicted resident's in-flight grant or VRAM pin is still
+        // live): the resident was restored, so the model is NOT unloaded. Mirror the
+        // handle_model_load exception mapping: 503 model_not_ready.
+        ApiError error;
+        error.status  = 503;
+        error.type    = "server_error";
+        error.param   = "model";
+        error.code    = "model_not_ready";
+        error.message = exception.what();
+        write_openai_error(res, error);
+        return;
+    }
     res.status = 200;
     res.set_content(nlohmann::json{{"model", unloaded_id.empty() ? model : unloaded_id},
                                    {"status", "unloaded"}}.dump(),

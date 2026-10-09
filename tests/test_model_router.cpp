@@ -113,9 +113,9 @@ public:
     // Ready once constructed (the fake has no async readiness; the construction block is the
     // "loading" window the concurrent test exercises).
     bool is_available() const override { return true; }
-    // No Engine (host fake): no live VRAM pins (the swap drain exits immediately).
+    // No Engine (host fake): no live VRAM pins (the swap drain's zero condition is already met).
     std::size_t active_pins() const override { return 0; }
-    bool wait_pin_release(std::chrono::steady_clock::time_point) const override { return false; }
+    bool wait_pins_zero(std::chrono::steady_clock::time_point) const override { return true; }
 
     ns::PreparedRequest
     prepare(const ns::GenerationRequest&, ns::GenerationConsumerMode,
@@ -156,9 +156,9 @@ public:
     explicit NeverReadyBackend(std::string id) : id_(std::move(id)) {}
     std::string id() const override { return id_; }
     bool is_available() const override { return false; }
-    // No Engine (host fake): no live VRAM pins (the swap drain exits immediately).
+    // No Engine (host fake): no live VRAM pins (the swap drain's zero condition is already met).
     std::size_t active_pins() const override { return 0; }
-    bool wait_pin_release(std::chrono::steady_clock::time_point) const override { return false; }
+    bool wait_pins_zero(std::chrono::steady_clock::time_point) const override { return true; }
     ns::PreparedRequest
     prepare(const ns::GenerationRequest&, ns::GenerationConsumerMode,
             ninfer::GenerationObservationOptions, std::function<bool()>,
@@ -226,9 +226,9 @@ public:
     }
     // Simulates a retained GenerationHandle pinning the VRAM: the drain never sees 0 pins.
     std::size_t active_pins() const override { return 1; }
-    // No real Engine (no pin-release notifier): a bounded no-op wait (the drain re-checks the
-    // deadline/shutdown and bails).
-    bool wait_pin_release(std::chrono::steady_clock::time_point) const override {
+    // No real Engine (no pin-release notifier): a bounded no-op wait (pins never reach 0; the
+    // drain re-checks the deadline/shutdown and bails).
+    bool wait_pins_zero(std::chrono::steady_clock::time_point) const override {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         return false;
     }
@@ -259,7 +259,7 @@ public:
     // count and the drain's bounded wait is a condition-variable wake on the release (no real
     // sleep), so the test controls the pin release deterministically.
     std::size_t active_pins() const override { return static_cast<std::size_t>(pins_.load()); }
-    bool wait_pin_release(std::chrono::steady_clock::time_point deadline) const override {
+    bool wait_pins_zero(std::chrono::steady_clock::time_point deadline) const override {
         std::unique_lock<std::mutex> lock(pin_mu_);
         pin_cv_.wait_until(lock, deadline, [this] { return pins_.load() == 0; });
         return pins_.load() == 0;
@@ -766,7 +766,10 @@ void test_10_swap_rejected_when_evicted_pinned() {
     CHECK(state.destroyed_of("res") == 0, "the restored resident was NOT destroyed");
     CHECK(router.swap_count() == 1, "the rejected swap did not count as a completed swap");
 
-    // The restored resident still serves: the fast path grants it.
+    // The restored resident still serves: the fast path grants it. (The original request
+    // completes: releasing `held` drops its in-flight reservation, so the joiner + fast-path
+    // grants are the only in-flight requests.)
+    held.reset(); // the original request completes
     ModelRouter::Grant fast = router.route("res");
     CHECK(fast.backend != nullptr && fast.backend->id() == "res",
           "the restored resident serves the next request (fast path)");
@@ -811,34 +814,93 @@ void test_11_swap_proceeds_when_evicted_pin_released() {
     CHECK(held.backend != nullptr && held.backend->active_pins() == 1,
           "the loaded backend reports one live VRAM pin (a retained handle)");
 
-    // A swap to "other" must DRAIN the evicted "res" pin first: the starter blocks in the drain
-    // until the pin is released.
+    // A swap to "other" must DRAIN the evicted "res" (its in-flight Grant AND its live VRAM pin)
+    // first: the starter blocks in the drain until BOTH are released.
     ModelRouter::Grant a_grant;
     std::thread A([&] { a_grant = router.route("other"); });
     CHECK(wait_for(std::chrono::milliseconds(500), [&] { return router.is_swapping(); }),
           "the swap is in flight (the drain is waiting on the pinned resident)");
+    CHECK(held.backend != nullptr && held.backend->active_pins() == 1,
+          "the evicted resident still reports one live VRAM pin (a retained handle)");
 
-    // Release the pin: the drain observes 0 live pins and proceeds.
+    // Release BOTH references that keep the evicted "res" alive: the in-flight Grant (the drain
+    // gates on the in-flight counter too) and the live VRAM pin. The drain observes 0 in-flight +
+    // 0 pins and proceeds.
+    held.reset(); // the original request completes (drops the Grant's in-flight reservation)
     res_backend->release_pins();
     CHECK(res_backend->active_pins() == 0, "the pin release is observed (0 live VRAM pins)");
     A.join();
 
     // The swap PROCEEDED: the target is constructed + installed, and the evicted "res" backend
-    // is destroyed (VRAM freed) once the last grant releases it.
+    // is destroyed (VRAM freed) by do_swap's evicted.reset() once no other reference remains
+    // (the in-flight Grant was released and the pin was released before the drain completed).
     CHECK(a_grant.backend != nullptr && a_grant.backend->id() == "other",
           "the starter's grant is the swapped-in model");
     CHECK(router.loaded_id() == "other", "the target model is now loaded");
     CHECK(router.swap_count() == 2, "the drain-completed swap counted as a completed swap");
     CHECK(!router.is_swapping(), "the swap state was cleared after completion");
     CHECK(state.constructed_of("other") == 1, "the target model was constructed");
-    CHECK(state.destroyed_of("res") == 0,
-          "the evicted backend is not destroyed while the in-flight grant references it");
-    // The evicted "res" backend is still referenced by the first grant (its shared_ptr);
-    // only when no grant references it is it destroyed (VRAM freed).
-    held.reset();
     CHECK(state.destroyed_of("res") == 1,
-          "releasing the grant destroyed the evicted backend (VRAM freed)");
+          "the evicted backend was destroyed once the drain released its last reference");
     CHECK(router.in_flight() == 1, "only the starter's grant is in-flight");
+    (void)a_grant;
+}
+
+void test_12_swap_drains_live_grant_before_swap() {
+    std::printf("[test] 12. swap drain: a live Grant (no handle) is drained before the swap "
+                "proceeds (the production OOM case)\n");
+    FakeState state;
+    Config config;
+    ModelConfig res;
+    res.id = "res";
+    res.artifact = "/tmp/res.ninfer";
+    res.ttl = 0;
+    config.models.push_back(res);
+    ModelConfig other;
+    other.id = "other";
+    other.artifact = "/tmp/other.ninfer";
+    other.ttl = 0;
+    config.models.push_back(other);
+    config.global_ttl = 0;
+    config.health_check_timeout = 5; // the drain bound (the grant is released well before it)
+
+    ModelRouter router(make_options(config), {}, [&state](const ModelConfig& model,
+                                                         const ninfer::StartupObserver&)
+                           -> std::unique_ptr<ModelBackend> {
+                           // "res" is a plain fake (active_pins() == 0); the LIVE Grant is what
+                           // keeps it alive. "other" is also a plain fake.
+                           return std::make_unique<FakeModelBackend>(model.id, &state, false);
+                       });
+
+    // Load "res" from the empty state and hold its Grant (the reference is the Grant, not a
+    // handle): active_pins() is 0, so the drain must gate on the Grant in-flight counter.
+    ModelRouter::Grant held = router.route("res");
+    CHECK(router.loaded_id() == "res", "the resident model is loaded");
+    CHECK(held.backend != nullptr && held.backend->active_pins() == 0,
+          "the loaded backend has no live VRAM pins (the live Grant is the reference)");
+
+    // A swap to "other" must DRAIN the live "res" Grant first: the target must NOT be constructed
+    // while the evicted backend is still referenced (the OOM prevention).
+    ModelRouter::Grant a_grant;
+    std::thread A([&] { a_grant = router.route("other"); });
+    CHECK(wait_for(std::chrono::milliseconds(500), [&] { return router.is_swapping(); }),
+          "the swap is in flight (the drain is waiting on the live Grant)");
+    CHECK(state.constructed_of("other") == 0,
+          "the target is NOT constructed while the evicted backend is still referenced (no OOM)");
+    CHECK(router.loaded_id().empty(), "mid-drain state: the loaded id is cleared");
+
+    // Release the live Grant: the drain observes 0 in-flight + 0 pins and proceeds.
+    held.reset();
+    A.join();
+
+    // The swap PROCEEDED: the target is constructed + installed, and the evicted "res" backend
+    // is destroyed (VRAM freed) once the live Grant released its last reference.
+    CHECK(a_grant.backend != nullptr && a_grant.backend->id() == "other",
+          "the starter's grant is the swapped-in model");
+    CHECK(router.loaded_id() == "other", "the target model is now loaded");
+    CHECK(state.destroyed_of("res") == 1,
+          "the evicted backend was destroyed once the live Grant released it");
+    CHECK(router.swap_count() == 2, "the drain-completed swap counted as a completed swap");
     (void)a_grant;
 }
 
@@ -855,6 +917,7 @@ int main() {
     test_9_ttl_skips_while_in_flight();
     test_10_swap_rejected_when_evicted_pinned();
     test_11_swap_proceeds_when_evicted_pin_released();
+    test_12_swap_drains_live_grant_before_swap();
 
     if (g_failures == 0) {
         std::printf("\nALL TESTS PASSED\n");

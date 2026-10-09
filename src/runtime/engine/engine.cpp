@@ -203,8 +203,9 @@ public:
     // are gone.
     std::atomic<std::size_t> live_handle_pins_{0};
     // Pin-release notification (guarded by pin_mutex_): a release monotonically bumps the count
-    // and notifies pin_cv_, so a bounded waiter (wait_handle_pin_release) wakes on a real pin
-    // release instead of busy-polling.
+    // and notifies pin_cv_. The waiter (wait_handle_pins_zero) gates on the LIVE pin count
+    // (live_handle_pins_ == 0), so a release between the drain's check and the wait is not
+    // missed; the monotonic count stays as a diagnostic/notification trigger, not the gate.
     std::uint64_t pin_release_count_{0};
     std::mutex pin_mutex_;
     std::condition_variable pin_cv_;
@@ -467,14 +468,13 @@ std::size_t Engine::active_handle_pins() const {
     return impl_ != nullptr ? impl_->live_handle_pins_.load(std::memory_order_acquire) : 0;
 }
 
-bool Engine::wait_handle_pin_release(std::chrono::steady_clock::time_point deadline) const {
-    if (impl_ == nullptr) { return false; }
+bool Engine::wait_handle_pins_zero(std::chrono::steady_clock::time_point deadline) const {
+    if (impl_ == nullptr) { return true; } // no engine ⇒ no pins
     std::unique_lock<std::mutex> lock(impl_->pin_mutex_);
-    const std::uint64_t before = impl_->pin_release_count_;
-    impl_->pin_cv_.wait_until(lock, deadline, [this, before] {
-        return impl_->pin_release_count_ != before;
+    impl_->pin_cv_.wait_until(lock, deadline, [this] {
+        return impl_->live_handle_pins_.load(std::memory_order_acquire) == 0;
     });
-    return impl_->pin_release_count_ != before;
+    return impl_->live_handle_pins_.load(std::memory_order_acquire) == 0;
 }
 
 void Engine::reset_memory_peaks() noexcept {

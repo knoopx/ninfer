@@ -137,10 +137,11 @@ public:
     [[nodiscard]] std::size_t active_pins() const {
         return engine_ != nullptr ? engine_->active_handle_pins() : 0;
     }
-    // Bounded wake on VRAM pin release (forwarded to the Engine; false when no engine). Lets the
-    // router's swap drain gate on the real pin without busy-polling.
-    [[nodiscard]] bool wait_pin_release(std::chrono::steady_clock::time_point deadline) const {
-        return engine_ != nullptr ? engine_->wait_handle_pin_release(deadline) : false;
+    // Bounded wake on the VRAM pin count reaching zero (forwarded to the Engine; a no-engine
+    // service has no pins, so it returns true immediately). Lets the router's swap drain gate
+    // on the real pin without busy-polling.
+    [[nodiscard]] bool wait_pins_zero(std::chrono::steady_clock::time_point deadline) const {
+        return engine_ != nullptr ? engine_->wait_handle_pins_zero(deadline) : true;
     }
 
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {

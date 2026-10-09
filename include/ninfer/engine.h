@@ -61,7 +61,7 @@ public:
     // Pimpl. The nested class NAME is public (its body stays opaque in this header) so a
     // GenerationHandle's Impl can hold a typed std::shared_ptr<Engine::Impl> keep-alive
     // back-reference: each live handle pins the Engine's VRAM and its destructor releases
-    // that pin (active_handle_pins / wait_handle_pin_release).
+    // that pin (active_handle_pins / wait_handle_pins_zero).
     class Impl;
 
     explicit Engine(EngineOptions options);
@@ -122,10 +122,11 @@ public:
     // destroying an evicted resident: the router's Grant in-flight counter can reach 0 while a
     // retained/streaming GenerationHandle still pins the VRAM (concurrent residency -> OOM).
     [[nodiscard]] std::size_t active_handle_pins() const;
-    // Bounded wake on live-handle pin release: blocks until a GenerationHandle is destroyed
-    // (its VRAM pin released) or `deadline` passes; returns true when a release was observed.
+    // Bounded wake on the live-handle pin count reaching zero: blocks until no GenerationHandle
+    // pins the Engine's VRAM (active_handle_pins() == 0) or `deadline` passes; returns true when
+    // zero live pins are observed (a no-engine Engine has no pins, so it returns true immediately).
     // Lets the serve router's swap drain gate on the real pin without busy-polling.
-    [[nodiscard]] bool wait_handle_pin_release(std::chrono::steady_clock::time_point deadline) const;
+    [[nodiscard]] bool wait_handle_pins_zero(std::chrono::steady_clock::time_point deadline) const;
 
     void reset_memory_peaks() noexcept;
 

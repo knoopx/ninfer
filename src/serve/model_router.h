@@ -72,14 +72,17 @@ public:
     [[nodiscard]] virtual bool is_available() const = 0;
 
     // Live VRAM pin count (the Engine's live GenerationHandles; 0 for a fake backend without an
-    // Engine). The router's swap drain gates on this (active_pins() == 0) BEFORE destroying an
-    // evicted resident: the Grant in-flight counter can reach 0 while a retained/streaming
-    // GenerationHandle still pins the VRAM (concurrent residency -> OOM).
+    // Engine). The router's swap drain gates on BOTH this (active_pins() == 0) AND the Grant
+    // in-flight counter (scheduler_.in_flight == 0) BEFORE destroying an evicted resident: a
+    // Grant without a live handle (granted but not yet submitted, or whose handle was already
+    // released) keeps the backend + Engine alive, so draining the pin count alone is not enough
+    // (concurrent residency -> OOM).
     [[nodiscard]] virtual std::size_t active_pins() const = 0;
-    // Bounded wake on VRAM pin release (see Engine::wait_handle_pin_release): blocks until a
-    // handle pin is released or `deadline` passes; returns true when a release was observed.
-    // Lets the swap drain gate on the real pin without busy-polling.
-    virtual bool wait_pin_release(std::chrono::steady_clock::time_point deadline) const = 0;
+    // Bounded wake on the VRAM pin count reaching zero (see Engine::wait_handle_pins_zero):
+    // blocks until no live handle pins the VRAM (active_pins() == 0) or `deadline` passes;
+    // returns true when zero live pins are observed. Lets the swap drain gate on the real pin
+    // without busy-polling.
+    virtual bool wait_pins_zero(std::chrono::steady_clock::time_point deadline) const = 0;
 
     // Generation surface the handler forwards to (the wiring step uses these on the granted
     // backend).
@@ -115,7 +118,7 @@ public:
     [[nodiscard]] std::string id() const override;
     [[nodiscard]] bool is_available() const override;
     [[nodiscard]] std::size_t active_pins() const override;
-    bool wait_pin_release(std::chrono::steady_clock::time_point deadline) const override;
+    bool wait_pins_zero(std::chrono::steady_clock::time_point deadline) const override;
     [[nodiscard]] PreparedRequest
     prepare(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
             ninfer::GenerationObservationOptions observation, std::function<bool()> is_cancelled,
@@ -335,7 +338,12 @@ public:
     [[nodiscard]] std::shared_ptr<ModelBackend> resident() const;
     // The id of the loaded model; "" when nothing is loaded (always "" at startup).
     [[nodiscard]] std::string loaded_id() const;
-    // Destroy the resident (TTL / eviction) so the next request reloads it.
+    // Destroy the resident (TTL / eviction) so the next request reloads it. The unload DRAINS the
+    // resident first (gate on the Grant in-flight counter + the live VRAM pin count, bounded by
+    // healthCheckTimeout); on a drain timeout the resident is restored intact and the call throws
+    // (the handler maps it to 503 model_not_ready). A concurrent route() for ANY model queues
+    // behind the drain (swapping_ is set while the drain is in flight) instead of starting a
+    // second load while the evicted VRAM is still referenced.
     void unload();
     // Stop the TTL ticker thread, then unload the resident. Idempotent.
     void shutdown();
@@ -356,16 +364,25 @@ public:
     [[nodiscard]] RouterStatusSnapshot status_snapshot() const;
 
 private:
-    // Option-B doSwap (base.go doSwap): evict the current resident, DRAIN its live-handle VRAM
-    // pins (active_pins() == 0; bounded by healthCheckTimeout, restoring the resident + rejecting
-    // the swap on timeout/shutdown -- the no-preemption policy), free it (the Engine has no
-    // unload(); destruction IS the unload), construct the target via the factory, then gate on
-    // readiness: loop
+    // Option-B doSwap (base.go doSwap): evict the current resident, DRAIN it (gate on BOTH the
+    // Grant in-flight counter (scheduler_.in_flight(evicted_id) == 0) AND the evicted backend's
+    // live VRAM pin count (evicted->active_pins() == 0); bounded by healthCheckTimeout, restoring
+    // the resident + rejecting the swap on timeout/shutdown -- the no-preemption policy), free it
+    // (the Engine has no unload(); destruction IS the unload), construct the target via the
+    // factory, then gate on readiness: loop
     // `while (!ready && elapsed < health_check_timeout)` (poll is_available; a real Engine is ready
     // immediately after construction, the fake controls this to exercise the gate + the "loading"
     // window). Sets resident_ + loaded_id_ and increments swap_count_. Called OUTSIDE the router
     // lock by route() so is_swapping() is observable to concurrent requests.
     void do_swap(const ModelConfig& target);
+    // DRAIN the evicted resident before freeing it: gate on BOTH the Grant in-flight counter
+    // (scheduler_.in_flight(evicted_id) == 0) AND the backend's live VRAM pin count
+    // (evicted->active_pins() == 0), bounded by healthCheckTimeout. At shutdown (read under
+    // shutdown_mu_) returns true immediately (the process is exiting; VRAM is reclaimed at
+    // exit). Returns false on a drain timeout (the caller restores the resident + rejects). The
+    // dual bounded wake (drain_cv_ for the Grant counter + evicted->wait_pins_zero for the pin
+    // count) is bounded by the remaining drain time (no busy-poll).
+    bool drain_evicted(const std::shared_ptr<ModelBackend>& evicted, const std::string& evicted_id);
     // Fire the status hook (if set) with `ev`: copy the hook under mu_, then invoke it OUTSIDE
     // mu_, so a subscriber that blocks cannot stall the router (the hook is a thin, non-blocking
     // serving callback -- the hub's bounded-queue fan-out, design §5.2).
@@ -403,6 +420,13 @@ private:
     std::condition_variable cv_shutdown_; // stalls route()); cv_ uses mu_
     bool shutdown_ = false;
     std::thread ttl_thread_;
+    // drain_cv_ is notified by release_in_flight (the Grant's in-flight counter mutation); the
+    // drain predicate (in_flight == 0) is checked under drain_mu_ to avoid a lost wakeup, and the
+    // notifier locks drain_mu_ before notifying so its notification happens-after any in-flight
+    // predicate check. The dual drain wake (drain_cv_ for the Grant counter + the backend's own
+    // pin CV) is bounded by the remaining drain time (no busy-poll).
+    std::mutex drain_mu_;
+    std::condition_variable drain_cv_;
 };
 
 } // namespace ninfer::serve
