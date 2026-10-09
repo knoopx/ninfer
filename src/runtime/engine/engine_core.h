@@ -42,12 +42,14 @@ class EngineCore {
 
 public:
     using ModelContract      = typename Instance::ModelContract;
+    using DecisionAdmissionCandidate = typename ModelContract::DecisionAdmissionCandidate;
     using ExecutionUnit      = typename ModelContract::ExecutionUnit;
     using UnitKind           = typename ModelContract::ExecutionUnitKind;
     using Checkpoint         = typename ModelContract::CheckpointHandle;
     using SequenceHandle     = typename ModelContract::SequenceHandle;
     using PendingBatch       = typename ModelContract::PendingBatch;
     using PreparedPrompt     = typename ModelContract::PreparedPrompt;
+    using OutputSession      = typename ModelContract::OutputSession;
     using PublishedOutput    = typename ModelContract::PublishedOutput;
     using Request            = RequestRecord<ModelContract>;
     using Scheduling         = Scheduler<Request>;
@@ -249,46 +251,70 @@ public:
         return Submission(*this, std::move(request));
     }
 
-    // The decisions route runs on this loaded engine: the call serializes against in-flight
-    // generation rounds (the worker holds execution_mutex_ per execution round), so a decision
-    // job executes atomically between rounds and never shares program state with a round. The
-    // Program owns the decision state/KV reservation for the job's lifetime on Generation's
-    // working set (forked in rounds bounded by the live free rows); the job is independent of the
-    // ResourceManager request admission policy.
+    // A decision job is a queue entry like a generation request: it joins pending_ behind
+    // generation traffic, the worker admits and runs it between generation rounds (the worker
+    // holds execution_mutex_ for the whole body, so a decision executes atomically against the
+    // shared physical KV page pool), and completion is delivered through the entry's promise.
+    // A live free-count axis shortfall leaves the entry queued for a later iteration; deadline
+    // expiry goes through the existing expire_pending_requests() (QueueTimeout); a terminal
+    // admission rejection completes the entry with the exact old-path error. The runtime-stats
+    // update and publication stay on the worker's success path (under execution_mutex_, before
+    // the promise is fulfilled): this caller does not hold execution_mutex_ and the worker keeps
+    // mutating cumulative_stats_ for other traffic while the caller is blocked, so a caller-side
+    // update would race. The worker's end-of-iteration publish_runtime_stats() reports the
+    // decision's prefill tokens.
     [[nodiscard]] DecisionResult decide(DecisionPrepared prepared, float temperature) {
-        std::scoped_lock lock(execution_mutex_);
-        CancellationFlagView cancellation{};
-        try {
-            auto candidate = instance_.program->inspect_decision_admission(std::move(prepared));
-            if (!candidate) {
-                // Admission rejects only when the shared working set cannot hold the caller-owned
-                // row 0 plus one branch row; dereferencing a null candidate would crash here.
+        const Clock::time_point submitted        = Clock::now();
+        const Clock::time_point pending_deadline = submitted + pending_timeout_;
+        std::uint64_t request_id        = 0;
+        std::uint64_t publication_order = 0;
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (stopping_ || failed_) {
                 throw RequestError(RequestErrorKind::Unavailable,
-                                   "decision job has no capacity for a branch fork");
+                                   "inference engine is unavailable");
             }
-            (void)instance_.program->start_decision_transaction(std::move(*candidate),
-                                                                cancellation);
-            DecisionResult result =
-                instance_.program->progress_decision_transaction(temperature, cancellation);
-            // A decision job prefills the shared state once plus every branch suffix, so count its
-            // prompt tokens like a generation prefill and publish the snapshot: the periodic
-            // throughput record then reports decision work (prefill tokens, no decode) instead of
-            // staying silent for a decision-only interval.
-            cumulative_stats_.computed_prefill_tokens += result.input_tokens;
-            publish_runtime_stats();
-            return result;
-        } catch (const RequestError&) {
-            // A decision job is fire-and-forget: every failure path must release the transaction,
-            // or its state/KV reservation stays pinned and wedges every later decision job until a
-            // restart. RequestError derives from std::invalid_argument, so without this arm the
-            // finalize below would be skipped and the transaction would leak.
-            instance_.program->finalize_decision_transaction();
-            throw;
-        } catch (const std::exception& error) {
-            instance_.program->finalize_decision_transaction();
-            throw RequestError(RequestErrorKind::Unavailable,
-                               std::string("decision job failed: ") + error.what());
+            if (outstanding_ >= max_outstanding_) {
+                throw RequestError(RequestErrorKind::Overloaded, "inference request queue is full");
+            }
+            if (next_request_id_ == 0 || next_publication_order_ == 0) {
+                throw std::overflow_error("request identity space exhausted");
+            }
+            ++outstanding_;
+            request_id        = next_request_id_++;
+            publication_order = next_publication_order_++;
         }
+
+        std::shared_ptr<Request> request;
+        try {
+            request = std::make_shared<Request>(request_id, publication_order, PreparedPrompt{},
+                                                OutputSession{}, PromptSummary{}, 0.0,
+                                                ResolvedRequestOptions{},
+                                                OutputConsumerMode::Aggregate,
+                                                GenerationObservationOptions{}, pending_deadline,
+                                                submitted);
+            request->decision.emplace(std::move(prepared), temperature);
+        } catch (...) {
+            release_reserved_capacity();
+            throw;
+        }
+
+        auto completion = request->decision->done.get_future();
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (stopping_ || failed_) {
+                --outstanding_;
+                throw RequestError(RequestErrorKind::Unavailable,
+                                   "inference engine is unavailable");
+            }
+            pending_.push_back(request);
+        }
+        request_admission_check();
+        queue_cv_.notify_one();
+
+        const DecisionCompletion completed = completion.get();
+        if (completed.error) { std::rethrow_exception(completed.error); }
+        return std::move(*completed.result);
     }
 
     [[nodiscard]] MemorySummary memory_summary() const {
@@ -869,6 +895,122 @@ private:
         }
     }
 
+    // Fulfills a queued decision entry's promise exactly once and releases its outstanding
+    // capacity. Only the terminal path that removes the entry from pending_ may call it, so the
+    // promise cannot be fulfilled twice.
+    void complete_decision_entry(const std::shared_ptr<Request>& request,
+                                 DecisionCompletion completion) noexcept {
+        {
+            std::lock_guard lock(queue_mutex_);
+            pending_.erase(std::remove(pending_.begin(), pending_.end(), request),
+                           pending_.end());
+        }
+        request->decision->done.set_value(std::move(completion));
+        release_reserved_capacity();
+        // The freed pool pages are an admission-visible change: a generation queued behind a
+        // page-blocked decision must be re-scanned now, not on the next external queue event.
+        request_admission_check();
+    }
+
+    // Worker-thread only, called with execution_mutex_ held between generation rounds. Finds
+    // the frontmost queued decision entry (FIFO within pending_), attempts its admission, and
+    // runs an admitted job to completion. Outcomes:
+    //  - inspect returns nullptr: terminal plan-level infeasibility (the branch tail exceeds the
+    //    planned decision KV capacity) -> complete with the exact old-path rejection, never
+    //    retried.
+    //  - inspect throws invalid_argument: terminal input validation failure -> complete with
+    //    the old-path wrapped error.
+    //  - inspect throws logic_error: the live free-count axis breakdown -> not admitted; the
+    //    entry stays queued and is retried next iteration until its deadline expires via
+    //    expire_pending_requests() (QueueTimeout). No completion, no removal.
+    //  - admitted: start + progress run atomically under execution_mutex_; every failure path
+    //    finalizes the transaction, or its state/KV reservation pins and wedges later jobs.
+    [[nodiscard]] bool run_pending_decisions(HostPhaseMeasurement& boundary) {
+        if (instance_.program->has_context_transaction()) { return false; }
+        std::shared_ptr<Request> job;
+        {
+            std::lock_guard lock(queue_mutex_);
+            for (const auto& request : pending_) {
+                if (request->decision) {
+                    job = request;
+                    break;
+                }
+            }
+        }
+        if (!job) { return false; }
+
+        std::optional<DecisionAdmissionCandidate> candidate;
+        try {
+            // inspect takes the payload by value and DecisionPrepared is move-only, so the
+            // job's canonical payload is copied field-by-field for this attempt: an axis
+            // breakdown must leave the entry queued for a later retry, and the payload must
+            // survive the attempt.
+            DecisionPrepared attempt;
+            attempt.state_tokens = job->decision->prepared.state_tokens;
+            attempt.branches     = job->decision->prepared.branches;
+            attempt.state_media  = job->decision->prepared.state_media;
+            candidate            = instance_.program->inspect_decision_admission(std::move(attempt));
+        } catch (const std::invalid_argument& error) {
+            finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            complete_decision_entry(
+                job, DecisionCompletion{std::nullopt, std::make_exception_ptr(
+                       RequestError(RequestErrorKind::Unavailable,
+                                    std::string("decision job failed: ") + error.what()))});
+            boundary = begin_host_phase();
+            return true;
+        } catch (const std::logic_error&) {
+            // Live free-count axis breakdown: not admitted. Leave the entry queued (its
+            // deadline expiry completes it with QueueTimeout); no completion, no removal.
+            return false;
+        }
+        if (!candidate) {
+            finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            complete_decision_entry(job, DecisionCompletion{
+                std::nullopt,
+                std::make_exception_ptr(RequestError(
+                    RequestErrorKind::Unavailable,
+                    "decision job has no capacity for a branch fork"))});
+            boundary = begin_host_phase();
+            return true;
+        }
+        try {
+            (void)instance_.program->start_decision_transaction(std::move(*candidate),
+                                                                CancellationFlagView{});
+            DecisionResult result =
+                instance_.program->progress_decision_transaction(job->decision->temperature,
+                                                                 CancellationFlagView{});
+            // A decision job prefills the shared state once plus every branch suffix, so count
+            // its prompt tokens like a generation prefill; the end-of-iteration
+            // publish_runtime_stats() reports the work. The payload is consumed by the
+            // transaction; release it from the entry.
+            cumulative_stats_.computed_prefill_tokens += result.input_tokens;
+            job->decision->prepared = DecisionPrepared{};
+            finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            complete_decision_entry(job, DecisionCompletion{std::move(result), nullptr});
+            boundary = begin_host_phase();
+            return true;
+        } catch (const RequestError& error) {
+            // RequestError derives from std::invalid_argument, so this arm must precede the
+            // std::exception arm; finalize or the state/KV reservation pins.
+            instance_.program->finalize_decision_transaction();
+            finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            complete_decision_entry(job, DecisionCompletion{std::nullopt,
+                                                             std::make_exception_ptr(error)});
+            boundary = begin_host_phase();
+            return true;
+        } catch (const std::exception& error) {
+            instance_.program->finalize_decision_transaction();
+            finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            complete_decision_entry(job, DecisionCompletion{
+                std::nullopt,
+                std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable,
+                                                     std::string("decision job failed: ") +
+                                                                     error.what()))});
+            boundary = begin_host_phase();
+            return true;
+        }
+    }
+
     void remove_completed_slot(std::uint32_t lane) {
         capture_decisions_[lane].reset();
         slots_[lane].reset();
@@ -979,18 +1121,39 @@ private:
             }
             have_pending = !pending_.empty();
         }
+        // Decision entries complete through their promise (the blocked caller unblocks with the
+        // error); generation entries keep the existing completion paths.
+        const auto complete_terminal = [this](const std::shared_ptr<Request>& request,
+                                              std::exception_ptr error) {
+            if (request->decision) {
+                complete_decision_entry(
+                    request, DecisionCompletion{std::nullopt, std::move(error)});
+            } else {
+                complete_error(request, std::move(error));
+            }
+        };
         try {
-            for (const auto& request : cancelled) { complete_detached_cancelled(request); }
+            for (const auto& request : cancelled) {
+                if (request->decision) {
+                    complete_decision_entry(request, DecisionCompletion{
+                        std::nullopt,
+                        std::make_exception_ptr(RequestError(
+                            RequestErrorKind::Cancelled,
+                            "inference request cancelled while waiting for admission"))});
+                } else {
+                    complete_detached_cancelled(request);
+                }
+            }
             for (const auto& request : expired) {
-                complete_error(request,
-                               std::make_exception_ptr(RequestError(
-                                   RequestErrorKind::QueueTimeout,
-                                   "inference request expired while waiting for admission")));
+                complete_terminal(request,
+                                  std::make_exception_ptr(RequestError(
+                                      RequestErrorKind::QueueTimeout,
+                                      "inference request expired while waiting for admission")));
             }
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
-            for (const auto& request : cancelled) { complete_error(request, error); }
-            for (const auto& request : expired) { complete_error(request, error); }
+            for (const auto& request : cancelled) { complete_terminal(request, error); }
+            for (const auto& request : expired) { complete_terminal(request, error); }
             throw;
         }
         if (!cancelled.empty() || !expired.empty()) {
@@ -1706,6 +1869,14 @@ private:
         } else {
             std::lock_guard lock(queue_mutex_);
             candidates = scheduler_.fresh_candidates(pending_, max_concurrency_);
+            // Decision entries are admitted by run_pending_decisions, never by the generation
+            // admission pass: they must not reach ensure_base_plan (which would plan their
+            // empty prompt).
+            candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                                            [](const std::shared_ptr<Request>& request) {
+                                                return request->decision.has_value();
+                                            }),
+                             candidates.end());
         }
         for (const auto& request : candidates) {
             const ReclaimRights rights{restoring ? ReclaimPurpose::Execution
@@ -2216,7 +2387,14 @@ private:
             }
         }
         if (materializing_request != nullptr) { complete_error(materializing_request, error); }
-        for (const auto& request : pending) { complete_error(request, error); }
+        for (const auto& request : pending) {
+            if (request->decision) {
+                // A queued decision caller unblocks with the engine failure instead of hanging.
+                complete_decision_entry(request, DecisionCompletion{std::nullopt, error});
+            } else {
+                complete_error(request, error);
+            }
+        }
         publish_runtime_stats();
     }
 
@@ -2250,6 +2428,9 @@ private:
                             break;
                         }
                     }
+                    // A decision runs between generation rounds: the worker holds execution_mutex_
+                    // for the whole body, so a job executes atomically against the shared pool.
+                    executed |= run_pending_decisions(boundary);
                 }
                 (void)settle_terminal_requests(boundary);
                 cancel_active_requests(snapshot_cancellations(), boundary);

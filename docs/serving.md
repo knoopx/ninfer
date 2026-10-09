@@ -88,7 +88,7 @@ a capability omitted at load.
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
-| `POST /v1/decisions` | Decision scoring over a state + questions, on the loaded model |
+| `POST /v1/decisions` | Decision scoring over a state + questions, on the loaded model; the job queues behind generation traffic |
 | `POST /v1/systemone` | Alias of `POST /v1/decisions` (identical handler and contract) |
 | `POST /models/load` | llama.cpp compatibility: load/swap the resident model |
 | `POST /models/unload` | llama.cpp compatibility: force the no-resident state |
@@ -975,11 +975,15 @@ When the request set `options.raw_logits`, each answer also carries a `raw_logit
 to pre-softmax readout logit) parallel to `probabilities`.
 
 `usage.output_tokens` is always `0`: decision scoring generates no tokens. Errors: 401 for a
-missing/invalid API key, 422 for body validation (the offending field is named), and 503 for a
-model that is not loaded (or whose load failed), or for a decision job the loaded engine cannot
-start (its shared working set cannot hold row 0 plus one branch row). Limits: choice questions
-take 1-255 options (capped at the artifact's compiled label-table size, <=255; out of range is a
-422) and score levels are 2-50.
+missing/invalid API key, 422 for body validation (the offending field is named), 429
+`server_overloaded` when the pending queue is full, and 503 `model_not_ready` for a model that
+is not loaded (or whose load failed). A decision job is queued behind generation traffic in the
+engine's pending queue: if it cannot be admitted in time it answers 503 `request_queue_timeout`
+after the `--pending-timeout-ms` deadline. The immediate 503s a queued job can answer are the
+terminal cases — the branch tail exceeds the plan's decision KV capacity ("decision job has no
+capacity for a branch fork") and malformed decision input. Limits: choice questions take 1-255
+options (capped at the
+artifact's compiled label-table size, <=255; out of range is a 422) and score levels are 2-50.
 
 The route runs on the model's loaded engine (no separate model load): the decision branch
 workspace is allocated per job, sized to one round of branches, and the plan reserves a decision
@@ -989,9 +993,15 @@ neither starve a decision job of capacity nor collide with its execution rows. A
 serialized against in-flight generation rounds by the engine's execution lock. A question set
 larger than one round is processed as successive fork / prefill / readout / release rounds, not
 rejected: a round holds `min(free Device StateImage slots, free KV addresses, free decision
-execution rows)` branches. Admission requires room for the shared row 0 plus one branch row, and
-names the exact free counts when it fails, because with the reserved region in place a shortfall
-means Generation traffic overran its configured axes. Every parsed decision request also appears in the operational
+execution rows)` branches. Admission requires room for the shared row 0 plus one branch row
+(free Device StateImage slots, free KV addresses, free decision execution rows, and free KV
+pages in the shared pool). A
+shortfall on those live free-count axes is transient: the job stays queued behind generation
+traffic and is retried each worker iteration until its `--pending-timeout-ms` deadline, then
+expires as 503 `request_queue_timeout` — with the reserved region in place a shortfall means
+Generation traffic overran its configured axes, so it resolves as that traffic frees capacity.
+A branch tail that exceeds the plan's decision KV capacity, and malformed decision input, are
+terminal: they answer an immediate 503 without queueing. Every parsed decision request also appears in the operational
 log and, when request logging is enabled, in the request JSONL: one `decision_start` before the
 job runs and exactly one `decision_done` or `decision_error` terminal after it, carrying the
 question and candidate counts, the answers, and the prefilled input tokens. A decision job's

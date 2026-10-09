@@ -114,10 +114,13 @@ When the request set `options.raw_logits`, each answer also carries a `raw_logit
 pre-softmax readout logit) parallel to `probabilities`.
 
 `usage.output_tokens` is always `0`: decision scoring generates no tokens. Errors: 401 for a
-missing/invalid API key, 422 for body validation (the offending field is named), and 503 for a
-model that is not loaded (or whose load failed). Limits: choice questions take 1-255 options
-(capped at the artifact's compiled label-table size, <=255; out of range is a 422) and score
-levels are 2-50.
+missing/invalid API key, 422 for body validation (the offending field is named), 429
+`server_overloaded` when the pending queue is full, and 503: `model_not_ready` for a model that
+is not loaded (or whose load failed), `request_queue_timeout` when a queued job outlives the
+`--pending-timeout-ms` deadline, and an immediate 503 for a terminally infeasible job (the
+branch tail exceeds the plan's decision KV capacity, "decision job has no capacity for a branch
+fork") or malformed decision input. Limits: choice questions take 1-255 options (capped at the
+artifact's compiled label-table size, <=255; out of range is a 422) and score levels are 2-50.
 
 v1 semantics: each option is scored in isolation (a slice softmax over each question's candidate
 set). Option-set interaction is limited to the shared slice denominator, so changing the option
@@ -126,7 +129,11 @@ slice statistics (choice confidence = top option probability; score confidence =
 
 ## Execution
 
-A decision job has one shared state prefix and one branch per question. The model executes the
+A decision job has one shared state prefix and one branch per question. Before any of that
+runs, the job joins the engine's pending queue behind generation traffic: it is a queue entry in
+the same bounded pending queue as generation requests (the same outstanding bound and the
+`--pending-timeout-ms` deadline), and the worker admits and runs it between generation rounds
+once the shared working set can hold row 0 plus one branch row. The model then executes the
 prepared branches in one serialized job, as successive **rounds** of branches. The branch
 workspace (readout buffers, projection scratch, and host mirrors) is allocated per job, sized to
 one round rather than to the question count, and bounded only by live store availability (the
@@ -168,10 +175,11 @@ resident model is resolved, and exactly one `decision_done` or `decision_error` 
 operational record shows the request shape (`req#42 started | decisions | 30 questions |
 candidates 540`) and the engine work (`req#42 done | decisions | 30 answers | questions 30 |
 input 14,974 | total 1.67s | prefill 8,966 tok/s`); the request JSONL carries the same fields under
-the `decision_start` / `decision_done` / `decision_error` events. A decision job's prefilled
-tokens (the shared state once plus every branch suffix) enter the runtime stats, so a
-decision-only interval still produces the periodic throughput record. See
-[Operational logging](maintainer/logging.md).
+the `decision_start` / `decision_done` / `decision_error` events. A job that waits in the pending
+queue behind generation traffic carries that queue wait in the recorded total time (the record
+spans queue wait plus execution). A decision job's prefilled tokens (the shared state once plus
+every branch suffix) enter the runtime stats, so a decision-only interval still produces the
+periodic throughput record. See [Operational logging](maintainer/logging.md).
 
 ## Design decisions
 
@@ -198,7 +206,7 @@ rather than by the plan. Rounds cost no throughput: `prefill_decision_batch` wal
 rows sequentially, so the suffix prefill's kernel work is the same whether a round holds 1 branch
 or 30.
 
-**Decision capacity is reserved, its rows are its own, and every job is fire-and-forget.**
+**Decision capacity is reserved, its rows are its own, and every job is queued.**
 Generation traffic must not be able to starve or collide with a decision job:
 
 - The plan adds a decision region on top of the Generation capacity axes: two Device StateImage
@@ -207,22 +215,40 @@ Generation traffic must not be able to starve or collide with a decision job:
   KV address rows)` is the decision branch capacity. The context cache and the lanes cannot claim
   the region because their own capacities stay the configured axes; the runtime still widens a
   round from any larger live free capacity. Without the region, chat traffic eventually commits
-  every KV address to cached continuations and every decision request fails its admission until a
-  restart (a chat evicts a cache entry when it needs room; a decision job is not a cache client).
+  every KV address to cached continuations and a decision job sits queued behind it until its
+  pending deadline expires (a chat evicts a cache entry when it needs room; a decision job is not
+  a cache client).
 - The decision path binds its own execution rows, above the Generation lanes' rows, because a lane
   holds its row (`0..max_concurrency-1`) for a request's whole lifetime and a decision job runs
   between rounds, while requests are still in flight.
 - Every failure path finalizes the decision transaction, so a failed job never leaves its state/KV
   reservation pinned for later jobs (including the `RequestError` path, which derives from
   `std::invalid_argument` and would otherwise bypass the finalize).
+- A job that cannot be admitted stays in the queue. While the shared working set cannot hold row
+  0 plus one branch row (a live free-count axis shortfall: free Device StateImage slots, free KV
+  addresses, free decision execution rows, or free KV pages), the job is a pending-queue entry
+  like a generation request: the worker retries its admission each iteration until the job's
+  `--pending-timeout-ms` deadline, then the existing pending-request expiry completes it with a
+  queue timeout, which the serve layer maps to 503 `request_queue_timeout` (the same mapping
+  generation uses). Only two admission outcomes are terminal: the branch tail exceeds the plan's
+  decision KV capacity (immediate 503 "decision job has no capacity for a branch fork"), and
+  malformed decision input (a terminal validation error). A queued decision counts against the
+  same outstanding bound as generation traffic; the serve layer acquires the request lifetime
+  with the client pending timeout before queueing, so no serve-layer change was needed.
 
-**Admission rejects only an infeasible job.** `inspect_decision_admission` requires room for the
-caller-owned row 0 plus one branch row: at least 2 free Device StateImage slots, 2 free KV
-addresses, 2 free decision execution rows, and a shared physical KV page pool holding row
-0's entitlement pages plus one branch's pages-per-branch demand. A larger question set is not
-rejected — the rounds process it. A shortfall with the reserved region in place means
-Generation traffic overran its configured axes, and the error names every axis with its
-free count instead of a bare verdict.
+**Admission is retried while queued; only an infeasible job is terminal.**
+`inspect_decision_admission` requires room for the caller-owned row 0 plus one branch row: at
+least 2 free Device StateImage slots, 2 free KV addresses, 2 free decision execution rows, and
+a shared physical KV page pool holding row 0's entitlement pages plus one branch's
+pages-per-branch demand. A larger question set is not rejected — the rounds process it. A
+shortfall on any of those live free-count axes is transient: the job stays queued and is retried
+each worker iteration until its pending deadline, then expires as a queue timeout (503
+`request_queue_timeout`) — with the reserved region in place a shortfall means Generation
+traffic overran its configured axes, so it resolves as that traffic frees capacity. Two
+outcomes are terminal and are not retried: the branch tail exceeds the plan's decision KV
+capacity (`branch_tail_pages`), which completes the job with an immediate 503 "decision job has
+no capacity for a branch fork", and malformed decision input (an `std::invalid_argument`
+validation failure), which completes the job with a terminal error.
 
 **`candidate_slice_softmax` broadcasts the block sum to every active thread.** `block_reduce_sum`
 returns the full block sum only to lane 0 (the other threads hold a partial sum or zero). The
