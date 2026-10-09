@@ -79,10 +79,11 @@ struct DecisionPrepared {
 };
 
 // One question answer. options is parallel to probabilities and raw_logits. Per type: noul
-// reports noul as P(true) with no confidence; choice reports the winning key plus a normalized
-// Gini confidence; score reports the expected 0-based level index plus a normalized Gini
-// confidence. raw_logits holds the per-candidate pre-softmax readout logits (the diagnostic
-// `options.raw_logits` response field carries them when the request asked for them).
+// reports noul as P(true); choice reports the winning key plus a top-probability confidence;
+// score reports the expected 0-based level index plus a spread confidence
+// (1 - sqrt(variance)/half_range). raw_logits holds the per-candidate pre-softmax readout logits
+// (the diagnostic `options.raw_logits` response field carries them when the request asked for
+// them).
 struct DecisionAnswer {
     DecisionQuestionType type;
     std::string winning_option;

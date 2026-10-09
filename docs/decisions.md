@@ -104,9 +104,11 @@ than `role` and `content`, and any `options` key other than `raw_logits`.
 fields:
 
 - `noul`: the `noul` probability (P(true)) and no confidence field;
-- `choice`: the winning `choice`, per-option `probabilities`, and `confidence`;
+- `choice`: the winning `choice`, per-option `probabilities`, and `confidence` (the top option
+  probability);
 - `score`: `score` as the expected 0-based level index, a `legend` mapping level indices to their
-  descriptions, per-level `probabilities`, and `confidence`.
+  descriptions, per-level `probabilities`, and `confidence` (spread: 1 - sqrt(variance)/half_range
+  over the level indices).
 
 When the request set `options.raw_logits`, each answer also carries a `raw_logits` map (option to
 pre-softmax readout logit) parallel to `probabilities`.
@@ -120,7 +122,7 @@ levels are 2-50.
 v1 semantics: each option is scored in isolation (a slice softmax over each question's candidate
 set). Option-set interaction is limited to the shared slice denominator, so changing the option
 set rescales the surviving options' probabilities; probabilities and confidence are uncalibrated
-slice statistics (confidence = normalized Gini).
+slice statistics (choice confidence = top option probability; score confidence = spread).
 
 ## Execution
 
@@ -128,7 +130,8 @@ A decision job has one shared state prefix and one branch per question. The mode
 prepared branches in one serialized job, as successive **rounds** of branches. The branch
 workspace (readout buffers, projection scratch, and host mirrors) is allocated per job, sized to
 one round rather than to the question count, and bounded only by live store availability (the
-StateImage store, the KV address space, and the Main KV execution table) plus device memory.
+StateImage store, the KV address space, the Main KV execution table, and the physical KV
+page pool) plus device memory.
 There is no fixed branch capacity, and no question count is rejected for being large:
 
 1. **State prefill.** The shared state prefix is prefilled into the Main KV row 0. For an image
@@ -138,8 +141,9 @@ There is no fixed branch capacity, and no question count is rejected for being l
    branch KV tail. `open_branches` is called with `round + 1` rows so row 0 stays the
    caller-owned source and destination `i` binds the decision's own execution row block. A round
    is sized at `min(free Device StateImage slots, free KV addresses, free decision execution
-   rows)`. A fork needs a **Device** StateImage slot (the GDN state is replicated
-   device-to-device), so the host StateImage replicas never widen a round.
+   rows, free KV pages / pages per branch)`, where pages per branch is the branch's growth
+   pages plus its partial tail page copy. A fork needs a **Device** StateImage slot (the GDN
+   state is replicated device-to-device), so the host StateImage replicas never widen a round.
 3. **Suffix prefill.** Each round branch's question suffix (the rendered question text plus its
    criteria) is appended in a suffix prefill over the round's branch rows.
 4. **Readout.** Each round branch's last-position hidden state is gathered into the per-job
@@ -153,9 +157,9 @@ There is no fixed branch capacity, and no question count is rejected for being l
    next round forks the same prefilled row 0. A round never mutates row 0's page membership or
    its GDN state, so row 0 is a stable source for every round.
 8. **Answer.** Per question type: `noul` reports `P(true)` with no confidence; `choice` reports
-   the winning key, per-option probabilities, and a normalized Gini confidence; `score` reports
-   the expected 0-based level index, the level legend, per-level probabilities, and a normalized
-   Gini confidence.
+   the winning key, per-option probabilities, and a top-probability confidence; `score` reports
+   the expected 0-based level index, the level legend, per-level probabilities, and a spread
+   confidence.
 
 ## Observability
 
@@ -214,9 +218,11 @@ Generation traffic must not be able to starve or collide with a decision job:
 
 **Admission rejects only an infeasible job.** `inspect_decision_admission` requires room for the
 caller-owned row 0 plus one branch row: at least 2 free Device StateImage slots, 2 free KV
-addresses, and 2 free decision execution rows. A larger question set is not rejected — the rounds
-process it. A shortfall with the reserved region in place means Generation traffic overran its
-configured axes, and the error names the exact axis and free count instead of a bare verdict.
+addresses, 2 free decision execution rows, and a shared physical KV page pool holding row
+0's entitlement pages plus one branch's pages-per-branch demand. A larger question set is not
+rejected — the rounds process it. A shortfall with the reserved region in place means
+Generation traffic overran its configured axes, and the error names every axis with its
+free count instead of a bare verdict.
 
 **`candidate_slice_softmax` broadcasts the block sum to every active thread.** `block_reduce_sum`
 returns the full block sum only to lane 0 (the other threads hold a partial sum or zero). The

@@ -628,7 +628,10 @@ DecisionBranch build_decision_branch(const DecisionQuestion& question,
                                         " as one token at the answer boundary");
         }
         branch.candidate_ids.push_back(appended.back());
-        branch.candidate_groups.push_back(static_cast<std::int32_t>(i));
+        // -1 disables the op's max-pooling: each decision option is scored independently on its
+        // own logit (a group index of i would make every candidate its own singleton group and
+        // route the row through the atomic pooling path for no benefit).
+        branch.candidate_groups.push_back(-1);
         branch.options.push_back(decision_option_key(question, i));
     }
     return branch;

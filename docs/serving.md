@@ -965,9 +965,11 @@ The response shape is `{model, answers{<id>: {type, ...}}, usage{input_tokens, o
 with per-type answer fields:
 
 - `noul`: the `noul` probability (P(true)) and no confidence field;
-- `choice`: the winning `choice`, per-option `probabilities`, and `confidence`;
+- `choice`: the winning `choice`, per-option `probabilities`, and `confidence` (the top option
+  probability);
 - `score`: `score` as the expected 0-based level index, a `legend` mapping level indices to their
-  descriptions, per-level `probabilities`, and `confidence`.
+  descriptions, per-level `probabilities`, and `confidence` (spread: 1 - sqrt(variance)/half_range
+  over the level indices).
 
 When the request set `options.raw_logits`, each answer also carries a `raw_logits` map (option
 to pre-softmax readout logit) parallel to `probabilities`.
@@ -1001,7 +1003,7 @@ prefilled tokens count toward the periodic throughput record. The full feature r
 v1 semantics: each option is scored in isolation (a slice softmax over each question's candidate
 set). Option-set interaction is limited to the shared slice denominator, so changing the option set
 rescales the surviving options' probabilities; probabilities and confidence are uncalibrated slice
-statistics (confidence = normalized Gini).
+statistics (choice confidence = top option probability; score confidence = spread).
 
 
 ## llama.cpp / llama-ui compatibility

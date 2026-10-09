@@ -350,10 +350,11 @@ The per-job readout workspace is not planned: it is allocated per job, sized to 
 count.
 
 **Admission and transaction.** A job is admitted when the shared working set holds row 0 plus
-one branch row: at least 2 free Device StateImage slots, 2 free KV addresses, and 2 free
-decision execution rows. A larger question set is never rejected — it runs as successive
-rounds. Every failure path finalizes the decision transaction, so a failed job never pins its
-state/KV reservation for later jobs.
+one branch row: at least 2 free Device StateImage slots, 2 free KV addresses, 2 free
+decision execution rows, and a shared physical KV page pool holding row 0's entitlement
+pages plus one branch's pages-per-branch demand. A larger question set is never rejected — it
+runs as successive rounds. Every failure path finalizes the decision transaction, so a failed
+job never pins its state/KV reservation for later jobs.
 
 **Execution.** One job is one serialized sequence of rounds on Generation's working set:
 
@@ -363,8 +364,8 @@ state/KV reservation for later jobs.
    with `round + 1` rows, so row 0 stays the caller-owned source: its page membership and GDN
    state are untouched, and every round forks the same prefilled prefix. The fork copies the
    GDN state device-to-device into Device StateImage slots, so the round holds
-   `min(free Device StateImage slots, free KV addresses, free decision execution rows)`
-   branches; host StateImage replicas never widen a round.
+   `min(free Device StateImage slots, free KV addresses, free decision execution rows, free
+   KV pages / pages per branch)` branches; host StateImage replicas never widen a round.
 3. **Suffix prefill.** Each branch's question suffix (the rendered question text plus its
    criteria) prefills over the round's branch rows. A fork publishes only the shared prefix
    pages, so each branch row's growth pages are mapped through `state_length + suffix` before
@@ -389,8 +390,8 @@ intermediates; readout tensors allocated in the arena would be clobbered before 
 last-position gather and the projection ran.
 
 **Answers.** `noul` reports P(true) with no confidence; `choice` reports the winning key,
-per-option probabilities, and a normalized Gini confidence; `score` reports the expected 0-based
-level index, the level legend, per-level probabilities, and a normalized Gini confidence.
+per-option probabilities, and a top-probability confidence; `score` reports the expected 0-based
+level index, the level legend, per-level probabilities, and a spread confidence.
 Probabilities are uncalibrated slice statistics: each option scores in isolation over the
 question's candidate set, so changing the option set rescales the surviving options.
 

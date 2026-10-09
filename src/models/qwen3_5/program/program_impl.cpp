@@ -495,8 +495,9 @@ ProgramImpl::inspect_decision_admission(DecisionPrepared prepared) {
     // branch row in the Device StateImage pool, in the KV address space and in the decision's own
     // execution rows, so a shortfall means Generation traffic overran its configured axes. The
     // runtime still forks in rounds sized from the live free counts, so a larger free region only
-    // widens a round. Physical KV page demand is enforced per address by create_active, not by the
-    // address count.
+    // widens a round. Physical KV page demand is checked against the shared pool's live free
+    // pages (row 0 plus one branch here, per round at sizing); create_active enforces it per
+    // address at reservation.
     const std::uint32_t free_device_slots =
         state_store->device_capacity() - state_store->device_occupied();
     const std::uint32_t free_addresses =
@@ -504,7 +505,18 @@ ProgramImpl::inspect_decision_admission(DecisionPrepared prepared) {
     const std::uint32_t free_decision_rows =
         static_cast<std::uint32_t>(decoder->text_kv.execution_tables().row_count()) -
         decision_row_base_;
-    if (free_device_slots < 2 || free_addresses < 2 || free_decision_rows < 2) {
+    // Page axis: row 0 takes `entitlement` pages at start; each forked branch reserves
+    // `entitlement - full_pages + (partial tail ? 1 : 0)` new physical pages (the exact
+    // prepare_prefix_fork demand open_branches makes). The reserved decision region guarantees
+    // the state/address/row axes, not the page axis, so Generation traffic can leave the shared
+    // pool short: without this check the job passes admission, opens row 0, and the first fork
+    // throws a bare std::bad_alloc from the page pool instead of a capacity rejection.
+    const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
+    const std::uint32_t pages_per_branch =
+        entitlement - state_length / page_size + (state_length % page_size != 0 ? 1U : 0U);
+    const std::uint32_t free_pages = text_kv_pages->physical_pool().available_pages();
+    if (free_device_slots < 2 || free_addresses < 2 || free_decision_rows < 2 ||
+        free_pages < entitlement + pages_per_branch) {
         // The plan reserves a decision region, so a shortfall means Generation traffic overran its
         // own capacity axes (or the plan is inconsistent). Report the exact axes instead of a
         // bare infeasible verdict: this block used to wedge every later decision request with no
@@ -513,7 +525,9 @@ ProgramImpl::inspect_decision_admission(DecisionPrepared prepared) {
             "decision scoring has no capacity for a branch fork (free device state slots=" +
             std::to_string(free_device_slots) + " free KV addresses=" +
             std::to_string(free_addresses) + " free decision rows=" +
-            std::to_string(free_decision_rows) + ")");
+            std::to_string(free_decision_rows) + " free KV pages=" + std::to_string(free_pages) +
+            " required pages for row 0 plus one branch=" +
+            std::to_string(entitlement + pages_per_branch) + ")");
     }
 
     auto candidate = std::make_unique<DecisionAdmissionCandidateImpl>();
@@ -716,13 +730,28 @@ DecisionResult ProgramImpl::progress_decision_transaction(float temperature,
             static_cast<std::uint32_t>(decoder->text_kv.execution_tables().row_count());
         const std::uint32_t free_decision_rows =
             table_rows > decision_row_base_ ? table_rows - decision_row_base_ - 1U : 0U;
+        // Page axis: each forked branch reserves `pages_per_branch` new physical pages (the
+        // open_branches prepare_prefix_fork demand: growth pages plus the partial tail copy);
+        // row 0's `branch_entitlement` pages are already reserved. The shared pool's live free
+        // pages bound how many branches fit in a round, so size the round from them or the fork's
+        // resize_reservation throws a bare std::bad_alloc under Generation page pressure.
+        // pages_per_branch is always >= 1 (branch suffixes are non-empty, so the entitlement
+        // exceeds the full prefix pages), making the division well-defined.
+        const std::uint32_t page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
+        const std::uint32_t pages_per_branch =
+            branch_entitlement - state_length / page_size +
+            (state_length % page_size != 0 ? 1U : 0U);
+        const std::uint32_t free_pages = text_kv_pages->physical_pool().available_pages();
+        const std::uint32_t free_by_pages = free_pages / pages_per_branch;
         const std::uint32_t round_capacity =
-            std::min({free_state, free_kv, free_decision_rows});
+            std::min({free_state, free_kv, free_decision_rows, free_by_pages});
         if (round_capacity == 0) {
             throw std::logic_error(
                 "decision branch fork has no capacity (free device state slots=" +
                 std::to_string(free_state) + " free KV addresses=" + std::to_string(free_kv) +
-                " free decision rows=" + std::to_string(free_decision_rows) + ")");
+                " free decision rows=" + std::to_string(free_decision_rows) +
+                " free KV pages=" + std::to_string(free_pages) + " pages per branch=" +
+                std::to_string(pages_per_branch) + ")");
         }
         const std::uint32_t round_rows = std::min(round_capacity, branch_count);
 
@@ -752,16 +781,6 @@ DecisionResult ProgramImpl::progress_decision_transaction(float temperature,
         const std::span<const TokenId> state_span =
             media != nullptr ? std::span<const TokenId>(media->token_ids)
                              : std::span<const TokenId>(prepared.state_tokens);
-        const auto normalized_gini = [](const float* probs, std::size_t count) {
-            if (count == 1) { return 1.0f; }
-            double squares = 0.0;
-            for (std::size_t column = 0; column < count; ++column) {
-                squares += static_cast<double>(probs[column]) * probs[column];
-            }
-            const double gini =
-                (static_cast<double>(count) * squares - 1.0) / static_cast<double>(count - 1);
-            return static_cast<float>(std::clamp(gini, 0.0, 1.0));
-        };
         result.answers.reserve(branch_count);
         for (std::uint32_t begin = 0; begin < branch_count; begin += round_rows) {
             const std::uint32_t count = std::min(round_rows, branch_count - begin);
@@ -899,6 +918,7 @@ DecisionResult ProgramImpl::progress_decision_transaction(float temperature,
                 answer.options   = branch.options;
                 answer.probabilities.assign(probs, probs + candidates);
                 answer.raw_logits = slice; // pre-softmax readout logits (raw_logits diagnostic)
+
                 if (branch.type == DecisionQuestionType::Noul) {
                     answer.noul           = probs[1];
                     answer.winning_option = (probs[1] >= probs[0]) ? "true" : "false";
@@ -908,14 +928,25 @@ DecisionResult ProgramImpl::progress_decision_transaction(float temperature,
                         if (probs[column] > probs[winner]) { winner = column; }
                     }
                     answer.winning_option = branch.options[winner];
-                    answer.confidence     = normalized_gini(probs, candidates);
+                    // Top probability: the abstention signal the reference measures.
+                    answer.confidence = probs[winner];
                 } else {
-                    float expected = 0.0f;
+                    double expected = 0.0;
                     for (std::size_t column = 0; column < candidates; ++column) {
-                        expected += static_cast<float>(column) * probs[column];
+                        expected +=
+                            static_cast<double>(column) * static_cast<double>(probs[column]);
                     }
-                    answer.score      = expected;
-                    answer.confidence = normalized_gini(probs, candidates);
+                    answer.score = static_cast<float>(expected);
+                    // Spread, not height: an even split between adjacent levels knows where the
+                    // answer is. variance is over the 0-based level indices; half_range is (K-1)/2.
+                    double variance = 0.0;
+                    for (std::size_t column = 0; column < candidates; ++column) {
+                        const double offset = static_cast<double>(column) - expected;
+                        variance += static_cast<double>(probs[column]) * offset * offset;
+                    }
+                    const double half_range = static_cast<double>(candidates - 1) / 2.0;
+                    answer.confidence = static_cast<float>(
+                        std::clamp(1.0 - std::sqrt(variance) / half_range, 0.0, 1.0));
                 }
                 result.answers.push_back(std::move(answer));
             }
