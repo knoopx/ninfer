@@ -130,6 +130,19 @@ public:
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
 
+    // Live VRAM pin count: the number of GenerationHandles currently pinning the Engine's VRAM
+    // (0 when no engine). The router's swap drain gates on this before destroying an evicted
+    // resident (the Grant in-flight counter can reach 0 while a retained handle is still
+    // pinning the VRAM).
+    [[nodiscard]] std::size_t active_pins() const {
+        return engine_ != nullptr ? engine_->active_handle_pins() : 0;
+    }
+    // Bounded wake on VRAM pin release (forwarded to the Engine; false when no engine). Lets the
+    // router's swap drain gate on the real pin without busy-polling.
+    [[nodiscard]] bool wait_pin_release(std::chrono::steady_clock::time_point deadline) const {
+        return engine_ != nullptr ? engine_->wait_handle_pin_release(deadline) : false;
+    }
+
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }

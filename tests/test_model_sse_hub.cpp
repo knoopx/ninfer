@@ -73,6 +73,9 @@ public:
     }
     std::string id() const override { return id_; }
     bool is_available() const override { return true; } // ready once constructed (no async gate)
+    // No Engine (host fake): no live VRAM pins (the swap drain exits immediately).
+    std::size_t active_pins() const override { return 0; }
+    bool wait_pin_release(std::chrono::steady_clock::time_point) const override { return false; }
     ns::PreparedRequest
     prepare(const ns::GenerationRequest&, ns::GenerationConsumerMode,
             ninfer::GenerationObservationOptions, std::function<bool()>,
@@ -148,6 +151,9 @@ public:
     }
     std::string id() const override { return id_; }
     bool is_available() const override { return true; } // ready once constructed (no async gate)
+    // No Engine (host fake): no live VRAM pins (the swap drain exits immediately).
+    std::size_t active_pins() const override { return 0; }
+    bool wait_pin_release(std::chrono::steady_clock::time_point) const override { return false; }
     ns::PreparedRequest
     prepare(const ns::GenerationRequest&, ns::GenerationConsumerMode,
             ninfer::GenerationObservationOptions, std::function<bool()>,

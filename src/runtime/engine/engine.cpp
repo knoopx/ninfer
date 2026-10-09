@@ -10,7 +10,10 @@
 #include "runtime/engine/model_instance.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -95,20 +98,25 @@ public:
     template <class Submission>
     class Model final : public Concept {
     public:
-        Model(std::shared_ptr<void> keep_alive, Submission submission)
+        Model(std::shared_ptr<Engine::Impl> keep_alive, Submission submission)
             : keep_alive_(std::move(keep_alive)), submission_(std::move(submission)) {}
+
+        // Releases this handle's VRAM pin on the Engine (defined out-of-line after `Engine::Impl`
+        // is complete: the keep-alive back-reference type is non-dependent, so two-phase lookup
+        // checks the member access at the definition point, not at the submit() call sites).
+        ~Model() override;
 
         GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) override {
             return submission_.wait(sink, cancellation);
         }
 
     private:
-        std::shared_ptr<void> keep_alive_;
+        std::shared_ptr<Engine::Impl> keep_alive_;
         Submission submission_;
     };
 
     template <class Submission>
-    Impl(std::shared_ptr<void> keep_alive, Submission submission,
+    Impl(std::shared_ptr<Engine::Impl> keep_alive, Submission submission,
          ResolvedSamplingParameters sampling)
         : state_(std::make_unique<Model<Submission>>(std::move(keep_alive), std::move(submission))),
           sampling_(sampling) {}
@@ -188,7 +196,37 @@ public:
     ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
     Core core;
+
+    // Live-handle pin accounting (race-free; the drain never polls use_count()). Every
+    // GenerationHandle pins the Engine's VRAM until it is destroyed: ~Engine() drops only one
+    // reference, so the VRAM is freed only when the last pin (and the Engine's own reference)
+    // are gone.
+    std::atomic<std::size_t> live_handle_pins_{0};
+    // Pin-release notification (guarded by pin_mutex_): a release monotonically bumps the count
+    // and notifies pin_cv_, so a bounded waiter (wait_handle_pin_release) wakes on a real pin
+    // release instead of busy-polling.
+    std::uint64_t pin_release_count_{0};
+    std::mutex pin_mutex_;
+    std::condition_variable pin_cv_;
+
+    void notify_pin_release() noexcept {
+        std::lock_guard<std::mutex> lock(pin_mutex_);
+        ++pin_release_count_;
+        pin_cv_.notify_all();
+    }
 };
+
+template <class Submission>
+GenerationHandle::Impl::Model<Submission>::~Model() {
+    // Release this handle's VRAM pin on the Engine (the keep-alive ref held here is what keeps
+    // the Engine's weights/KV cache/CUDA graphs resident; ~Engine() alone does not free them).
+    // The serve router's swap drain gates on active_handle_pins() == 0, so the release must be
+    // observable (counter + notification), not a use_count() poll.
+    if (keep_alive_) {
+        keep_alive_->live_handle_pins_.fetch_sub(1, std::memory_order_acq_rel);
+        keep_alive_->notify_pin_release();
+    }
+}
 
 Engine::Engine(EngineOptions options) {
     StartupObserver startup_observer = options.startup_observer;
@@ -330,6 +368,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         immediate.result.timings.prepare_seconds    = prepare_seconds;
         immediate.result.timings.total_seconds      = prepare_seconds;
         prompt.impl_.reset();
+        impl_->live_handle_pins_.fetch_add(1, std::memory_order_acq_rel); // the new handle pins the VRAM
         return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
             impl_, std::move(immediate), resolved_sampling));
     }
@@ -346,6 +385,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                     core->submit(std::move(prompt.impl_->value), prompt_summary, prepare_seconds,
                                  std::move(resolved_options), consumer_mode, std::move(observation),
                                  pending_deadline);
+                impl_->live_handle_pins_.fetch_add(1, std::memory_order_acq_rel); // the new handle pins the VRAM
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }
@@ -421,6 +461,20 @@ bool Engine::is_available() const {
             }
         },
         impl_->core);
+}
+
+std::size_t Engine::active_handle_pins() const {
+    return impl_ != nullptr ? impl_->live_handle_pins_.load(std::memory_order_acquire) : 0;
+}
+
+bool Engine::wait_handle_pin_release(std::chrono::steady_clock::time_point deadline) const {
+    if (impl_ == nullptr) { return false; }
+    std::unique_lock<std::mutex> lock(impl_->pin_mutex_);
+    const std::uint64_t before = impl_->pin_release_count_;
+    impl_->pin_cv_.wait_until(lock, deadline, [this, before] {
+        return impl_->pin_release_count_ != before;
+    });
+    return impl_->pin_release_count_ != before;
 }
 
 void Engine::reset_memory_peaks() noexcept {

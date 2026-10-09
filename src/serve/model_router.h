@@ -71,6 +71,16 @@ public:
     // The /health readiness gate (process.go EnsureReady polls CheckEndpoint until 200).
     [[nodiscard]] virtual bool is_available() const = 0;
 
+    // Live VRAM pin count (the Engine's live GenerationHandles; 0 for a fake backend without an
+    // Engine). The router's swap drain gates on this (active_pins() == 0) BEFORE destroying an
+    // evicted resident: the Grant in-flight counter can reach 0 while a retained/streaming
+    // GenerationHandle still pins the VRAM (concurrent residency -> OOM).
+    [[nodiscard]] virtual std::size_t active_pins() const = 0;
+    // Bounded wake on VRAM pin release (see Engine::wait_handle_pin_release): blocks until a
+    // handle pin is released or `deadline` passes; returns true when a release was observed.
+    // Lets the swap drain gate on the real pin without busy-polling.
+    virtual bool wait_pin_release(std::chrono::steady_clock::time_point deadline) const = 0;
+
     // Generation surface the handler forwards to (the wiring step uses these on the granted
     // backend).
     [[nodiscard]] virtual PreparedRequest
@@ -104,6 +114,8 @@ public:
 
     [[nodiscard]] std::string id() const override;
     [[nodiscard]] bool is_available() const override;
+    [[nodiscard]] std::size_t active_pins() const override;
+    bool wait_pin_release(std::chrono::steady_clock::time_point deadline) const override;
     [[nodiscard]] PreparedRequest
     prepare(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
             ninfer::GenerationObservationOptions observation, std::function<bool()> is_cancelled,
@@ -344,8 +356,11 @@ public:
     [[nodiscard]] RouterStatusSnapshot status_snapshot() const;
 
 private:
-    // Option-B doSwap (base.go doSwap): destroy the current resident (frees VRAM; the Engine has
-    // no unload()), construct the target via the factory, then gate on readiness: loop
+    // Option-B doSwap (base.go doSwap): evict the current resident, DRAIN its live-handle VRAM
+    // pins (active_pins() == 0; bounded by healthCheckTimeout, restoring the resident + rejecting
+    // the swap on timeout/shutdown -- the no-preemption policy), free it (the Engine has no
+    // unload(); destruction IS the unload), construct the target via the factory, then gate on
+    // readiness: loop
     // `while (!ready && elapsed < health_check_timeout)` (poll is_available; a real Engine is ready
     // immediately after construction, the fake controls this to exercise the gate + the "loading"
     // window). Sets resident_ + loaded_id_ and increments swap_count_. Called OUTSIDE the router
