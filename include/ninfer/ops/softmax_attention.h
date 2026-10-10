@@ -16,6 +16,11 @@ namespace ninfer::ops {
 
 inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 262144;
 
+// Fixed key-split workspace of the fast INT8 prompt kernel: a split launch publishes one
+// normalized FP32 row per (column, query head, split) plus (max, sum) statistics, merged by
+// causal_attention_prompt_fast_merge_kernel. The budget is fixed, not configurable.
+inline constexpr std::size_t kCausalPromptSplitWorkspaceBytes = 256 * 1024 * 1024;
+
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
@@ -159,6 +164,15 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      CausalAttentionExecutionEnvelope envelope,
                                      WorkspaceArena& workspace, Tensor& out,
                                      DeviceExecutionView execution);
+
+/**
+ * Return the prompt-route width granule of one registered head geometry on the current device.
+ * A single-sequence call whose width is a multiple of the granule launches whole waves of fast
+ * prompt-kernel CTAs, so a caller that splits a long prompt into such calls leaves no SM idle behind
+ * a partial wave. The granule is a positive multiple of 128 tokens.
+ */
+[[nodiscard]] std::int32_t
+causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry);
 
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
